@@ -4,7 +4,7 @@
 set -euo pipefail
 
 echo "========== [0/5] 安装系统工具 =========="
-apt-get update && apt-get install -y tmux
+command -v tmux &>/dev/null || { apt-get update && apt-get install -y tmux; }
 
 echo "========== [1/5] 升级 PyTorch (需要 2.5+) =========="
 pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu124
@@ -16,11 +16,15 @@ echo "========== [3/5] 安装 verl 及依赖 =========="
 cd /root/verl
 pip install -e .
 # flash-attn 编译较慢，但对性能很重要
-pip install flash-attn --no-build-isolation
+python3 -c "import flash_attn" 2>/dev/null || MAX_JOBS=4 pip install flash-attn --no-build-isolation
 
 echo "========== [4/5] 准备 GSM8K 数据 =========="
-mkdir -p ~/data/gsm8k
-python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
+if [ ! -f ~/data/gsm8k/train.parquet ]; then
+    mkdir -p ~/data/gsm8k
+    python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
+else
+    echo "GSM8K 数据已存在，跳过"
+fi
 
 echo "========== [5/5] 验证环境 =========="
 python3 -c "
