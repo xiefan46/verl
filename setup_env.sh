@@ -39,7 +39,7 @@ print('verl: OK')
 
 try:
     import flash_attn
-    print(f'flash-attn: {flash_attn.__version__}')
+    print(f'flash-attn: OK')
 except ImportError:
     print('flash-attn: NOT INSTALLED')
 
