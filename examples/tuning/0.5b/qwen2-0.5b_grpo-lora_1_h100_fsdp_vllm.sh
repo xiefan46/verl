@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-export CUDA_VISIBLE_DEVICES=4
+export CUDA_VISIBLE_DEVICES=0
 NOW=$(date +%Y%m%d)
 export WANDB_DIR=gsm8k-grpo-lora-qwen2.5-0.5b-${NOW}
 export WANDB_PROJECT=${WANDB_DIR}
