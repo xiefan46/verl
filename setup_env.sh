@@ -3,25 +3,17 @@
 # 用法: cd /root/verl && bash setup_env.sh
 set -euo pipefail
 
-echo "========== [0/5] 安装系统工具 =========="
+echo "========== [0/4] 安装系统工具 =========="
 command -v tmux &>/dev/null || { apt-get update && apt-get install -y tmux; }
 
-echo "========== [1/5] 升级 PyTorch (需要 2.5+) =========="
-pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu124
-
-echo "========== [2/5] 安装 vLLM =========="
-pip install vllm
-
-echo "========== [3/5] 安装 verl 及依赖 =========="
+echo "========== [1/4] 运行官方安装脚本 =========="
 cd /root/verl
-pip install -e .
-# flash-attn: 优先用预编译 wheel（秒装），失败再源码编译
-if ! python3 -c "import flash_attn" 2>/dev/null; then
-    pip install flash-attn 2>/dev/null \
-        || MAX_JOBS=$(( $(nproc) / 2 )) pip install flash-attn --no-build-isolation
-fi
+USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh
 
-echo "========== [4/5] 准备 GSM8K 数据 =========="
+echo "========== [2/4] 安装 verl =========="
+pip install --no-deps -e .
+
+echo "========== [3/4] 准备 GSM8K 数据 =========="
 if [ ! -f ~/data/gsm8k/train.parquet ]; then
     mkdir -p ~/data/gsm8k
     python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
@@ -29,7 +21,7 @@ else
     echo "GSM8K 数据已存在，跳过"
 fi
 
-echo "========== [5/5] 验证环境 =========="
+echo "========== [4/4] 验证环境 =========="
 python3 -c "
 import torch
 print(f'PyTorch: {torch.__version__}')
@@ -45,11 +37,17 @@ print(f'vLLM: {vllm.__version__}')
 import verl
 print('verl: OK')
 
+try:
+    import flash_attn
+    print(f'flash-attn: {flash_attn.__version__}')
+except ImportError:
+    print('flash-attn: NOT INSTALLED')
+
 import os
 assert os.path.exists(os.path.expanduser('~/data/gsm8k/train.parquet')), 'GSM8K data missing!'
 print('GSM8K data: OK')
 
-print('\\n=== All checks passed! ===')
+print('\n=== All checks passed! ===')
 print('Run training with:')
 print('  bash examples/tuning/0.5b/qwen2-0.5b_grpo-lora_1_h100_fsdp_vllm.sh')
 "
