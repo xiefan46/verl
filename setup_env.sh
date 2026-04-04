@@ -15,8 +15,11 @@ pip install vllm
 echo "========== [3/5] 安装 verl 及依赖 =========="
 cd /root/verl
 pip install -e .
-# flash-attn 编译较慢，但对性能很重要
-python3 -c "import flash_attn" 2>/dev/null || MAX_JOBS=4 pip install flash-attn --no-build-isolation
+# flash-attn: 优先用预编译 wheel（秒装），失败再源码编译
+if ! python3 -c "import flash_attn" 2>/dev/null; then
+    pip install flash-attn 2>/dev/null \
+        || MAX_JOBS=$(( $(nproc) / 2 )) pip install flash-attn --no-build-isolation
+fi
 
 echo "========== [4/5] 准备 GSM8K 数据 =========="
 if [ ! -f ~/data/gsm8k/train.parquet ]; then
