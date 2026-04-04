@@ -3,6 +3,9 @@
 # 用法: cd /root/verl && bash setup_env.sh
 set -euo pipefail
 
+echo "========== [0/5] 安装系统工具 =========="
+apt-get update && apt-get install -y tmux
+
 echo "========== [1/5] 升级 PyTorch (需要 2.5+) =========="
 pip install --upgrade torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
