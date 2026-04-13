@@ -33,7 +33,12 @@ conda activate "$CONDA_ENV_NAME"
 echo "Python: $(python3 --version) at $(which python3)"
 
 echo "========== [3/7] 安装 PyTorch + vLLM + 基础依赖（锁定版本） =========="
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+# 如果系统已有 torch，直接复用（避免重复下载 766MB）
+if python3 -c "import torch" 2>/dev/null; then
+    echo "PyTorch 已安装: $(python3 -c 'import torch; print(torch.__version__)'), 跳过"
+else
+    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+fi
 pip install vllm==0.8.2
 pip install ray==2.44.0 tensordict==0.6.2
 pip install transformers accelerate datasets peft hydra-core wandb
