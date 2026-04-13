@@ -24,7 +24,7 @@ installed torch  && echo "torch 已安装: $(python3 -c 'import torch;print(torc
 installed vllm   && echo "vllm 已安装，跳过"        || pip install vllm
 installed ray    && echo "ray 已安装，跳过"          || pip install ray[default]
 installed tensordict && echo "tensordict 已安装，跳过" || pip install "tensordict>=0.8.0,<=0.10.0,!=0.9.0"
-pip install transformers accelerate datasets peft hydra-core wandb 2>/dev/null
+pip install transformers accelerate datasets peft hydra-core wandb codetiming
 
 echo "========== [2/5] 安装 flash-attn =========="
 FA_WHEEL_CACHE="/workspace/wheels"
