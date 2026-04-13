@@ -67,4 +67,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
     trainer.test_freq=200 \
-    trainer.total_epochs=1 $@ 2>&1 | tee ${WANDB_PROJECT}.log
+    trainer.total_epochs=1 \
+    trainer.total_training_steps=5 $@ 2>&1 | tee ${WANDB_PROJECT}.log
