@@ -31,8 +31,9 @@ if has_pkg flash_attn; then
     echo "flash-attn 已安装，跳过"
 else
     PY_VER=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
-    WHEEL="flash_attn-2.7.4+cu12torch2.6cxx11abiFALSE-${PY_VER}-${PY_VER}-linux_x86_64.whl"
-    WHEEL_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4/${WHEEL}"
+    TORCH_VER=$(python3 -c "import torch; print(torch.__version__.split('+')[0].rsplit('.',1)[0])")
+    WHEEL="flash_attn-2.7.3+cu12torch${TORCH_VER}cxx11abiFALSE-${PY_VER}-${PY_VER}-linux_x86_64.whl"
+    WHEEL_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/${WHEEL}"
     echo "下载预编译 wheel: ${WHEEL}"
     wget -nv "${WHEEL_URL}" && pip install --no-cache-dir "${WHEEL}" && rm -f "${WHEEL}" \
         || { echo "预编译 wheel 不可用，源码编译..."; MAX_JOBS=8 pip install flash-attn --no-build-isolation; }
