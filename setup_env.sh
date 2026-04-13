@@ -19,11 +19,11 @@ has_pkg() { python3 -c "import importlib.metadata; importlib.metadata.version('$
 echo "========== [0/5] 安装系统工具 =========="
 command -v tmux &>/dev/null || { apt-get update && apt-get install -y tmux; }
 
-echo "========== [1/5] 安装 PyTorch + vLLM + 基础依赖（锁定版本） =========="
-installed torch  && echo "torch 已安装，跳过"       || pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
-installed vllm   && echo "vllm 已安装，跳过"        || pip install vllm==0.8.2
-installed ray    && echo "ray 已安装，跳过"          || pip install ray==2.44.0
-installed tensordict && echo "tensordict 已安装，跳过" || pip install tensordict==0.6.2
+echo "========== [1/5] 安装 PyTorch + vLLM + 基础依赖 =========="
+installed torch  && echo "torch 已安装: $(python3 -c 'import torch;print(torch.__version__)'), 跳过" || pip install torch torchvision torchaudio
+installed vllm   && echo "vllm 已安装，跳过"        || pip install vllm
+installed ray    && echo "ray 已安装，跳过"          || pip install ray[default]
+installed tensordict && echo "tensordict 已安装，跳过" || pip install "tensordict>=0.8.0,<=0.10.0,!=0.9.0"
 installed transformers && echo "基础依赖已安装，跳过"  || pip install transformers accelerate datasets peft hydra-core wandb
 
 echo "========== [2/5] 安装 flash-attn（预编译 wheel） =========="
