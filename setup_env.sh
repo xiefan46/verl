@@ -22,6 +22,8 @@ if [ ! -d "$REPO_ROOT/../miniconda3" ]; then
     rm -f /tmp/miniconda.sh
 fi
 eval "$("$REPO_ROOT/../miniconda3/bin/conda" shell.bash hook)"
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main 2>/dev/null || true
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r 2>/dev/null || true
 
 echo "========== [2/7] 创建 conda 虚拟环境 =========="
 if ! conda env list | grep -q "$CONDA_ENV_NAME"; then
