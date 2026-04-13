@@ -1,19 +1,34 @@
 #!/bin/bash
 # setup_env.sh — 一键搭建 verl 0.5B GRPO 训练环境
 # 用法: cd /root/verl && bash setup_env.sh
+# 参考: https://www.cnblogs.com/rh-li/p/19302501
 set -euo pipefail
 
-echo "========== [0/4] 安装系统工具 =========="
+echo "========== [0/5] 安装系统工具 =========="
 command -v tmux &>/dev/null || { apt-get update && apt-get install -y tmux; }
 
-echo "========== [1/4] 运行官方安装脚本 =========="
-cd /root/verl
-USE_MEGATRON=0 bash scripts/install_vllm_sglang_mcore.sh
+echo "========== [1/5] 安装 PyTorch + vLLM + 基础依赖（锁定版本） =========="
+pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+pip install vllm==0.8.2
+pip install ray==2.44.0 tensordict==0.6.2
+pip install transformers accelerate datasets peft hydra-core wandb
 
-echo "========== [2/4] 安装 verl =========="
+echo "========== [2/5] 安装 flash-attn（预编译 wheel） =========="
+if ! python3 -c "import importlib.metadata; importlib.metadata.version('flash_attn')" 2>/dev/null; then
+    PY_VER=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
+    # torch 2.6 + cu124 的预编译 wheel
+    WHEEL="flash_attn-2.7.4+cu12torch2.6cxx11abiFALSE-${PY_VER}-${PY_VER}-linux_x86_64.whl"
+    WHEEL_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4/${WHEEL}"
+    echo "下载预编译 wheel: ${WHEEL}"
+    wget -nv "${WHEEL_URL}" && pip install --no-cache-dir "${WHEEL}" && rm -f "${WHEEL}" \
+        || { echo "预编译 wheel 不可用，源码编译..."; MAX_JOBS=8 pip install flash-attn --no-build-isolation; }
+fi
+
+echo "========== [3/5] 安装 verl =========="
+cd /root/verl
 pip install --no-deps -e .
 
-echo "========== [3/4] 准备 GSM8K 数据 =========="
+echo "========== [4/5] 准备 GSM8K 数据 =========="
 if [ ! -f ~/data/gsm8k/train.parquet ]; then
     mkdir -p ~/data/gsm8k
     python3 examples/data_preprocess/gsm8k.py --local_save_dir ~/data/gsm8k
@@ -21,15 +36,12 @@ else
     echo "GSM8K 数据已存在，跳过"
 fi
 
-echo "========== [4/4] 验证环境 =========="
+echo "========== [5/5] 验证环境 =========="
 python3 -c "
 import torch
 print(f'PyTorch: {torch.__version__}')
 assert torch.cuda.is_available(), 'CUDA not available!'
 print(f'CUDA: {torch.version.cuda}, GPU: {torch.cuda.get_device_name(0)}')
-
-from torch.distributed.tensor import DTensor
-print('DTensor: OK')
 
 import vllm
 print(f'vLLM: {vllm.__version__}')
@@ -37,10 +49,11 @@ print(f'vLLM: {vllm.__version__}')
 import verl
 print('verl: OK')
 
+import importlib.metadata
 try:
-    import flash_attn
-    print(f'flash-attn: OK')
-except ImportError:
+    fa_ver = importlib.metadata.version('flash_attn')
+    print(f'flash-attn: {fa_ver}')
+except importlib.metadata.PackageNotFoundError:
     print('flash-attn: NOT INSTALLED')
 
 import os
