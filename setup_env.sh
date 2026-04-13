@@ -12,6 +12,11 @@ RESET='\033[0m'
 REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 CONDA_ENV_NAME="verl"
 
+# 检查 Python 模块是否已安装
+installed() { python3 -c "import $1" 2>/dev/null; }
+# 检查 pip 包元数据是否存在
+has_pkg() { python3 -c "import importlib.metadata; importlib.metadata.version('$1')" 2>/dev/null; }
+
 echo "========== [0/7] 安装系统工具 =========="
 command -v tmux &>/dev/null || { apt-get update && apt-get install -y tmux; }
 
@@ -33,18 +38,16 @@ conda activate "$CONDA_ENV_NAME"
 echo "Python: $(python3 --version) at $(which python3)"
 
 echo "========== [3/7] 安装 PyTorch + vLLM + 基础依赖（锁定版本） =========="
-# 如果系统已有 torch，直接复用（避免重复下载 766MB）
-if python3 -c "import torch" 2>/dev/null; then
-    echo "PyTorch 已安装: $(python3 -c 'import torch; print(torch.__version__)'), 跳过"
-else
-    pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
-fi
-pip install vllm==0.8.2
-pip install ray==2.44.0 tensordict==0.6.2
-pip install transformers accelerate datasets peft hydra-core wandb
+installed torch  && echo "torch 已安装，跳过"       || pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0
+installed vllm   && echo "vllm 已安装，跳过"        || pip install vllm==0.8.2
+installed ray    && echo "ray 已安装，跳过"          || pip install ray==2.44.0
+installed tensordict && echo "tensordict 已安装，跳过" || pip install tensordict==0.6.2
+installed transformers && echo "基础依赖已安装，跳过"  || pip install transformers accelerate datasets peft hydra-core wandb
 
 echo "========== [4/7] 安装 flash-attn（预编译 wheel） =========="
-if ! python3 -c "import importlib.metadata; importlib.metadata.version('flash_attn')" 2>/dev/null; then
+if has_pkg flash_attn; then
+    echo "flash-attn 已安装，跳过"
+else
     PY_VER=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
     WHEEL="flash_attn-2.7.4+cu12torch2.6cxx11abiFALSE-${PY_VER}-${PY_VER}-linux_x86_64.whl"
     WHEEL_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4/${WHEEL}"
@@ -55,7 +58,7 @@ fi
 
 echo "========== [5/7] 安装 verl =========="
 cd "$REPO_ROOT"
-pip install --no-deps -e .
+installed verl && echo "verl 已安装，跳过" || pip install --no-deps -e .
 
 echo "========== [6/7] 准备 GSM8K 数据 =========="
 if [ ! -f ~/data/gsm8k/train.parquet ]; then
