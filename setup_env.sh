@@ -32,7 +32,8 @@ if has_pkg flash_attn; then
 else
     PY_VER=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
     TORCH_VER=$(python3 -c "import torch; print(torch.__version__.split('+')[0].rsplit('.',1)[0])")
-    WHEEL="flash_attn-2.7.3+cu12torch${TORCH_VER}cxx11abiFALSE-${PY_VER}-${PY_VER}-linux_x86_64.whl"
+    CXX11_ABI=$(python3 -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')")
+    WHEEL="flash_attn-2.7.3+cu12torch${TORCH_VER}cxx11abi${CXX11_ABI}-${PY_VER}-${PY_VER}-linux_x86_64.whl"
     WHEEL_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/${WHEEL}"
     echo "下载预编译 wheel: ${WHEEL}"
     wget -nv "${WHEEL_URL}" && pip install --no-cache-dir "${WHEEL}" && rm -f "${WHEEL}" \
