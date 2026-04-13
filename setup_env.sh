@@ -26,18 +26,30 @@ installed ray    && echo "ray 已安装，跳过"          || pip install ray[de
 installed tensordict && echo "tensordict 已安装，跳过" || pip install "tensordict>=0.8.0,<=0.10.0,!=0.9.0"
 installed transformers && echo "基础依赖已安装，跳过"  || pip install transformers accelerate datasets peft hydra-core wandb
 
-echo "========== [2/5] 安装 flash-attn（预编译 wheel） =========="
+echo "========== [2/5] 安装 flash-attn =========="
+FA_WHEEL_CACHE="/workspace/wheels"
 if has_pkg flash_attn; then
     echo "flash-attn 已安装，跳过"
 else
-    PY_VER=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
-    TORCH_VER=$(python3 -c "import torch; print(torch.__version__.split('+')[0].rsplit('.',1)[0])")
-    CXX11_ABI=$(python3 -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')")
-    WHEEL="flash_attn-2.7.3+cu12torch${TORCH_VER}cxx11abi${CXX11_ABI}-${PY_VER}-${PY_VER}-linux_x86_64.whl"
-    WHEEL_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/${WHEEL}"
-    echo "下载预编译 wheel: ${WHEEL}"
-    wget -nv "${WHEEL_URL}" && pip install --no-cache-dir "${WHEEL}" && rm -f "${WHEEL}" \
-        || { echo "预编译 wheel 不可用，源码编译..."; MAX_JOBS=8 pip install flash-attn --no-build-isolation; }
+    # 优先从本地缓存安装（重启后复用）
+    LOCAL_WHL=$(ls ${FA_WHEEL_CACHE}/flash_attn-*.whl 2>/dev/null | head -1)
+    if [ -n "$LOCAL_WHL" ]; then
+        echo "从本地缓存安装: $LOCAL_WHL"
+        pip install --no-cache-dir "$LOCAL_WHL"
+    else
+        # 尝试下载预编译 wheel，失败则源码编译
+        PY_VER=$(python3 -c "import sys; print(f'cp{sys.version_info.major}{sys.version_info.minor}')")
+        TORCH_VER=$(python3 -c "import torch; print(torch.__version__.split('+')[0].rsplit('.',1)[0])")
+        CXX11_ABI=$(python3 -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')")
+        WHEEL="flash_attn-2.7.3+cu12torch${TORCH_VER}cxx11abi${CXX11_ABI}-${PY_VER}-${PY_VER}-linux_x86_64.whl"
+        WHEEL_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.3/${WHEEL}"
+        echo "尝试下载预编译 wheel: ${WHEEL}"
+        wget -nv "${WHEEL_URL}" && pip install --no-cache-dir "${WHEEL}" && rm -f "${WHEEL}" \
+            || { echo "预编译 wheel 不可用，源码编译..."; MAX_JOBS=8 pip install flash-attn --no-build-isolation; }
+        # 编译成功后缓存 wheel 到 /workspace，重启后可复用
+        mkdir -p "$FA_WHEEL_CACHE"
+        pip wheel flash-attn --no-build-isolation --no-deps -w "$FA_WHEEL_CACHE" 2>/dev/null || true
+    fi
 fi
 
 echo "========== [3/5] 安装 verl =========="
