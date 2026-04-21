@@ -40,7 +40,7 @@ class TeacherModelManager:
         self,
         distillation_config: DistillationConfig,
         teacher_model_config: DistillationTeacherModelConfig,
-        resource_pool: RayResourcePool,
+        resource_pool: RayResourcePool = None,
     ):
         """
         Initialize the teacher model manager.
@@ -48,7 +48,8 @@ class TeacherModelManager:
         Args:
             distillation_config (DistillationConfig): Distillation configuration.
             teacher_model_config (DistillationTeacherModelConfig): Teacher model configuration.
-            resource_pool (RayResourcePool): Dedicated teacher resource pool.
+            resource_pool (RayResourcePool, optional): Dedicated teacher resource pool.
+                If None, each replica will create its own resource pool via init_standalone().
         """
 
         # Need dataclass conversion for max_logprobs handling in post_init
@@ -61,15 +62,17 @@ class TeacherModelManager:
     def _initialize_llm_servers(self):
         teacher_model_config = self.teacher_model_config
         per_replica_world_size = teacher_model_config.per_replica_world_size
+
         num_replicas = teacher_model_config.num_replicas
-        expected_pool_size = num_replicas * per_replica_world_size
-        if self.resource_pool.world_size != expected_pool_size:
-            raise ValueError(
-                f"Teacher {teacher_model_config.key!r} expected sub-pool of size "
-                f"{expected_pool_size} (num_replicas={num_replicas} * "
-                f"per_replica_world_size={per_replica_world_size}), but got "
-                f"{self.resource_pool.world_size}."
-            )
+        if self.resource_pool:
+            expected_pool_size = num_replicas * per_replica_world_size
+            if self.resource_pool.world_size != expected_pool_size:
+                raise ValueError(
+                    f"Teacher {teacher_model_config.key!r} expected sub-pool of size "
+                    f"{expected_pool_size} (num_replicas={num_replicas} * "
+                    f"per_replica_world_size={per_replica_world_size}), but got "
+                    f"{self.resource_pool.world_size}."
+                )
 
         gpus_per_node = self.distillation_config.n_gpus_per_node
         rollout_replica_class = get_rollout_replica_class(teacher_model_config.inference.name)
@@ -87,15 +90,18 @@ class TeacherModelManager:
             )
             for replica_rank in range(num_replicas)
         ]
-        split_resource_pools = split_resource_pool(self.resource_pool, split_size=per_replica_world_size)
-        assert len(split_resource_pools) == len(self.rollout_replicas)
-        self._validate_replica_node_alignment(split_resource_pools, per_replica_world_size, gpus_per_node)
-        _run_all(
-            [
-                server.init_colocated(resource_pool)
-                for server, resource_pool in zip(self.rollout_replicas, split_resource_pools, strict=True)
-            ]
-        )
+        if self.resource_pool:
+            split_resource_pools = split_resource_pool(self.resource_pool, split_size=per_replica_world_size)
+            assert len(split_resource_pools) == len(self.rollout_replicas)
+            self._validate_replica_node_alignment(split_resource_pools, per_replica_world_size, gpus_per_node)
+            _run_all(
+                [
+                    server.init_colocated(resource_pool)
+                    for server, resource_pool in zip(self.rollout_replicas, split_resource_pools, strict=True)
+                ]
+            )
+        else:
+            _run_all([server.init_standalone() for server in self.rollout_replicas])
         self.server_handles = [server._server_handle for server in self.rollout_replicas]
         self.server_addresses = [server._server_address for server in self.rollout_replicas]
 
@@ -156,14 +162,15 @@ class MultiTeacherModelManager:
     def __init__(
         self,
         config: DictConfig,
-        resource_pool: RayResourcePool,
+        resource_pool: RayResourcePool = None,
     ):
         """
         Initialize the multi-teacher model manager.
 
         Args:
             config (DictConfig): Full configuration.
-            resource_pool (RayResourcePool): Combined resource pool for all teachers.
+            resource_pool (RayResourcePool, optional): Combined resource pool for all teachers.
+                If None, each teacher will create its own resources via init_standalone().
         """
         self.config = config
         self.distillation_config: DistillationConfig = omega_conf_to_dataclass(config.distillation)
@@ -178,8 +185,12 @@ class MultiTeacherModelManager:
 
     def _initialize_teacher_model_managers(self):
         teacher_models = self.distillation_config.teacher_models
-        split_sizes = [teacher.world_size for teacher in teacher_models.values()]
-        split_pools = split_resource_pool(self.resource_pool, split_size=split_sizes)
+
+        if self.resource_pool:
+            split_sizes = [teacher.world_size for teacher in teacher_models.values()]
+            split_pools = split_resource_pool(self.resource_pool, split_size=split_sizes)
+        else:
+            split_pools = [None] * len(teacher_models)
 
         for (key, teacher_model_config), teacher_pool in zip(teacher_models.items(), split_pools, strict=True):
             manager = TeacherModelManager(
