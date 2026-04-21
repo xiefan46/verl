@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+# Workaround for NVIDIA driver bug (r560-r575) causing SIGSEGV in ncclCuMemHostEnable()
+# on PCIe machines without P2P access. See: https://github.com/NVIDIA/nccl/issues/1838
+export NCCL_CUMEM_ENABLE=0
+export NCCL_CUMEM_HOST_ENABLE=0
+
 # Test script for fully_async_policy + Multi-Teacher Online Policy Distillation (OPD)
 # This script runs fully async training with multiple standalone teacher models
 # to verify that multi-teacher distillation works correctly in async mode.
