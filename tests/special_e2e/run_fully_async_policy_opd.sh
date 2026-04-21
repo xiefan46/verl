@@ -39,7 +39,7 @@ MAX_NUM_TOKENS=$(( MAX_PROMPT + MAX_RESPONSE_LENGTH + 1 ))
 N_GPUS_ROLLOUT=1
 N_GPUS_TRAINING=2
 N_GPUS_TEACHER_TOTAL=2  # 1 per teacher
-TOTAL_ROLLOUT_STEPS=3200
+TOTAL_ROLLOUT_STEPS=143610
 
 STALENESS_THRESHOLD=0.5
 TRIGGER_PARAMETER_SYNC_STEP=8
@@ -219,7 +219,7 @@ TRAINER=(
     trainer.n_gpus_per_node=${N_GPUS_TRAINING}
     trainer.log_val_generations=10
     trainer.use_legacy_worker_impl=disable
-    trainer.total_epochs=2
+    trainer.total_epochs=15
     trainer.test_freq=-1
 )
 
