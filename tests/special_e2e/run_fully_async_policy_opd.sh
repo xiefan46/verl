@@ -10,8 +10,8 @@ set -xeuo pipefail
 #   GSM8K Teacher: Qwen3-4B-Instruct-2507
 #   Geo3K Teacher: Qwen3-VL-4B-Instruct
 #
-# GPU allocation (5 GPUs):
-#   - 1 GPU: Rollout (student vLLM async)
+# GPU allocation (6 GPUs):
+#   - 2 GPU: Rollout (student vLLM async)
 #   - 2 GPU: Training (student FSDP2)
 #   - 1 GPU: Teacher GSM8K (standalone vLLM)
 #   - 1 GPU: Teacher Geo3K (standalone vLLM)
@@ -36,7 +36,7 @@ MAX_RESPONSE_LENGTH=2048
 MAX_NUM_TOKENS=$(( MAX_PROMPT + MAX_RESPONSE_LENGTH + 1 ))
 
 # Fully async specific
-N_GPUS_ROLLOUT=1
+N_GPUS_ROLLOUT=2
 N_GPUS_TRAINING=2
 N_GPUS_TEACHER_TOTAL=2  # 1 per teacher
 TOTAL_ROLLOUT_STEPS=143610
