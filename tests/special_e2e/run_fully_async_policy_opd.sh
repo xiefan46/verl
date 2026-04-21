@@ -154,6 +154,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.agent.num_workers=1
     actor_rollout_ref.rollout.checkpoint_engine.backend='nccl'
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=2048
+    actor_rollout_ref.rollout.enforce_eager=False
     +actor_rollout_ref.rollout.engine_kwargs.vllm.mm_processor_cache_gb=0
 )
 
@@ -170,6 +171,7 @@ DISTILLATION=(
     +distillation.teacher_models.gsm8k.inference.name=$ROLLOUT_NAME
     +distillation.teacher_models.gsm8k.inference.tensor_model_parallel_size=1
     +distillation.teacher_models.gsm8k.inference.gpu_memory_utilization=0.7
+    +distillation.teacher_models.gsm8k.inference.enforce_eager=False
     +distillation.teacher_models.gsm8k.inference.max_model_len=$MAX_NUM_TOKENS
     +distillation.teacher_models.gsm8k.inference.max_num_batched_tokens=$MAX_NUM_TOKENS
     +distillation.teacher_models.gsm8k.inference.max_num_seqs=$MAX_NUM_TOKENS
@@ -180,6 +182,7 @@ DISTILLATION=(
     +distillation.teacher_models.geo3k.inference.name=$ROLLOUT_NAME
     +distillation.teacher_models.geo3k.inference.tensor_model_parallel_size=1
     +distillation.teacher_models.geo3k.inference.gpu_memory_utilization=0.7
+    +distillation.teacher_models.geo3k.inference.enforce_eager=False
     +distillation.teacher_models.geo3k.inference.max_model_len=$MAX_NUM_TOKENS
     +distillation.teacher_models.geo3k.inference.max_num_batched_tokens=$MAX_NUM_TOKENS
     +distillation.teacher_models.geo3k.inference.max_num_seqs=$MAX_NUM_TOKENS
