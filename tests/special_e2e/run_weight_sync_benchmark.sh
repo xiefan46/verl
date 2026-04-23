@@ -133,6 +133,7 @@ ACTOR=(
     +actor_rollout_ref.actor.optim.override_optimizer_config.overlap_cpu_optimizer_d2h_h2d=True
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
     # Megatron kernel configs
+    +actor_rollout_ref.actor.megatron.override_transformer_config.transformer_impl=local
     +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=False
     +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=False
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True
