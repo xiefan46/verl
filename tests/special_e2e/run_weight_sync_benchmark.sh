@@ -20,9 +20,9 @@ set -xeuo pipefail
 # Purpose: Measure parameter synchronization overhead between
 #          training (Megatron) and inference (vLLM) engines.
 #
-# GPU allocation (8 GPUs):
+# GPU allocation (6 GPUs):
 #   - 4 GPU: Training (Megatron, tp2 ep2)
-#   - 4 GPU: Inference (vLLM, tp1 ep4)
+#   - 2 GPU: Inference (vLLM, tp2)
 #
 # Training and inference use DIFFERENT parallelism strategies
 # to demonstrate resharding overhead and zero-redundancy potential.
@@ -54,9 +54,9 @@ TRAIN_CP=1
 TRAIN_PP=1
 TRAIN_VPP=null
 
-# Inference: vLLM tp1 ep4 (4 GPU) — intentionally different from training
-N_GPUS_ROLLOUT=4
-INFER_TP=1
+# Inference: vLLM tp2 (2 GPU) — different parallelism from training
+N_GPUS_ROLLOUT=2
+INFER_TP=2
 
 # Fully async parameters — minimal steps, focus on sync overhead
 TOTAL_ROLLOUT_STEPS=256
@@ -226,8 +226,9 @@ echo "=============================================="
 echo "Weight Sync Benchmark"
 echo "=============================================="
 echo "Model: ${MODEL_PATH}"
-echo "Training: ${N_GPUS_TRAINING} GPU (tp${TRAIN_TP} ep${TRAIN_EP})"
-echo "Inference: ${N_GPUS_ROLLOUT} GPU (tp${INFER_TP})"
+echo "Training: ${N_GPUS_TRAINING} GPU (Megatron tp${TRAIN_TP} ep${TRAIN_EP})"
+echo "Inference: ${N_GPUS_ROLLOUT} GPU (vLLM tp${INFER_TP})"
+echo "Total: $(( N_GPUS_TRAINING + N_GPUS_ROLLOUT )) GPUs"
 echo "Sequence: ${MAX_PROMPT} prompt + ${MAX_RESPONSE_LENGTH} response"
 echo "=============================================="
 
