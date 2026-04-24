@@ -391,13 +391,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def _create_teacher_model_manager(self):
         """Create MultiTeacherModelManager for distillation if enabled.
 
-        Uses standalone mode (resource_pool=None) so each teacher replica
-        allocates its own GPU via init_standalone().
+        Allocates a big resource pool for all teachers and passes it to
+        MultiTeacherModelManager, which splits it internally per teacher.
 
         NOTE: MultiTeacherModelManager.__init__ calls _run_all internally which uses
         asyncio.run(), conflicting with the already-running event loop. Run in a thread executor.
         """
         from verl.trainer.distillation.losses import is_distillation_enabled
+        from verl.trainer.ppo.utils import Role
 
         self.teacher_model_manager = None
         if is_distillation_enabled(self.config.get("distillation")):
@@ -405,10 +406,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
             from verl.experimental.teacher_loop import MultiTeacherModelManager
 
+            teacher_resource_pool = self.resource_pool_manager.get_resource_pool(Role.TeacherModel)
             loop = asyncio.get_running_loop()
             self.teacher_model_manager = await loop.run_in_executor(
                 None,
-                lambda: MultiTeacherModelManager(config=self.config, resource_pool=None),
+                lambda: MultiTeacherModelManager(config=self.config, resource_pool=teacher_resource_pool),
             )
 
     def _create_actor_rollout_classes(self):
