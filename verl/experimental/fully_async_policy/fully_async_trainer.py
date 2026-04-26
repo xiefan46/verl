@@ -325,13 +325,37 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._create_worker_classes()
         self._init_worker_groups()
         self._init_models()
-        self._init_reward_loop()
-        await self._init_async_rollout_manager()
+        # Reward loop + async rollout manager are deferred to
+        # init_validation_components(), called after the rollouter is ready.
+        if not self.config.async_training.use_trainer_do_validate:
+            await self._init_async_rollout_manager()
 
-    def _init_reward_loop(self):
-        if self.config.async_training.use_trainer_do_validate:
-            print("[FullyAsyncTrainer] Init reward loop")
-            super()._init_reward_loop()
+    async def init_validation_components(self, reward_router_address: str | None = None):
+        """Initialize reward loop + async rollout manager for trainer-side validation.
+
+        Must be called after the rollouter is ready so we can reuse its RM server.
+        """
+        if not self.config.async_training.use_trainer_do_validate:
+            return
+
+        # 1. Init reward loop, reusing the rollouter's RM server if available.
+        from verl.experimental.reward_loop import RewardLoopManager
+
+        if self.use_rm:
+            assert reward_router_address is not None, (
+                "use_trainer_do_validate + GenRM requires the rollouter's reward_router_address, but got None."
+            )
+            print(f"[FullyAsyncTrainer] Reusing rollouter RM at {reward_router_address}")
+            self.reward_loop_manager = RewardLoopManager(
+                config=self.config,
+                reward_router_address=reward_router_address,
+                worker_name_prefix="trainer_",
+            )
+        else:
+            self.reward_loop_manager = RewardLoopManager(config=self.config, worker_name_prefix="trainer_")
+
+        # 2. Init async rollout manager (needs reward_loop_manager).
+        await self._init_async_rollout_manager()
 
     async def _init_async_rollout_manager(self):
         # use async rollout do validate

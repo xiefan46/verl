@@ -297,9 +297,20 @@ class RewardLoopManager:
     This class will create reward loop workers and manage them.
     """
 
-    def __init__(self, config: DictConfig, rm_resource_pool: RayResourcePool = None):
+    def __init__(
+        self,
+        config: DictConfig,
+        rm_resource_pool: RayResourcePool = None,
+        reward_router_address: str | None = None,
+        worker_name_prefix: str = "",
+    ):
         self.config = config
-        if self.config.reward.reward_model.enable:
+        self.worker_name_prefix = worker_name_prefix
+        if reward_router_address is not None:
+            # Reuse an externally-created RM server (e.g. from the rollouter).
+            self.reward_model_manager = None
+            self.reward_router_address = reward_router_address
+        elif self.config.reward.reward_model.enable:
             self.reward_model_manager = RewardModelManager(config.reward.reward_model, rm_resource_pool)
             self.reward_router_address = self.reward_model_manager.get_router_address()
         else:
@@ -332,7 +343,7 @@ class RewardLoopManager:
 
             self.reward_loop_workers.append(
                 self.reward_loop_workers_class.options(
-                    name=f"reward_loop_worker_{i}",
+                    name=f"{self.worker_name_prefix}reward_loop_worker_{i}",
                     scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
                         node_id=node_id,
                         soft=True,

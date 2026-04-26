@@ -408,6 +408,12 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             lambda: RewardLoopManager(config=self.config, rm_resource_pool=None),
         )
 
+    def get_reward_router_address(self) -> str | None:
+        """Return the RM vLLM server router address so the trainer can reuse it."""
+        if hasattr(self, "reward_loop_manager") and self.reward_loop_manager:
+            return self.reward_loop_manager.reward_router_address
+        return None
+
     def _create_actor_rollout_classes(self):
         # Skip rollout creation and let agentloop handle it
         pass

@@ -61,11 +61,11 @@ gen_prompt_bsz=1
 n_resp_per_prompt=4
 train_prompt_mini_bsz=4
 total_rollout_steps=3200  # ~200 wandb data points on 3x H100
-test_freq=-1
+test_freq=5
 staleness_threshold=0.5
 trigger_parameter_sync_step=4
 partial_rollout=True
-use_trainer_do_validate=False
+use_trainer_do_validate=True
 
 exp_name="$(basename "${MODEL_PATH,,}")-fully-async-policy-genrm-fsdp2-minimal"
 
@@ -174,7 +174,7 @@ python3 -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=${n_gpus_training} \
     trainer.log_val_generations=10 \
-    trainer.use_legacy_worker_impl=disable \
+    +trainer.use_legacy_worker_impl=disable \
     rollout.nnodes=1 \
     rollout.n_gpus_per_node=${n_gpus_rollout} \
     rollout.total_rollout_steps=${total_rollout_steps} \

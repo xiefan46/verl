@@ -84,6 +84,17 @@ class FullyAsyncTaskRunner:
             rollouter_future = executor.submit(self._create_rollouter, config)
             rollouter_future.result()
 
+        # Init trainer validation components (reward loop + rollout manager for validation).
+        # Must happen after rollouter is ready so the trainer can reuse the rollouter's RM server.
+        if config.async_training.use_trainer_do_validate:
+            reward_router_address = ray.get(self.components["rollouter"].get_reward_router_address.remote())
+            print(f"[ASYNC MAIN] Initializing trainer validation components (RM address: {reward_router_address})")
+            ray.get(
+                self.components["trainer"].init_validation_components.remote(
+                    reward_router_address=reward_router_address
+                )
+            )
+
         # sync total_train_steps between rollouter and trainer
         total_train_steps = ray.get(self.components["rollouter"].get_total_train_steps.remote())
         print(f"total_train_steps {total_train_steps}")
@@ -199,17 +210,9 @@ def main(config):
     if not hasattr(config, "async_training"):
         raise RuntimeError("must set async_training config")
 
-    assert config.async_training.use_trainer_do_validate is False, "use_trainer_do_validate is not ready to use."
-
-    # TODO: support use_trainer_do_validate with GenRM/DisRM. Currently the trainer cannot
-    # connect to the rollouter's GenRM server for validation reward computation.
-    from verl.trainer.ppo.utils import need_reward_model
-
-    if need_reward_model(config) and config.async_training.use_trainer_do_validate:
-        raise NotImplementedError(
-            "use_trainer_do_validate with GenRM/DisRM is not yet supported. "
-            "The trainer currently cannot share the rollouter's reward model server for validation."
-        )
+    # NOTE: use_trainer_do_validate + GenRM is experimental.
+    # The trainer creates its own RewardLoopManager with a standalone RM server,
+    # so it does not need to share the rollouter's GenRM server.
 
     from time import time
 
