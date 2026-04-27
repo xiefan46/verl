@@ -134,7 +134,7 @@ ACTOR=(
     +actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True
     # Megatron kernel configs
     +actor_rollout_ref.actor.megatron.override_transformer_config.apply_rope_fusion=True
-    +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=True
+    +actor_rollout_ref.actor.megatron.override_transformer_config.gradient_accumulation_fusion=False
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_grouped_gemm=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_permute_fusion=True
     +actor_rollout_ref.actor.megatron.override_transformer_config.moe_token_dispatcher_type="alltoall"
@@ -195,7 +195,7 @@ REWARD=(
 )
 
 TRAINER=(
-    trainer.logger='["console"]'
+    trainer.logger='["console","wandb"]'
     trainer.project_name='weight-sync-benchmark'
     trainer.experiment_name="qwen3-30b-a3b-tp${TRAIN_TP}ep${TRAIN_EP}-to-tp${INFER_TP}"
     trainer.val_before_train=False
