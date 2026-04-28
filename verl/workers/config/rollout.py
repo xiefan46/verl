@@ -153,6 +153,9 @@ class CheckpointEngineConfig(BaseConfig):
     # backend is instantiated, allowing custom backends to register themselves
     # in CheckpointEngineRegistry.
     custom_backend_module: Optional[str] = None
+    # Suspend idle NCCL communicators during sleep/wake to free GPU memory.
+    # Requires NCCL >= 2.29.7. Only effective in colocated mode.
+    suspend_nccl_comms: bool = False
 
 
 @dataclass

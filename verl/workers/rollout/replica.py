@@ -267,6 +267,14 @@ class RolloutReplica(ABC):
         """Sleep each rollout server."""
         await asyncio.gather(*[server.sleep.remote() for server in self.servers])
 
+    async def suspend_nccl_comms(self):
+        """Suspend NCCL communicators on all rollout servers to free GPU memory."""
+        await asyncio.gather(*[server.suspend_nccl_comms.remote() for server in self.servers])
+
+    async def resume_nccl_comms(self):
+        """Resume NCCL communicators on all rollout servers."""
+        await asyncio.gather(*[server.resume_nccl_comms.remote() for server in self.servers])
+
     async def abort_all_requests(self):
         """Partial rollout: abort and save all unfinished requests in each rollout server."""
         await asyncio.gather(*[server.abort_all_requests.remote() for server in self.servers])

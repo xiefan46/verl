@@ -576,6 +576,35 @@ class vLLMHttpServer:
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 
+    async def suspend_nccl_comms(self):
+        """Suspend rollout NCCL communicators to free GPU memory.
+
+        Should be called after sleep() when the inference engine is idle.
+        All TP ranks must call this simultaneously to avoid P2P dangling references.
+        """
+        if self.rollout_mode != RolloutMode.COLOCATED:
+            return
+        from verl.utils.memory_utils import log_memory_usage
+        from verl.utils.nccl_suspend import suspend_vllm_comms
+
+        if self.node_rank == 0:
+            log_memory_usage("before_suspend_rollout_nccl")
+        suspend_vllm_comms()
+        if self.node_rank == 0:
+            log_memory_usage("after_suspend_rollout_nccl")
+
+    async def resume_nccl_comms(self):
+        """Resume rollout NCCL communicators.
+
+        Must be called before wake_up() so the inference engine can use NCCL.
+        All TP ranks must call this simultaneously.
+        """
+        if self.rollout_mode != RolloutMode.COLOCATED:
+            return
+        from verl.utils.nccl_suspend import resume_vllm_comms
+
+        resume_vllm_comms()
+
     async def start_profile(self, **kwargs):
         if (
             self.profiler_controller.check_enable()

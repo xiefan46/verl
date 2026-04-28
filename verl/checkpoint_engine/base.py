@@ -361,6 +361,7 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.trainer = trainer
         self.replicas = replicas
+        self.suspend_nccl_comms_enabled = getattr(config, "suspend_nccl_comms", False)
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
@@ -442,6 +443,10 @@ class CheckpointEngineManager:
         # 3. sleep replicas to free kv_cache before weight sync (if free_cache_engine is enabled)
         await self.sleep_replicas()
 
+        # 3.5. suspend rollout NCCL comms to free additional GPU memory
+        if self.suspend_nccl_comms_enabled:
+            await asyncio.gather(*[r.suspend_nccl_comms() for r in self.replicas])
+
         # 4. build process group
         self.build_process_group(rollout)
 
@@ -453,6 +458,10 @@ class CheckpointEngineManager:
             trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
+
+        # 6.5. resume rollout NCCL comms before wake_up (vLLM needs NCCL for TP operations)
+        if self.suspend_nccl_comms_enabled:
+            await asyncio.gather(*[r.resume_nccl_comms() for r in self.replicas])
 
         # 7. resume replicas to recover kv_cache (for free_cache_engine scenarios)
         await self.wake_up_replicas()
