@@ -48,6 +48,7 @@ from verl.utils.fsdp_utils import (
     fsdp2_clip_grad_norm_,
     fsdp2_load_full_state_dict,
     fsdp_version,
+    get_fsdp_full_state_dict,
     get_fsdp_wrap_policy,
     get_init_weight_context_manager,
     init_fn,
@@ -748,7 +749,8 @@ class FSDPEngine(BaseEngine):
     def get_per_tensor_param(self, layered_summon=False, base_sync_done=False, **kwargs):
         log_gpu_memory_usage("Before load_fsdp_model_to_gpu", logger=logger)
 
-        load_fsdp_model_to_gpu(self.module)
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.module)
 
         log_gpu_memory_usage("After load_fsdp_model_to_gpu", logger=logger)
 
@@ -771,7 +773,13 @@ class FSDPEngine(BaseEngine):
                     params = self.module.state_dict()
                     params = normalize_peft_param_name(params)
         else:
-            params = self.module.state_dict()
+            if fsdp_version(self.module) == 2 and not self._is_offload_param:
+                # FSDP2 + CPUOffloadPolicy: use get_fsdp_full_state_dict which internally calls
+                # get_model_state_dict with full_state_dict=True. Direct self.module.state_dict()
+                # crashes when CPUOffloadPolicy has offloaded params to CPU (#5995).
+                params = get_fsdp_full_state_dict(self.module, offload_to_cpu=False, rank0_only=False)
+            else:
+                params = self.module.state_dict()
 
         params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
 
