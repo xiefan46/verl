@@ -207,8 +207,11 @@ def exp_group_size(suspend_fn, resume_fn):
         group_ranks = list(range(gs))
         pg = dist.new_group(ranks=group_ranks)
 
+        # clean_baseline has a global barrier — must be outside `if` to avoid
+        # deadlock when only a subset of ranks enter the block.
+        baseline = clean_baseline()
+
         if RANK in group_ranks:
-            baseline = clean_baseline()
             do_warmup(pg, "allreduce", msg_elements, warmup, RANK, gs)
             nccl_mem = clean_measure() - baseline
 
