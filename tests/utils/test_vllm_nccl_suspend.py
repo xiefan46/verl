@@ -150,7 +150,8 @@ def warmup_pynccl(pynccl_comm_obj, rounds=10, size=4096):
     """Warmup vLLM pynccl comm using its native all_reduce."""
     for _ in range(rounds):
         buf = torch.randn(size, size, device="cuda")
-        pynccl_comm_obj.all_reduce(buf)
+        # pynccl all_reduce is NOT in-place — pass same tensor as in and out
+        pynccl_comm_obj.all_reduce(buf, out_tensor=buf)
         del buf
     torch.cuda.synchronize()
 
@@ -158,7 +159,8 @@ def warmup_pynccl(pynccl_comm_obj, rounds=10, size=4096):
 def verify_pynccl(pynccl_comm_obj, tp_ranks):
     """Verify pynccl comm works by doing all_reduce and checking result."""
     x = torch.ones(1024, 1024, device="cuda") * (RANK + 1)
-    pynccl_comm_obj.all_reduce(x)
+    # pynccl all_reduce returns a new tensor if out_tensor not specified
+    pynccl_comm_obj.all_reduce(x, out_tensor=x)
     torch.cuda.synchronize()
     expected = sum(r + 1 for r in tp_ranks)
     assert torch.allclose(x, torch.full_like(x, float(expected))), \
