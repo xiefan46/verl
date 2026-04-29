@@ -94,97 +94,30 @@ def test_nccl_suspend_resume():
 
     comm_handles = []
 
-    # Try to get comm handles from the default process group
-    default_pg = dist.group.WORLD
-    backend = dist.get_backend(default_pg)
-    log(rank, f"  Default PG backend: {backend}")
+    # Use ProcessGroupNCCL._comm_ptr() to get ncclComm_t as int pointer.
+    # This is a public (but unsafe) PyTorch API available in recent versions.
+    groups_to_extract = [
+        ("default", dist.distributed_c10d._get_default_group()),
+        ("sub_group", sub_group),
+    ]
 
-    # Method: use torch's internal API to get the NCCL backend object
-    try:
-        pg_nccl = dist.distributed_c10d._get_default_group()._get_backend(torch.device("cuda"))
-        log(rank, f"  Got backend object: {type(pg_nccl).__name__}")
-
-        # Try to access comm via bound_device_id or other attributes
-        # This is exploratory - log what attributes are available
-        attrs = [a for a in dir(pg_nccl) if not a.startswith("__")]
-        log(rank, f"  Available attributes: {attrs[:20]}...")
-
-        # Check for _get_backend_name or similar
-        if hasattr(pg_nccl, "comm"):
-            log(rank, "  Found pg_nccl.comm")
-            comm_handles.append(("default", pg_nccl.comm))
-        if hasattr(pg_nccl, "_get_communicator"):
-            log(rank, "  Found pg_nccl._get_communicator()")
-        if hasattr(pg_nccl, "nccl_comm"):
-            log(rank, "  Found pg_nccl.nccl_comm")
-            comm_handles.append(("default", pg_nccl.nccl_comm))
-
-    except Exception as e:
-        log(rank, f"  Failed to get NCCL backend: {e}")
+    for name, pg in groups_to_extract:
+        try:
+            pg_nccl = pg._get_backend(torch.device("cuda"))
+            if hasattr(pg_nccl, "_comm_ptr"):
+                comm_ptr = pg_nccl._comm_ptr()
+                log(rank, f"  {name}: _comm_ptr() = {hex(comm_ptr)}")
+                comm_handles.append((name, comm_ptr))
+            else:
+                log(rank, f"  {name}: _comm_ptr not available")
+        except Exception as e:
+            log(rank, f"  {name}: failed to extract comm: {e}")
 
     if not comm_handles:
-        log(rank, "\n  Cannot extract ncclComm_t from PyTorch ProcessGroupNCCL.")
-        log(rank, "  This is expected - training-side suspend needs C++ extension (Step 3 in plan).")
-        log(rank, "  Testing with ctypes direct NCCL comm creation instead...\n")
-
-        # Fallback: create our own NCCL comm via ctypes to test suspend/resume works
-        import ctypes
-
-        nccl = _get_nccl_lib()
-
-        # Create a unique ID on rank 0 and broadcast
-        unique_id = (ctypes.c_byte * 128)()
-        if rank == 0:
-            nccl.ncclGetUniqueId(ctypes.byref(unique_id))
-
-        # Broadcast unique_id via gloo
-        id_tensor = torch.frombuffer(unique_id, dtype=torch.uint8).clone().cuda()
-        dist.broadcast(id_tensor, src=0)
-        ctypes.memmove(unique_id, id_tensor.cpu().numpy().ctypes.data, 128)
-        del id_tensor
-
-        # Init comm
-        comm = ctypes.c_void_p()
-        result = nccl.ncclCommInitRank(ctypes.byref(comm), world_size, unique_id, rank)
-        if result != 0:
-            log(rank, f"  ncclCommInitRank failed with {result}")
-            dist.destroy_process_group()
-            return
-        log(rank, f"  Created standalone NCCL comm: {comm.value}")
-        comm_handles.append(("standalone", comm))
-
-        # Do an allreduce to warm up the comm and allocate buffers
-        sendbuf = torch.ones(4096, 4096, device="cuda") * (rank + 1)
-        recvbuf = torch.zeros_like(sendbuf)
-
-        nccl.ncclAllReduce.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_size_t,
-            ctypes.c_int,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        nccl.ncclAllReduce.restype = ctypes.c_int
-
-        stream = torch.cuda.current_stream().cuda_stream
-        # ncclFloat=7, ncclSum=0
-        result = nccl.ncclAllReduce(
-            sendbuf.data_ptr(),
-            recvbuf.data_ptr(),
-            sendbuf.numel(),
-            7,
-            0,
-            comm,
-            stream,
-        )
-        torch.cuda.synchronize()
-        assert result == 0, f"ncclAllReduce failed with {result}"
-        log(rank, f"  Standalone allreduce OK (result={recvbuf[0, 0].item()})")
-
-        del sendbuf, recvbuf
-        torch.cuda.empty_cache()
+        log(rank, "\n  Cannot extract ncclComm_t. ProcessGroupNCCL._comm_ptr() not available.")
+        log(rank, "  Requires PyTorch >= 2.x with NCCL backend.")
+        dist.destroy_process_group()
+        return
 
     # --- Step 5: Suspend and measure ---
     dist.barrier()  # sync all ranks before suspend
@@ -228,34 +161,17 @@ def test_nccl_suspend_resume():
     # --- Step 7: Verify NCCL still works after resume ---
     log(rank, "\n[Step 7] Verify NCCL allreduce works after resume...")
 
-    if comm_handles[0][0] == "standalone":
-        # Test standalone comm
-        name, comm = comm_handles[0]
-        sendbuf = torch.ones(1024, 1024, device="cuda") * (rank + 1)
-        recvbuf = torch.zeros_like(sendbuf)
-        stream = torch.cuda.current_stream().cuda_stream
-        result = nccl.ncclAllReduce(
-            sendbuf.data_ptr(),
-            recvbuf.data_ptr(),
-            sendbuf.numel(),
-            7,
-            0,
-            comm,
-            stream,
-        )
-        torch.cuda.synchronize()
-        assert result == 0, f"ncclAllReduce after resume failed with {result}"
-        assert torch.allclose(recvbuf, torch.full_like(recvbuf, expected)), "allreduce result wrong after resume"
-        log(rank, f"  Standalone allreduce after resume OK (result={recvbuf[0, 0].item()})")
+    # Test default process group
+    z = torch.ones(1024, 1024, device="cuda") * (rank + 1)
+    dist.all_reduce(z)
+    assert torch.allclose(z, torch.full_like(z, expected)), "allreduce after resume failed (default group)"
+    log(rank, f"  default group allreduce OK (result={z[0, 0].item()})")
 
-        # Cleanup standalone comm
-        nccl.ncclCommDestroy(comm)
-    else:
-        # Test PyTorch process group
-        z = torch.ones(1024, 1024, device="cuda") * (rank + 1)
-        dist.all_reduce(z)
-        assert torch.allclose(z, torch.full_like(z, expected)), "allreduce after resume failed"
-        log(rank, f"  allreduce after resume OK (result={z[0, 0].item()})")
+    # Test sub_group
+    w = torch.ones(512, 512, device="cuda") * (rank + 1)
+    dist.all_reduce(w, group=sub_group)
+    assert torch.allclose(w, torch.full_like(w, expected)), "allreduce after resume failed (sub_group)"
+    log(rank, "  sub_group allreduce OK")
 
     # --- Summary ---
     log(rank, f"\n{'=' * 60}")
