@@ -52,28 +52,49 @@ def test_nccl_suspend_resume():
 
     log(rank, f"=== NCCL Suspend/Resume Test (world_size={world_size}) ===\n")
 
-    # --- Step 1: Verify NCCL works ---
-    log(rank, "[Step 1] Verify NCCL allreduce works...")
+    # --- Step 1: Create multiple process groups (simulate Megatron TP/DP/EP/CP/PP) ---
+    log(rank, "[Step 1] Creating multiple process groups to simulate real training...")
+    expected = sum(range(1, world_size + 1))
+    all_ranks = list(range(world_size))
+
+    groups = {}
+    group_names = ["tp", "dp", "ep", "cp", "pp", "tp_dp"]
+    for name in group_names:
+        groups[name] = dist.new_group(ranks=all_ranks)
+    log(rank, f"  Created {len(groups)} process groups: {group_names}")
+
+    # Verify default group works
     x = torch.ones(1024, 1024, device="cuda") * (rank + 1)
     dist.all_reduce(x)
-    expected = sum(range(1, world_size + 1))
     assert torch.allclose(x, torch.full_like(x, expected)), "allreduce failed"
-    log(rank, f"  allreduce OK (result={x[0, 0].item()})")
+    log(rank, f"  default group allreduce OK (result={x[0, 0].item()})")
+    del x
 
-    # Also create a second process group to test multi-group suspend
-    sub_group = dist.new_group(ranks=list(range(world_size)))
-    y = torch.ones(512, 512, device="cuda") * (rank + 1)
-    dist.all_reduce(y, group=sub_group)
-    assert torch.allclose(y, torch.full_like(y, expected)), "sub_group allreduce failed"
-    log(rank, "  sub_group allreduce OK")
+    # --- Step 2: Heavy warmup to force NCCL internal buffer allocation ---
+    log(rank, "\n[Step 2] Heavy warmup (large allreduce on all groups)...")
+    warmup_sizes = [
+        (8192, 8192),   # 256 MB per tensor (float32)
+        (4096, 4096),   # 64 MB
+        (16384, 4096),  # 256 MB
+    ]
+    all_groups = [("default", None)] + [(name, pg) for name, pg in groups.items()]
+
+    for gname, pg in all_groups:
+        for size in warmup_sizes:
+            for _ in range(3):
+                buf = torch.randn(*size, device="cuda")
+                if pg is None:
+                    dist.all_reduce(buf)
+                else:
+                    dist.all_reduce(buf, group=pg)
+                del buf
+        log(rank, f"  warmed up '{gname}'")
 
     torch.cuda.synchronize()
-    del x, y
     torch.cuda.empty_cache()
 
-    # --- Step 2: Measure baseline memory ---
     mem_before = get_memory_mb()
-    log(rank, "\n[Step 2] Memory before suspend:")
+    log(rank, f"\n  Memory after warmup + empty_cache:")
     log(rank, f"  allocated={mem_before['allocated']:.1f} MB, reserved={mem_before['reserved']:.1f} MB")
 
     # --- Step 3: Load nccl_suspend and check availability ---
@@ -96,10 +117,8 @@ def test_nccl_suspend_resume():
 
     # Use ProcessGroupNCCL._comm_ptr() to get ncclComm_t as int pointer.
     # This is a public (but unsafe) PyTorch API available in recent versions.
-    groups_to_extract = [
-        ("default", dist.distributed_c10d._get_default_group()),
-        ("sub_group", sub_group),
-    ]
+    groups_to_extract = [("default", dist.distributed_c10d._get_default_group())]
+    groups_to_extract += [(name, pg) for name, pg in groups.items()]
 
     for name, pg in groups_to_extract:
         try:
@@ -162,17 +181,15 @@ def test_nccl_suspend_resume():
     # --- Step 7: Verify NCCL still works after resume ---
     log(rank, "\n[Step 7] Verify NCCL allreduce works after resume...")
 
-    # Test default process group
-    z = torch.ones(1024, 1024, device="cuda") * (rank + 1)
-    dist.all_reduce(z)
-    assert torch.allclose(z, torch.full_like(z, expected)), "allreduce after resume failed (default group)"
-    log(rank, f"  default group allreduce OK (result={z[0, 0].item()})")
-
-    # Test sub_group
-    w = torch.ones(512, 512, device="cuda") * (rank + 1)
-    dist.all_reduce(w, group=sub_group)
-    assert torch.allclose(w, torch.full_like(w, expected)), "allreduce after resume failed (sub_group)"
-    log(rank, "  sub_group allreduce OK")
+    for gname, pg in all_groups:
+        z = torch.ones(1024, 1024, device="cuda") * (rank + 1)
+        if pg is None:
+            dist.all_reduce(z)
+        else:
+            dist.all_reduce(z, group=pg)
+        assert torch.allclose(z, torch.full_like(z, expected)), f"allreduce failed after resume ({gname})"
+        del z
+    log(rank, f"  All {len(all_groups)} groups verified OK")
 
     # --- Summary ---
     log(rank, f"\n{'=' * 60}")
