@@ -378,13 +378,20 @@ def main():
         return
 
     # Init distributed + vLLM parallel state
+    # vLLM >= 0.18 requires set_current_vllm_config() context for initialize_model_parallel()
     log("Initializing vLLM parallel state...")
     try:
+        from vllm.config import VllmConfig, set_current_vllm_config
         from vllm.distributed.parallel_state import (
             get_tp_group,
             init_distributed_environment,
             initialize_model_parallel,
         )
+
+        vllm_config = VllmConfig()
+        _vllm_config_ctx = set_current_vllm_config(vllm_config)
+        _vllm_config_ctx.__enter__()
+
         init_distributed_environment(
             world_size=WORLD_SIZE, rank=RANK, local_rank=LOCAL_RANK,
         )
