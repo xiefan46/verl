@@ -86,7 +86,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.checkpoint_engine.backend=${checkpoint_engine_backend} \
     actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024 \
-    actor_rollout_ref.rollout.checkpoint_engine.suspend_nccl_comms=true \
+    +actor_rollout_ref.rollout.checkpoint_engine.suspend_nccl_comms=true \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
     reward.reward_manager.name=dapo \
