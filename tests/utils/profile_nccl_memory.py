@@ -49,6 +49,7 @@ import torch
 import torch.distributed as dist
 
 RANK = None
+LOCAL_RANK = None
 WORLD_SIZE = None
 
 # ---------------------------------------------------------------------------
@@ -90,17 +91,50 @@ def extract_comm(pg):
         backend = pg._get_backend(torch.device("cuda"))
         if hasattr(backend, "_comm_ptr"):
             return backend._comm_ptr()
-    except Exception:
-        pass
+        log(f"  WARNING: backend {type(backend).__name__} has no _comm_ptr")
+    except Exception as e:
+        log(f"  WARNING: extract_comm failed: {e}")
     return None
 
 
 def destroy_pg(pg):
-    """Destroy a non-default process group to release NCCL comm resources."""
+    """Destroy a non-default process group and clean up."""
     try:
         dist.destroy_process_group(pg)
     except Exception:
         pass
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+
+def gather_stats(x: float, group=None):
+    """Gather a scalar from all ranks in group, return (min, avg, max) on all ranks."""
+    t = torch.tensor([x], device="cuda", dtype=torch.float64)
+    if group is not None:
+        ws = dist.get_world_size(group)
+        vals = [torch.zeros_like(t) for _ in range(ws)]
+        dist.all_gather(vals, t, group=group)
+    else:
+        vals = [torch.zeros_like(t) for _ in range(WORLD_SIZE)]
+        dist.all_gather(vals, t)
+    vals = torch.stack(vals).flatten()
+    return vals.min().item(), vals.mean().item(), vals.max().item()
+
+
+def fmt_stats(mn, avg, mx):
+    """Format min/avg/max stats. If spread is tiny, just show avg."""
+    if abs(mx - mn) < 1.0:
+        return f"{avg:.0f}"
+    return f"{mn:.0f}/{avg:.0f}/{mx:.0f}"
+
+
+def fmt_persist(nccl_avg, freed_avg):
+    """Format persist column, marking negative values as noise."""
+    p = nccl_avg - freed_avg
+    if p < -1:
+        return f"{p:.0f}*"
+    return f"{max(p, 0):.0f}"
 
 
 def do_warmup(pg, op, msg_elements, rounds, rank, world_size):
@@ -151,37 +185,52 @@ def do_warmup(pg, op, msg_elements, rounds, rank, world_size):
 
 
 def measure_one(pg, suspend_fn, resume_fn):
-    """Suspend one comm, measure freed + latency, resume. Returns (freed_mb, suspend_ms, resume_ms)."""
+    """Suspend one comm, measure freed + latency, resume.
+
+    Returns (freed_mb, suspend_api_ms, reclaim_total_ms, resume_ms).
+    suspend_api_ms:    pure ncclCommSuspend + cuda sync
+    reclaim_total_ms:  suspend + gc + empty_cache + sync (end-to-end reclaim)
+    """
     comm = extract_comm(pg)
     if comm is None:
-        return 0, 0, 0
+        return 0, 0, 0, 0
 
     dist.barrier(group=pg)
     torch.cuda.synchronize()
     pre = gpu_used_mb()
     dist.barrier(group=pg)
 
+    # Suspend API latency
     t0 = time.perf_counter()
     suspend_fn(comm)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+
+    # Reclaim (gc + empty_cache)
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    t1 = time.perf_counter()
+    t2 = time.perf_counter()
+
     freed = pre - gpu_used_mb()
 
-    t2 = time.perf_counter()
+    # Resume
+    t3 = time.perf_counter()
     resume_fn(comm)
     torch.cuda.synchronize()
-    t3 = time.perf_counter()
+    t4 = time.perf_counter()
 
-    return freed, (t1 - t0) * 1000, (t3 - t2) * 1000
+    suspend_api_ms = (t1 - t0) * 1000
+    reclaim_total_ms = (t2 - t0) * 1000
+    resume_ms = (t4 - t3) * 1000
+    return freed, suspend_api_ms, reclaim_total_ms, resume_ms
 
 
-def print_table(headers, rows, title=""):
+def print_table(headers, rows, title="", footnote=""):
     if title:
-        log(f"\n{'=' * 80}")
+        log(f"\n{'=' * 90}")
         log(title)
-        log(f"{'=' * 80}")
+        log(f"{'=' * 90}")
     widths = [len(h) for h in headers]
     for row in rows:
         for i, cell in enumerate(row):
@@ -190,7 +239,25 @@ def print_table(headers, rows, title=""):
     log("-+-".join("-" * w for w in widths))
     for row in rows:
         log(" | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)))
+    if footnote:
+        log(footnote)
     log()
+
+
+def cuda_warmup():
+    """Dummy warmup to trigger CUDA context / cuRAND / PyTorch lazy init.
+    Call once before all experiments to eliminate first-allocation noise."""
+    tmp = torch.randn(1024, 1024, device="cuda")
+    tmp = tmp @ tmp.T
+    del tmp
+    # Also trigger a dummy NCCL collective on default group
+    buf = torch.ones(256, device="cuda")
+    dist.all_reduce(buf)
+    del buf
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    dist.barrier()
 
 
 # ---------------------------------------------------------------------------
@@ -207,30 +274,36 @@ def exp_group_size(suspend_fn, resume_fn):
         group_ranks = list(range(gs))
         pg = dist.new_group(ranks=group_ranks)
 
-        # clean_baseline has a global barrier — must be outside `if` to avoid
-        # deadlock when only a subset of ranks enter the block.
+        # Global barrier must be outside if-block to avoid sync mismatch
         baseline = clean_baseline()
 
         if RANK in group_ranks:
             do_warmup(pg, "allreduce", msg_elements, warmup, RANK, gs)
             nccl_mem = clean_measure() - baseline
 
-            freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn)
+            freed, sus_api, sus_total, res_ms = measure_one(pg, suspend_fn, resume_fn)
+
+            # Gather stats within the subgroup
+            nccl_stats = gather_stats(nccl_mem, group=pg)
+            freed_stats = gather_stats(freed, group=pg)
 
             real_world = {2: "TP=2 or DP=2", 4: "TP=4 (Qwen-32B)", 8: "TP=8 (Qwen-72B)"}
             if RANK == 0:
                 rows.append([
                     gs, real_world.get(gs, ""),
-                    f"{nccl_mem:.1f}", f"{freed:.1f}", f"{nccl_mem - freed:.1f}",
-                    f"{sus_ms:.1f}", f"{res_ms:.1f}",
+                    fmt_stats(*nccl_stats), fmt_stats(*freed_stats),
+                    fmt_persist(nccl_stats[1], freed_stats[1]),
+                    f"{sus_api:.0f}", f"{sus_total:.0f}", f"{res_ms:.0f}",
                 ])
         dist.barrier()
         destroy_pg(pg)
 
     print_table(
-        ["group_sz", "real_world", "nccl(MB)", "freed(MB)", "persist(MB)", "sus(ms)", "res(ms)"],
+        ["grp_sz", "real_world", "nccl(MB)", "freed(MB)", "persist(MB)",
+         "sus_api(ms)", "sus_total(ms)", "res(ms)"],
         rows,
         "Exp 1: Group size (allreduce, batch=2 x seq=4096 x hidden=8192 = 256MB)",
+        "  nccl/freed: min/avg/max across ranks in group. * = measurement noise.",
     )
 
 
@@ -253,24 +326,29 @@ def exp_message_size(suspend_fn, resume_fn):
 
     rows = []
     for elements, label, scenario in sizes:
+        assert elements % WORLD_SIZE == 0, f"{label}: {elements} not divisible by {WORLD_SIZE}"
         pg = dist.new_group(ranks=list(range(WORLD_SIZE)))
 
         baseline = clean_baseline()
         do_warmup(pg, "allreduce", elements, warmup, RANK, WORLD_SIZE)
         nccl_mem = clean_measure() - baseline
 
-        freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn)
+        freed, sus_api, sus_total, res_ms = measure_one(pg, suspend_fn, resume_fn)
+        nccl_stats = gather_stats(nccl_mem)
+        freed_stats = gather_stats(freed)
 
         if RANK == 0:
-            rows.append([label, scenario, f"{nccl_mem:.1f}", f"{freed:.1f}", f"{sus_ms:.1f}", f"{res_ms:.1f}"])
+            rows.append([label, scenario, fmt_stats(*nccl_stats), fmt_stats(*freed_stats),
+                         f"{sus_api:.0f}", f"{res_ms:.0f}"])
             log(f"    {label} done")
         dist.barrier()
         destroy_pg(pg)
 
     print_table(
-        ["msg_size", "scenario", "nccl(MB)", "freed(MB)", "sus(ms)", "res(ms)"],
+        ["msg_size", "scenario", "nccl(MB)", "freed(MB)", "sus_api(ms)", "res(ms)"],
         rows,
         f"Exp 2: Message size ({WORLD_SIZE} GPUs, allreduce)",
+        "  nccl/freed: min/avg/max across all ranks.",
     )
 
 
@@ -288,6 +366,7 @@ def exp_collective_type(suspend_fn, resume_fn):
         ("p2p",            "PP activation transfer"),
     ]
     msg_elements = 2 * 4096 * 4096  # 128 MB float32
+    assert msg_elements % WORLD_SIZE == 0
     warmup = 10
 
     rows = []
@@ -298,19 +377,23 @@ def exp_collective_type(suspend_fn, resume_fn):
         do_warmup(pg, op, msg_elements, warmup, RANK, WORLD_SIZE)
         nccl_mem = clean_measure() - baseline
 
-        freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn)
+        freed, sus_api, sus_total, res_ms = measure_one(pg, suspend_fn, resume_fn)
+        nccl_stats = gather_stats(nccl_mem)
+        freed_stats = gather_stats(freed)
 
         if RANK == 0:
-            rows.append([op, scenario, f"{nccl_mem:.1f}", f"{freed:.1f}",
-                         f"{nccl_mem - freed:.1f}" if nccl_mem > 0 else "N/A",
-                         f"{sus_ms:.1f}", f"{res_ms:.1f}"])
+            rows.append([op, scenario, fmt_stats(*nccl_stats), fmt_stats(*freed_stats),
+                         fmt_persist(nccl_stats[1], freed_stats[1]),
+                         f"{sus_api:.0f}", f"{res_ms:.0f}"])
         dist.barrier()
         destroy_pg(pg)
 
     print_table(
-        ["collective", "parallelism", "nccl(MB)", "freed(MB)", "persist(MB)", "sus(ms)", "res(ms)"],
+        ["collective", "parallelism", "nccl(MB)", "freed(MB)", "persist(MB)",
+         "sus_api(ms)", "res(ms)"],
         rows,
         f"Exp 3: Collective type ({WORLD_SIZE} GPUs, 128MB msg)",
+        "  nccl/freed: min/avg/max across all ranks. * = measurement noise.",
     )
 
 
@@ -360,32 +443,38 @@ def exp_num_groups(suspend_fn, resume_fn):
         t0 = time.perf_counter()
         for _, c in comms:
             suspend_fn(c)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        freed = pre - gpu_used_mb()
         t2 = time.perf_counter()
+        freed = pre - gpu_used_mb()
+        t3 = time.perf_counter()
         for _, c in comms:
             resume_fn(c)
         torch.cuda.synchronize()
-        t3 = time.perf_counter()
+        t4 = time.perf_counter()
+
+        total_stats = gather_stats(total_nccl)
+        freed_stats = gather_stats(freed)
 
         if RANK == 0:
             rows.append([
                 n, real_world.get(n, ""),
-                f"{total_nccl:.1f}", f"{per_group:.1f}", f"{freed:.1f}",
-                f"{(t1 - t0) * 1000:.1f}", f"{(t3 - t2) * 1000:.1f}",
+                fmt_stats(*total_stats), f"{per_group:.0f}", fmt_stats(*freed_stats),
+                f"{(t1 - t0) * 1000:.0f}", f"{(t4 - t3) * 1000:.0f}",
             ])
         dist.barrier()
-        # Destroy all groups to prevent cross-experiment contamination
         for pg in pgs:
             destroy_pg(pg)
 
     print_table(
-        ["n_groups", "scenario", "total(MB)", "per_grp(MB)", "freed(MB)", "sus(ms)", "res(ms)"],
+        ["n_grps", "scenario", "total(MB)", "per_grp(MB)", "freed(MB)",
+         "sus_api(ms)", "res(ms)"],
         rows,
         f"Exp 4: Number of groups ({WORLD_SIZE} GPUs, allreduce 128MB)",
+        "  total/freed: min/avg/max across all ranks. per_grp from rank 0.",
     )
 
 
@@ -407,17 +496,21 @@ def exp_warmup_rounds(suspend_fn, resume_fn):
         do_warmup(pg, "allreduce", msg_elements, rounds, RANK, WORLD_SIZE)
         nccl_mem = clean_measure() - baseline
 
-        freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn)
+        freed, sus_api, sus_total, res_ms = measure_one(pg, suspend_fn, resume_fn)
+        nccl_stats = gather_stats(nccl_mem)
+        freed_stats = gather_stats(freed)
 
         if RANK == 0:
-            rows.append([rounds, f"{nccl_mem:.1f}", f"{freed:.1f}", f"{sus_ms:.1f}", f"{res_ms:.1f}"])
+            rows.append([rounds, fmt_stats(*nccl_stats), fmt_stats(*freed_stats),
+                         f"{sus_api:.0f}", f"{res_ms:.0f}"])
         dist.barrier()
         destroy_pg(pg)
 
     print_table(
-        ["rounds", "nccl(MB)", "freed(MB)", "sus(ms)", "res(ms)"],
+        ["rounds", "nccl(MB)", "freed(MB)", "sus_api(ms)", "res(ms)"],
         rows,
         f"Exp 5: Warmup rounds ({WORLD_SIZE} GPUs, allreduce 128MB)",
+        "  nccl/freed: min/avg/max across all ranks.",
     )
 
 
@@ -427,6 +520,7 @@ def exp_warmup_rounds(suspend_fn, resume_fn):
 
 def exp_mixed_ops(suspend_fn, resume_fn):
     msg_elements = 2 * 4096 * 4096  # 128MB
+    assert msg_elements % WORLD_SIZE == 0
     warmup = 5
 
     op_combos = [
@@ -453,22 +547,25 @@ def exp_mixed_ops(suspend_fn, resume_fn):
             do_warmup(pg, op, msg_elements, warmup, RANK, WORLD_SIZE)
         nccl_mem = clean_measure() - baseline
 
-        freed, sus_ms, _ = measure_one(pg, suspend_fn, resume_fn)
+        freed, sus_api, sus_total, _ = measure_one(pg, suspend_fn, resume_fn)
+        nccl_stats = gather_stats(nccl_mem)
+        freed_stats = gather_stats(freed)
 
         if RANK == 0:
             rows.append([
                 label, ", ".join(ops),
-                f"{nccl_mem:.1f}", f"{freed:.1f}",
-                f"{nccl_mem - freed:.1f}" if nccl_mem > 0 else "N/A",
-                f"{sus_ms:.1f}",
+                fmt_stats(*nccl_stats), fmt_stats(*freed_stats),
+                fmt_persist(nccl_stats[1], freed_stats[1]),
+                f"{sus_api:.0f}",
             ])
         dist.barrier()
         destroy_pg(pg)
 
     print_table(
-        ["scenario", "ops", "nccl(MB)", "freed(MB)", "persist(MB)", "sus(ms)"],
+        ["scenario", "ops", "nccl(MB)", "freed(MB)", "persist(MB)", "sus_api(ms)"],
         rows,
         f"Exp 6: Mixed ops on SAME group ({WORLD_SIZE} GPUs, 128MB per op)",
+        "  nccl/freed: min/avg/max across all ranks. * = measurement noise.",
     )
 
 
@@ -477,16 +574,21 @@ def exp_mixed_ops(suspend_fn, resume_fn):
 # ---------------------------------------------------------------------------
 
 def main():
-    global RANK, WORLD_SIZE
+    global RANK, LOCAL_RANK, WORLD_SIZE
 
     dist.init_process_group(backend="nccl")
     RANK = dist.get_rank()
     WORLD_SIZE = dist.get_world_size()
-    torch.cuda.set_device(RANK)
+    LOCAL_RANK = int(os.environ.get("LOCAL_RANK", RANK % torch.cuda.device_count()))
+    torch.cuda.set_device(LOCAL_RANK)
 
     log(f"=== NCCL Memory Profiling (world_size={WORLD_SIZE}) ===")
     log(f"GPU: {torch.cuda.get_device_name(0)}")
-    log(f"Baseline gpu_used: {gpu_used_mb():.0f} MB")
+
+    # Dummy warmup to trigger CUDA context / cuRAND / NCCL lazy init
+    # before any measurement, eliminating first-allocation noise.
+    cuda_warmup()
+    log(f"Baseline gpu_used (post-init): {gpu_used_mb():.0f} MB")
 
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
     from verl.utils.nccl_suspend import _get_nccl_lib, resume_nccl_comm, suspend_nccl_comm
@@ -513,9 +615,9 @@ def main():
         total_elapsed = time.perf_counter() - total_start
         log(f">>> {name} done in {elapsed:.0f}s (total {total_elapsed:.0f}s)")
 
-    log(f"\n{'=' * 80}")
+    log(f"\n{'=' * 90}")
     log("ALL PROFILING EXPERIMENTS COMPLETE")
-    log(f"{'=' * 80}")
+    log(f"{'=' * 90}")
 
     dist.destroy_process_group()
 
