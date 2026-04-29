@@ -425,13 +425,13 @@ class CheckpointEngineManager:
         """Suspend training-side NCCL comms (torch PG) on all training workers."""
         if not self.suspend_nccl_comms_enabled:
             return
-        ray.get(self.trainer.suspend_training_nccl_comms())
+        self.trainer.suspend_training_nccl_comms()
 
     def resume_training_comms(self):
         """Resume training-side NCCL comms on all training workers."""
         if not self.suspend_nccl_comms_enabled:
             return
-        ray.get(self.trainer.resume_training_nccl_comms())
+        self.trainer.resume_training_nccl_comms()
 
     @auto_await
     async def suspend_rollout_comms(self):
