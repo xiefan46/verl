@@ -145,8 +145,9 @@ def test_nccl_suspend_resume():
     log(rank, f"  Freed: {freed_reserved:.1f} MB reserved, {freed_allocated:.1f} MB allocated")
 
     # --- Step 6: Resume and verify ---
+    # NOTE: cannot use dist.barrier() here — NCCL comms are suspended!
+    # All ranks are already synchronized from the barrier before suspend.
     log(rank, "\n[Step 6] Calling ncclCommResume...")
-    dist.barrier()
 
     for name, comm in comm_handles:
         success = resume_nccl_comm(comm)
