@@ -110,44 +110,47 @@ def test_basic(suspend_fn, resume_fn):
 
 
 # ---------------------------------------------------------------------------
-# Test 2: P2P safety
+# Test 2: P2P safety (using batch_isend_irecv to avoid lazy 2-rank comm creation)
 # ---------------------------------------------------------------------------
+def _ring_p2p(pg, size, value_fn):
+    """Ring send/recv using batch_isend_irecv. Returns recv tensor."""
+    send_buf = torch.ones(size, size, device="cuda") * value_fn(RANK)
+    recv_buf = torch.zeros(size, size, device="cuda")
+    dst = (RANK + 1) % WORLD_SIZE
+    src = (RANK - 1) % WORLD_SIZE
+    ops = [
+        dist.P2POp(dist.isend, send_buf, dst, group=pg),
+        dist.P2POp(dist.irecv, recv_buf, src, group=pg),
+    ]
+    reqs = dist.batch_isend_irecv(ops)
+    for req in reqs:
+        req.wait()
+    return recv_buf
+
+
 def test_p2p(suspend_fn, resume_fn):
     log("\n[Test 2] P2P send/recv safety across suspend/resume")
-    pg = dist.distributed_c10d._get_default_group()
+    pg = dist.new_group(ranks=list(range(WORLD_SIZE)))
 
-    # Warmup: ring send/recv with large tensors
+    # Warmup: ring P2P with large tensors
     for _ in range(5):
-        send_buf = torch.randn(4096, 4096, device="cuda")
-        recv_buf = torch.empty_like(send_buf)
-        dst = (RANK + 1) % WORLD_SIZE
-        src = (RANK - 1) % WORLD_SIZE
-        s = dist.isend(send_buf, dst)
-        r = dist.irecv(recv_buf, src)
-        s.wait()
-        r.wait()
-        del send_buf, recv_buf
+        recv = _ring_p2p(pg, 4096, lambda r: r + 1)
+        del recv
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
 
-    comm = extract_comm(pg, "default")
+    comm = extract_comm(pg, "p2p")
     assert comm is not None
 
     # 5 suspend/resume cycles, each followed by P2P verify
     for cycle in range(5):
-        freed = suspend_resume_cycle([("default", comm)], suspend_fn, resume_fn)
+        freed = suspend_resume_cycle([("p2p", comm)], suspend_fn, resume_fn)
 
-        send_buf = torch.ones(2048, 2048, device="cuda") * (RANK + cycle + 1)
-        recv_buf = torch.zeros_like(send_buf)
-        dst = (RANK + 1) % WORLD_SIZE
+        recv = _ring_p2p(pg, 2048, lambda r: r + cycle + 1)
         src = (RANK - 1) % WORLD_SIZE
-        s = dist.isend(send_buf, dst)
-        r = dist.irecv(recv_buf, src)
-        s.wait()
-        r.wait()
         expected = src + cycle + 1
-        assert recv_buf[0, 0].item() == expected, f"FAIL cycle {cycle}: got {recv_buf[0, 0].item()}"
-        del send_buf, recv_buf
+        assert recv[0, 0].item() == expected, f"FAIL cycle {cycle}: got {recv[0, 0].item()}"
+        del recv
         log(f"  Cycle {cycle + 1}: P2P OK, freed={freed:.0f} MB")
 
     log("  PASS")

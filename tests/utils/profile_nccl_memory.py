@@ -174,10 +174,14 @@ def do_warmup(pg, op, msg_elements, rounds, rank, world_size):
             if my_idx >= 0:
                 dst = group_ranks[(my_idx + 1) % len(group_ranks)]
                 src = group_ranks[(my_idx - 1) % len(group_ranks)]
-                s = dist.isend(send_buf, dst, group=pg)
-                r = dist.irecv(recv_buf, src, group=pg)
-                s.wait()
-                r.wait()
+                # Use batch_isend_irecv to avoid lazy 2-rank comm creation
+                ops = [
+                    dist.P2POp(dist.isend, send_buf, dst, group=pg),
+                    dist.P2POp(dist.irecv, recv_buf, src, group=pg),
+                ]
+                reqs = dist.batch_isend_irecv(ops)
+                for req in reqs:
+                    req.wait()
             del send_buf, recv_buf
         else:
             raise ValueError(f"Unknown op: {op}")
