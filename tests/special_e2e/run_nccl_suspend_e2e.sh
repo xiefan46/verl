@@ -104,7 +104,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.test_freq=-1 \
     trainer.save_freq=-1 \
     trainer.total_epochs=1 \
-    trainer.total_training_steps=3 \
+    trainer.total_training_steps=100 \
     trainer.resume_mode=disable \
     trainer.nnodes=1 \
     trainer.n_gpus_per_node=${NUM_GPUS} \
