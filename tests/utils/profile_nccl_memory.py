@@ -40,6 +40,7 @@ Usage:
     torchrun --nproc_per_node=8 tests/utils/profile_nccl_memory.py
 """
 
+import gc
 import os
 import sys
 import time
@@ -67,6 +68,23 @@ def gpu_used_mb():
     return (total - free) / 1024**2
 
 
+def clean_baseline():
+    """Force GC + empty cache + sync + barrier for accurate baseline measurement."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    dist.barrier()
+    return gpu_used_mb()
+
+
+def clean_measure():
+    """Force GC + empty cache + sync for accurate post-warmup measurement."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    return gpu_used_mb()
+
+
 def extract_comm(pg):
     try:
         backend = pg._get_backend(torch.device("cuda"))
@@ -75,6 +93,14 @@ def extract_comm(pg):
     except Exception:
         pass
     return None
+
+
+def destroy_pg(pg):
+    """Destroy a non-default process group to release NCCL comm resources."""
+    try:
+        dist.destroy_process_group(pg)
+    except Exception:
+        pass
 
 
 def do_warmup(pg, op, msg_elements, rounds, rank, world_size):
@@ -124,7 +150,7 @@ def do_warmup(pg, op, msg_elements, rounds, rank, world_size):
     torch.cuda.synchronize()
 
 
-def measure_one(pg, suspend_fn, resume_fn, group_ranks):
+def measure_one(pg, suspend_fn, resume_fn):
     """Suspend one comm, measure freed + latency, resume. Returns (freed_mb, suspend_ms, resume_ms)."""
     comm = extract_comm(pg)
     if comm is None:
@@ -137,6 +163,7 @@ def measure_one(pg, suspend_fn, resume_fn, group_ranks):
 
     t0 = time.perf_counter()
     suspend_fn(comm)
+    gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     t1 = time.perf_counter()
@@ -166,36 +193,13 @@ def print_table(headers, rows, title=""):
     log()
 
 
-def elements_to_label(n):
-    """Convert float32 element count to human-readable size label."""
-    bytes_val = n * 4
-    if bytes_val >= 1024**3:
-        return f"{bytes_val / 1024**3:.0f}GB"
-    elif bytes_val >= 1024**2:
-        return f"{bytes_val / 1024**2:.0f}MB"
-    elif bytes_val >= 1024:
-        return f"{bytes_val / 1024:.0f}KB"
-    else:
-        return f"{bytes_val}B"
-
-
 # ---------------------------------------------------------------------------
 # Exp 1: Group size
-#
-# Real-world mapping:
-#   group_size=1 → no comm (baseline)
-#   group_size=2 → TP=2 (small model) or DP=2 (8 GPU / TP4)
-#   group_size=4 → TP=4 (Qwen2.5-32B typical) or EP=4
-#   group_size=8 → TP=8 (Qwen2.5-72B) or EP=8 (MoE full-node expert group)
-#
-# Fixed: allreduce (TP gradient sync), 256MB msg (~activation size for
-#   batch=2, seq=4096, hidden=8192, bf16 = 128MB, we use float32 so 256MB)
 # ---------------------------------------------------------------------------
 
 def exp_group_size(suspend_fn, resume_fn):
     sizes = [s for s in [2, 4, 8] if s <= WORLD_SIZE]
-    # Activation allreduce: batch=2, seq=4096, hidden=8192, float32 → 256MB
-    msg_elements = 2 * 4096 * 8192  # 67M elements = 256 MB float32
+    msg_elements = 2 * 4096 * 8192  # 256 MB float32
     warmup = 10
 
     rows = []
@@ -204,50 +208,31 @@ def exp_group_size(suspend_fn, resume_fn):
         pg = dist.new_group(ranks=group_ranks)
 
         if RANK in group_ranks:
-            torch.cuda.empty_cache()
-            baseline = gpu_used_mb()
+            baseline = clean_baseline()
             do_warmup(pg, "allreduce", msg_elements, warmup, RANK, gs)
-            torch.cuda.empty_cache()
-            nccl_mem = gpu_used_mb() - baseline
+            nccl_mem = clean_measure() - baseline
 
-            freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn, group_ranks)
+            freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn)
 
             real_world = {2: "TP=2 or DP=2", 4: "TP=4 (Qwen-32B)", 8: "TP=8 (Qwen-72B)"}
             if RANK == 0:
                 rows.append([
-                    gs,
-                    real_world.get(gs, ""),
-                    f"{nccl_mem:.1f}",
-                    f"{freed:.1f}",
-                    f"{nccl_mem - freed:.1f}",
-                    f"{sus_ms:.1f}",
-                    f"{res_ms:.1f}",
+                    gs, real_world.get(gs, ""),
+                    f"{nccl_mem:.1f}", f"{freed:.1f}", f"{nccl_mem - freed:.1f}",
+                    f"{sus_ms:.1f}", f"{res_ms:.1f}",
                 ])
         dist.barrier()
+        destroy_pg(pg)
 
     print_table(
         ["group_sz", "real_world", "nccl(MB)", "freed(MB)", "persist(MB)", "sus(ms)", "res(ms)"],
         rows,
-        "Exp 1: Group size (allreduce, batch=2 × seq=4096 × hidden=8192 = 256MB)",
+        "Exp 1: Group size (allreduce, batch=2 x seq=4096 x hidden=8192 = 256MB)",
     )
 
 
 # ---------------------------------------------------------------------------
 # Exp 2: Message size
-#
-# Real-world message sizes in training (bf16):
-#   ~4MB    → FSDP gradient bucket (PyTorch default ~25MB, per-param smaller)
-#   ~32MB   → Megatron TP allreduce: batch=1, seq=4k, hidden=4096
-#   ~80MB   → Megatron TP allreduce: batch=2, seq=4k, hidden=5120 (Qwen-32B)
-#   ~128MB  → Megatron TP allreduce: batch=2, seq=4k, hidden=8192 (Qwen-72B)
-#   ~512MB  → TP allreduce long seq: batch=1, seq=32k, hidden=8192 (Qwen-72B)
-#             or FSDP allgather: Qwen-72B layer/TP4 = 245M params × 2B
-#   ~1GB    → MoE all_to_all: batch=2, seq=4k, hidden=4096, top_k=8 (Qwen3-30B)
-#   ~2GB    → FSDP allgather no TP: Qwen-72B full layer ~980M params × 2B
-#
-# NOTE: NCCL uses fixed-size channel buffers (NCCL_BUFFSIZE ~4-8MB) and
-# streams data through ring/tree. Message size may NOT directly affect
-# internal memory. This experiment verifies that hypothesis.
 # ---------------------------------------------------------------------------
 
 def exp_message_size(suspend_fn, resume_fn):
@@ -266,18 +251,18 @@ def exp_message_size(suspend_fn, resume_fn):
     rows = []
     for elements, label, scenario in sizes:
         pg = dist.new_group(ranks=list(range(WORLD_SIZE)))
-        torch.cuda.empty_cache()
-        baseline = gpu_used_mb()
-        do_warmup(pg, "allreduce", elements, warmup, RANK, WORLD_SIZE)
-        torch.cuda.empty_cache()
-        nccl_mem = gpu_used_mb() - baseline
 
-        freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn, list(range(WORLD_SIZE)))
+        baseline = clean_baseline()
+        do_warmup(pg, "allreduce", elements, warmup, RANK, WORLD_SIZE)
+        nccl_mem = clean_measure() - baseline
+
+        freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn)
 
         if RANK == 0:
             rows.append([label, scenario, f"{nccl_mem:.1f}", f"{freed:.1f}", f"{sus_ms:.1f}", f"{res_ms:.1f}"])
             log(f"    {label} done")
         dist.barrier()
+        destroy_pg(pg)
 
     print_table(
         ["msg_size", "scenario", "nccl(MB)", "freed(MB)", "sus(ms)", "res(ms)"],
@@ -288,20 +273,6 @@ def exp_message_size(suspend_fn, resume_fn):
 
 # ---------------------------------------------------------------------------
 # Exp 3: Collective type
-#
-# Each collective maps to a parallelism dimension:
-#   allreduce       → TP gradient sync (Megatron column/row parallel)
-#   allgather       → FSDP unshard / Megatron sequence parallel
-#   reduce_scatter  → FSDP gradient shard
-#   all_to_all      → Expert Parallelism token dispatch/combine (MoE)
-#   broadcast       → PP (pipeline parallel) weight broadcast, or TP parameter broadcast
-#   p2p (send/recv) → PP inter-stage activation transfer
-#
-# Fixed: 8 GPU, message size calibrated per collective:
-#   allreduce/allgather/reduce_scatter: 128MB (TP activation, b=2,s=4k,h=8192,bf16)
-#   all_to_all: 128MB (MoE token dispatch: batch=2, seq=4k, hidden=4096, top_k=8)
-#   broadcast: 128MB
-#   p2p: 128MB (PP micro-batch activation)
 # ---------------------------------------------------------------------------
 
 def exp_collective_type(suspend_fn, resume_fn):
@@ -313,26 +284,25 @@ def exp_collective_type(suspend_fn, resume_fn):
         ("broadcast",      "PP weight broadcast"),
         ("p2p",            "PP activation transfer"),
     ]
-    # 128MB float32 = batch=2, seq=4096, hidden=4096
-    msg_elements = 2 * 4096 * 4096  # 33M elements = 128 MB float32
+    msg_elements = 2 * 4096 * 4096  # 128 MB float32
     warmup = 10
 
     rows = []
     for op, scenario in ops:
         pg = dist.new_group(ranks=list(range(WORLD_SIZE)))
-        torch.cuda.empty_cache()
-        baseline = gpu_used_mb()
-        do_warmup(pg, op, msg_elements, warmup, RANK, WORLD_SIZE)
-        torch.cuda.empty_cache()
-        nccl_mem = gpu_used_mb() - baseline
 
-        freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn, list(range(WORLD_SIZE)))
+        baseline = clean_baseline()
+        do_warmup(pg, op, msg_elements, warmup, RANK, WORLD_SIZE)
+        nccl_mem = clean_measure() - baseline
+
+        freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn)
 
         if RANK == 0:
             rows.append([op, scenario, f"{nccl_mem:.1f}", f"{freed:.1f}",
                          f"{nccl_mem - freed:.1f}" if nccl_mem > 0 else "N/A",
                          f"{sus_ms:.1f}", f"{res_ms:.1f}"])
         dist.barrier()
+        destroy_pg(pg)
 
     print_table(
         ["collective", "parallelism", "nccl(MB)", "freed(MB)", "persist(MB)", "sus(ms)", "res(ms)"],
@@ -343,19 +313,11 @@ def exp_collective_type(suspend_fn, resume_fn):
 
 # ---------------------------------------------------------------------------
 # Exp 4: Number of groups
-#
-# Real Megatron group configurations (8 GPU, single node):
-#   Minimal FSDP:   2 groups  (DP shard + DP replicate)
-#   FSDP + TP:      4 groups  (TP, DP shard, DP replicate, TP-DP)
-#   Full Megatron:  6 groups  (TP, DP, EP, CP, PP, TP-DP cross)
-#   Megatron + aux: 8 groups  (above + TP-EP, DP-CP)
-#   Upper bound:    12 groups (all combined groups for Megatron 3D+EP+CP)
 # ---------------------------------------------------------------------------
 
 def exp_num_groups(suspend_fn, resume_fn):
     counts = [1, 2, 4, 6, 8, 12]
-    # TP-like allreduce, 128MB
-    msg_elements = 2 * 4096 * 4096
+    msg_elements = 2 * 4096 * 4096  # 128MB
     warmup = 5
 
     real_world = {
@@ -371,8 +333,8 @@ def exp_num_groups(suspend_fn, resume_fn):
     rows = []
     for n in counts:
         log(f"    n={n} groups ...")
-        torch.cuda.empty_cache()
-        baseline = gpu_used_mb()
+
+        baseline = clean_baseline()
 
         pgs = []
         comms = []
@@ -384,8 +346,7 @@ def exp_num_groups(suspend_fn, resume_fn):
             if comm is not None:
                 comms.append((f"g{i}", comm))
 
-        torch.cuda.empty_cache()
-        total_nccl = gpu_used_mb() - baseline
+        total_nccl = clean_measure() - baseline
         per_group = total_nccl / n if n > 0 else 0
 
         # Suspend all
@@ -396,6 +357,7 @@ def exp_num_groups(suspend_fn, resume_fn):
         t0 = time.perf_counter()
         for _, c in comms:
             suspend_fn(c)
+        gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -408,15 +370,14 @@ def exp_num_groups(suspend_fn, resume_fn):
 
         if RANK == 0:
             rows.append([
-                n,
-                real_world.get(n, ""),
-                f"{total_nccl:.1f}",
-                f"{per_group:.1f}",
-                f"{freed:.1f}",
-                f"{(t1 - t0) * 1000:.1f}",
-                f"{(t3 - t2) * 1000:.1f}",
+                n, real_world.get(n, ""),
+                f"{total_nccl:.1f}", f"{per_group:.1f}", f"{freed:.1f}",
+                f"{(t1 - t0) * 1000:.1f}", f"{(t3 - t2) * 1000:.1f}",
             ])
         dist.barrier()
+        # Destroy all groups to prevent cross-experiment contamination
+        for pg in pgs:
+            destroy_pg(pg)
 
     print_table(
         ["n_groups", "scenario", "total(MB)", "per_grp(MB)", "freed(MB)", "sus(ms)", "res(ms)"],
@@ -427,35 +388,28 @@ def exp_num_groups(suspend_fn, resume_fn):
 
 # ---------------------------------------------------------------------------
 # Exp 5: Warmup rounds
-#
-# Real training does thousands of steps, each step may do 10-50 collectives
-# per group (forward + backward + optimizer). Question: does NCCL allocate
-# more internal buffers over time, or is it fixed after first few ops?
-#
-# We test: 1, 5, 20, 100, 500 rounds to cover first-op → steady-state.
 # ---------------------------------------------------------------------------
 
 def exp_warmup_rounds(suspend_fn, resume_fn):
     rounds_list = [1, 5, 20, 100, 500]
-    # 128MB activation allreduce
-    msg_elements = 2 * 4096 * 4096
+    msg_elements = 2 * 4096 * 4096  # 128MB
 
     log(f"  Testing warmup rounds: {rounds_list} ...")
     rows = []
     for rounds in rounds_list:
         log(f"    {rounds} rounds ...")
         pg = dist.new_group(ranks=list(range(WORLD_SIZE)))
-        torch.cuda.empty_cache()
-        baseline = gpu_used_mb()
-        do_warmup(pg, "allreduce", msg_elements, rounds, RANK, WORLD_SIZE)
-        torch.cuda.empty_cache()
-        nccl_mem = gpu_used_mb() - baseline
 
-        freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn, list(range(WORLD_SIZE)))
+        baseline = clean_baseline()
+        do_warmup(pg, "allreduce", msg_elements, rounds, RANK, WORLD_SIZE)
+        nccl_mem = clean_measure() - baseline
+
+        freed, sus_ms, res_ms = measure_one(pg, suspend_fn, resume_fn)
 
         if RANK == 0:
             rows.append([rounds, f"{nccl_mem:.1f}", f"{freed:.1f}", f"{sus_ms:.1f}", f"{res_ms:.1f}"])
         dist.barrier()
+        destroy_pg(pg)
 
     print_table(
         ["rounds", "nccl(MB)", "freed(MB)", "sus(ms)", "res(ms)"],
@@ -466,14 +420,6 @@ def exp_warmup_rounds(suspend_fn, resume_fn):
 
 # ---------------------------------------------------------------------------
 # Exp 6: Mixed ops on same group
-#
-# In real training, the same ProcessGroup may be used for multiple op types:
-#   - FSDP: allgather (unshard) + reduce_scatter (shard) on same group
-#   - Megatron TP: allreduce + allgather (sequence parallel) on same group
-#   - MoE: all_to_all + allreduce on same EP group
-#
-# Question: does using more op types on the SAME comm increase memory?
-# (Each op type may trigger different NCCL algorithms → different buffers)
 # ---------------------------------------------------------------------------
 
 def exp_mixed_ops(suspend_fn, resume_fn):
@@ -498,25 +444,23 @@ def exp_mixed_ops(suspend_fn, resume_fn):
     rows = []
     for ops, label in op_combos:
         pg = dist.new_group(ranks=list(range(WORLD_SIZE)))
-        torch.cuda.empty_cache()
-        baseline = gpu_used_mb()
+
+        baseline = clean_baseline()
         for op in ops:
             do_warmup(pg, op, msg_elements, warmup, RANK, WORLD_SIZE)
-        torch.cuda.empty_cache()
-        nccl_mem = gpu_used_mb() - baseline
+        nccl_mem = clean_measure() - baseline
 
-        freed, sus_ms, _ = measure_one(pg, suspend_fn, resume_fn, list(range(WORLD_SIZE)))
+        freed, sus_ms, _ = measure_one(pg, suspend_fn, resume_fn)
 
         if RANK == 0:
             rows.append([
-                label,
-                ", ".join(ops),
-                f"{nccl_mem:.1f}",
-                f"{freed:.1f}",
+                label, ", ".join(ops),
+                f"{nccl_mem:.1f}", f"{freed:.1f}",
                 f"{nccl_mem - freed:.1f}" if nccl_mem > 0 else "N/A",
                 f"{sus_ms:.1f}",
             ])
         dist.barrier()
+        destroy_pg(pg)
 
     print_table(
         ["scenario", "ops", "nccl(MB)", "freed(MB)", "persist(MB)", "sus(ms)"],
