@@ -724,6 +724,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.base_sync_done = True
         set_expandable_segments(True)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def suspend_training_nccl_comms(self):
+        """Suspend all training-side NCCL comms in this worker process."""
+        from verl.utils.nccl_suspend import suspend_training_comms
+
+        suspend_training_comms()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def resume_training_nccl_comms(self):
+        """Resume all training-side NCCL comms in this worker process."""
+        from verl.utils.nccl_suspend import resume_training_comms
+
+        resume_training_comms()
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
         """Execute checkpoint engine method.

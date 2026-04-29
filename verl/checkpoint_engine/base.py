@@ -417,9 +417,42 @@ class CheckpointEngineManager:
         """Resume all rollout replicas: recover kv_cache and weights device memory."""
         await asyncio.gather(*[r.wake_up() for r in self.replicas])
 
+    # --- NCCL comm suspend/resume for colocated mode ---
+    # Training comms: dispatched to training workers via Ray RPC
+    # Rollout comms: dispatched to rollout servers via Ray RPC
+
+    def suspend_training_comms(self):
+        """Suspend training-side NCCL comms (torch PG) on all training workers."""
+        if not self.suspend_nccl_comms_enabled:
+            return
+        ray.get(self.trainer.suspend_training_nccl_comms())
+
+    def resume_training_comms(self):
+        """Resume training-side NCCL comms on all training workers."""
+        if not self.suspend_nccl_comms_enabled:
+            return
+        ray.get(self.trainer.resume_training_nccl_comms())
+
+    @auto_await
+    async def suspend_rollout_comms(self):
+        """Suspend rollout-side NCCL comms (vLLM pynccl) on all rollout servers."""
+        if not self.suspend_nccl_comms_enabled:
+            return
+        await asyncio.gather(*[r.suspend_nccl_comms() for r in self.replicas])
+
+    @auto_await
+    async def resume_rollout_comms(self):
+        """Resume rollout-side NCCL comms on all rollout servers."""
+        if not self.suspend_nccl_comms_enabled:
+            return
+        await asyncio.gather(*[r.resume_nccl_comms() for r in self.replicas])
+
     @auto_await
     async def update_weights(self, global_steps: int = None):
         """Update weights from trainer to rollout replicas.
+
+        NCCL comm state on entry: training ACTIVE, rollout SUSPENDED
+        NCCL comm state on exit:  training SUSPENDED, rollout ACTIVE
 
         Args:
             global_steps: The global steps of the trainer.
@@ -433,40 +466,40 @@ class CheckpointEngineManager:
         # 1. abort and save all unfinished requests for partial rollout
         await asyncio.gather(*[r.abort_all_requests() for r in self.replicas])
 
-        # 2. create a temporay worker group for all replicas
+        # 2. create a temporary worker group for all replicas
         workers = []
         for replica in self.replicas:
             workers.extend(replica.workers)
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         trainer = self.trainer
 
-        # 3. sleep replicas to free kv_cache before weight sync (if free_cache_engine is enabled)
+        # 3. sleep replicas to free kv_cache before weight sync
         await self.sleep_replicas()
 
-        # 3.5. suspend rollout NCCL comms to free additional GPU memory
-        if self.suspend_nccl_comms_enabled:
-            await asyncio.gather(*[r.suspend_nccl_comms() for r in self.replicas])
+        # 4. suspend training comms → both sides now suspended → max memory for weight transfer
+        # (rollout comms already suspended by caller in ray_trainer.py)
+        self.suspend_training_comms()
 
-        # 4. build process group
+        # 5. build process group (temporary group, not affected by suspend)
         self.build_process_group(rollout)
 
-        # 5. update weights of all workers
+        # 6. update weights of all workers
         ray.get(trainer.update_weights(global_steps=global_steps) + rollout.update_weights(global_steps=global_steps))
 
-        # 6. finalize all workers
+        # 7. finalize all workers
         ray.get(
             trainer.execute_checkpoint_engine(["finalize"] * trainer.world_size)
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
 
-        # 6.5. resume rollout NCCL comms before wake_up (vLLM needs NCCL for TP operations)
-        if self.suspend_nccl_comms_enabled:
-            await asyncio.gather(*[r.resume_nccl_comms() for r in self.replicas])
+        # 8. transition to ROLLOUT state: resume rollout, keep training suspended
+        await self.resume_rollout_comms()
+        # training comms stay suspended → entering ROLLOUT state for next step
 
-        # 7. resume replicas to recover kv_cache (for free_cache_engine scenarios)
+        # 9. resume replicas to recover kv_cache
         await self.wake_up_replicas()
 
-        # 8. resume all unfinished requests for partial rollout
+        # 10. resume all unfinished requests for partial rollout
         await asyncio.gather(*[r.resume_generation() for r in self.replicas])
 
 

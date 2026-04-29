@@ -560,10 +560,15 @@ class RayPPOTrainer:
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
                 self.checkpoint_manager.sleep_replicas()
+
+                # Transition: ROLLOUT → TRAINING state (for reward computation)
+                self.checkpoint_manager.resume_training_comms()
+                self.checkpoint_manager.suspend_rollout_comms()
+
                 batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
-                # wake up rollout model
-                # replace with wake_up method once supported
+
+                # update_weights transitions back to ROLLOUT state internally
                 self.checkpoint_manager.update_weights(self.global_steps)
 
             # unpad
@@ -1361,6 +1366,12 @@ class RayPPOTrainer:
                             self.async_rollout_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
                         self.checkpoint_manager.sleep_replicas()
+
+                        # Transition: ROLLOUT → TRAINING state
+                        # Resume training comms (needed for reward/training), suspend rollout comms (idle)
+                        self.checkpoint_manager.resume_training_comms()
+                        self.checkpoint_manager.suspend_rollout_comms()
+
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
@@ -1371,10 +1382,20 @@ class RayPPOTrainer:
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
+
+                            # Transition back to ROLLOUT state for second generation
+                            self.checkpoint_manager.suspend_training_comms()
+                            self.checkpoint_manager.resume_rollout_comms()
+
                             if curr_step_profile:
                                 self.async_rollout_manager.start_profile()
                             gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
                             self.checkpoint_manager.sleep_replicas()
+
+                            # Transition back to TRAINING state
+                            self.checkpoint_manager.resume_training_comms()
+                            self.checkpoint_manager.suspend_rollout_comms()
+
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
                             batch = batch.union(gen_baseline_output)
