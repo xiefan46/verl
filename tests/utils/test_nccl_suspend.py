@@ -209,9 +209,11 @@ def test_multicycle_mixed(suspend_fn, resume_fn):
         dist.all_gather(gathered, buf, group=pg)
         del gathered
 
-        out = torch.empty(2048 * WORLD_SIZE, device="cuda")
-        dist.reduce_scatter_tensor(out, buf.flatten().repeat(WORLD_SIZE), group=pg)
-        del out, buf
+        # reduce_scatter: input=2048*2048*ws, output=2048*2048
+        rs_inp = torch.randn(2048 * 2048 * WORLD_SIZE, device="cuda")
+        rs_out = torch.empty(2048 * 2048, device="cuda")
+        dist.reduce_scatter_tensor(rs_out, rs_inp, group=pg)
+        del rs_inp, rs_out, buf
 
         # Suspend / resume
         freed = suspend_resume_cycle([("mixed", comm)], suspend_fn, resume_fn)
