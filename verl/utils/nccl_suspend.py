@@ -294,11 +294,12 @@ def suspend_training_comms() -> bool:
     """
     global _training_suspended
     if _training_suspended:
-        logger.debug("[NCCLSuspend] Training: already suspended, skipping.")
+        print("[NCCLSuspend] Training: already suspended, skipping.", flush=True)
         return False
 
     handles = _extract_training_comm_handles()
     if not handles:
+        print("[NCCLSuspend] Training suspend: no handles available (comms not initialized yet)", flush=True)
         return False
 
     ok, freed = _suspend_comms(handles, "Training")
@@ -311,16 +312,21 @@ def resume_training_comms() -> bool:
     """Resume all training-side NCCL comms in this process.
 
     Idempotent: if not suspended, this is a no-op.
+    First call before any suspend is expected — just extract handles for caching.
 
     Returns True if any comm was resumed.
     """
     global _training_suspended
     if not _training_suspended:
-        logger.debug("[NCCLSuspend] Training: not suspended, skipping resume.")
+        # Even if not suspended, try to extract handles so they get cached
+        # for the next suspend call (comms may have been initialized by now).
+        _extract_training_comm_handles()
+        print("[NCCLSuspend] Training: not suspended, skipping resume.", flush=True)
         return False
 
     handles = _extract_training_comm_handles()
     if not handles:
+        print("[NCCLSuspend] Training resume: no handles available", flush=True)
         return False
 
     ok, reclaimed = _resume_comms(handles, "Training")
@@ -427,11 +433,12 @@ def suspend_rollout_comms() -> bool:
     """
     global _rollout_suspended
     if _rollout_suspended:
-        logger.debug("[NCCLSuspend] Rollout: already suspended, skipping.")
+        print("[NCCLSuspend] Rollout: already suspended, skipping.", flush=True)
         return False
 
     handles = _extract_rollout_comm_handles()
     if not handles:
+        print("[NCCLSuspend] Rollout suspend: no handles available", flush=True)
         return False
 
     _gloo_barrier()
@@ -452,7 +459,8 @@ def resume_rollout_comms() -> bool:
     """
     global _rollout_suspended
     if not _rollout_suspended:
-        logger.debug("[NCCLSuspend] Rollout: not suspended, skipping resume.")
+        _extract_rollout_comm_handles()  # cache handles for next suspend
+        print("[NCCLSuspend] Rollout: not suspended, skipping resume.", flush=True)
         return False
 
     handles = _extract_rollout_comm_handles()
