@@ -261,6 +261,7 @@ def exp_message_size(suspend_fn, resume_fn):
         (512 * 1024 * 1024,  "2GB",    "FSDP allgather Qwen-72B no TP"),
     ]
     warmup = 10
+    log(f"  Testing {len(sizes)} message sizes ...")
 
     rows = []
     for elements, label, scenario in sizes:
@@ -275,6 +276,7 @@ def exp_message_size(suspend_fn, resume_fn):
 
         if RANK == 0:
             rows.append([label, scenario, f"{nccl_mem:.1f}", f"{freed:.1f}", f"{sus_ms:.1f}", f"{res_ms:.1f}"])
+            log(f"    {label} done")
         dist.barrier()
 
     print_table(
@@ -365,8 +367,10 @@ def exp_num_groups(suspend_fn, resume_fn):
         12: "Megatron 3D+EP+CP all combos",
     }
 
+    log(f"  Testing group counts: {counts} ...")
     rows = []
     for n in counts:
+        log(f"    n={n} groups ...")
         torch.cuda.empty_cache()
         baseline = gpu_used_mb()
 
@@ -436,8 +440,10 @@ def exp_warmup_rounds(suspend_fn, resume_fn):
     # 128MB activation allreduce
     msg_elements = 2 * 4096 * 4096
 
+    log(f"  Testing warmup rounds: {rounds_list} ...")
     rows = []
     for rounds in rounds_list:
+        log(f"    {rounds} rounds ...")
         pg = dist.new_group(ranks=list(range(WORLD_SIZE)))
         torch.cuda.empty_cache()
         baseline = gpu_used_mb()
@@ -543,12 +549,22 @@ def main():
         dist.destroy_process_group()
         return
 
-    exp_group_size(suspend_nccl_comm, resume_nccl_comm)
-    exp_message_size(suspend_nccl_comm, resume_nccl_comm)
-    exp_collective_type(suspend_nccl_comm, resume_nccl_comm)
-    exp_num_groups(suspend_nccl_comm, resume_nccl_comm)
-    exp_warmup_rounds(suspend_nccl_comm, resume_nccl_comm)
-    exp_mixed_ops(suspend_nccl_comm, resume_nccl_comm)
+    experiments = [
+        ("Exp 1/6: Group size",      exp_group_size,     "~15s"),
+        ("Exp 2/6: Message size",    exp_message_size,   "~60s"),
+        ("Exp 3/6: Collective type", exp_collective_type, "~30s"),
+        ("Exp 4/6: Num groups",      exp_num_groups,     "~90s"),
+        ("Exp 5/6: Warmup rounds",   exp_warmup_rounds,  "~120s"),
+        ("Exp 6/6: Mixed ops",       exp_mixed_ops,      "~60s"),
+    ]
+    total_start = time.perf_counter()
+    for i, (name, fn, est) in enumerate(experiments):
+        log(f"\n>>> Starting {name} (est {est}) ...")
+        t = time.perf_counter()
+        fn(suspend_nccl_comm, resume_nccl_comm)
+        elapsed = time.perf_counter() - t
+        total_elapsed = time.perf_counter() - total_start
+        log(f">>> {name} done in {elapsed:.0f}s (total {total_elapsed:.0f}s)")
 
     log(f"\n{'=' * 80}")
     log("ALL PROFILING EXPERIMENTS COMPLETE")
