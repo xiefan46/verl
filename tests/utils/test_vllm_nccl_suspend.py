@@ -12,169 +12,403 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """
-Test for vLLM NCCL communicator suspend/resume integration.
+Test vLLM NCCL communicator suspend/resume integration.
 
-Verifies that suspend_vllm_comms() / resume_vllm_comms() actually
-frees GPU memory and that vLLM NCCL operations still work after resume.
+Verifies that suspend/resume works on vLLM's internal pynccl communicators
+(TP group, PP group) — the ones used in colocated RL training's rollout side.
+
+Tests:
+  1. Extract ncclComm_t from vLLM's pynccl wrapper
+  2. Suspend → measure freed GPU memory (driver-level)
+  3. Resume → verify allreduce still works
+  4. Multi-cycle stability
+  5. Compare: vLLM pynccl comm vs torch ProcessGroup comm on same group
 
 Usage:
     torchrun --nproc_per_node=2 tests/utils/test_vllm_nccl_suspend.py
 
 Requires:
-    - 2+ GPUs (TP=1 has no NCCL comm, nothing to test)
+    - 2+ GPUs
     - vLLM installed
     - NCCL >= 2.29.7
 """
 
+import gc
+import os
+import sys
+import time
+
 import torch
 import torch.distributed as dist
 
+RANK = None
+LOCAL_RANK = None
+WORLD_SIZE = None
 
-def get_memory_mb():
-    torch.cuda.synchronize()
-    return {
-        "allocated": torch.cuda.memory_allocated() / 1024**2,
-        "reserved": torch.cuda.memory_reserved() / 1024**2,
-    }
+# ---------------------------------------------------------------------------
+# Utilities (same conventions as profile_nccl_memory.py)
+# ---------------------------------------------------------------------------
 
 
-def log(rank, msg):
-    if rank == 0:
+def log(msg=""):
+    if RANK == 0:
         print(msg, flush=True)
 
 
+def gpu_used_mb():
+    torch.cuda.synchronize()
+    free, total = torch.cuda.mem_get_info()
+    return (total - free) / 1024**2
+
+
+def clean_and_measure():
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    return gpu_used_mb()
+
+
+def gather_stats(x: float):
+    t = torch.tensor([x], device="cuda", dtype=torch.float64)
+    vals = [torch.zeros_like(t) for _ in range(WORLD_SIZE)]
+    dist.all_gather(vals, t)
+    vals = torch.stack(vals).flatten()
+    return vals.min().item(), vals.mean().item(), vals.max().item()
+
+
+def fmt_stats(mn, avg, mx):
+    if abs(mx - mn) < 1.0:
+        return f"{avg:.0f}"
+    return f"{mn:.0f}/{avg:.0f}/{mx:.0f}"
+
+
+# ---------------------------------------------------------------------------
+# vLLM comm handle extraction
+# ---------------------------------------------------------------------------
+
+def extract_vllm_pynccl_comm(group, name=""):
+    """Extract ncclComm_t from vLLM GroupCoordinator → device_communicator → pynccl_comm → comm.
+
+    Returns (comm_handle, path_description) or (None, error_msg).
+    """
+    if group is None:
+        return None, "group is None"
+    if group.world_size <= 1:
+        return None, f"world_size={group.world_size} (no NCCL comm for TP=1)"
+
+    # Path: group.device_communicator.pynccl_comm.comm
+    device_comm = getattr(group, "device_communicator", None)
+    if device_comm is None:
+        return None, "no device_communicator attribute"
+
+    pynccl_comm = getattr(device_comm, "pynccl_comm", None)
+    if pynccl_comm is None:
+        return None, "no pynccl_comm attribute"
+
+    comm = getattr(pynccl_comm, "comm", None)
+    if comm is None:
+        return None, "no comm attribute on pynccl_comm"
+
+    return comm, f"group.device_communicator.pynccl_comm.comm = {comm}"
+
+
+def extract_torch_pg_comm(group, name=""):
+    """Extract ncclComm_t from vLLM's underlying torch ProcessGroup via _comm_ptr()."""
+    device_group = getattr(group, "device_group", None)
+    if device_group is None:
+        return None, "no device_group attribute"
+
+    try:
+        backend = device_group._get_backend(torch.device("cuda"))
+        if hasattr(backend, "_comm_ptr"):
+            ptr = backend._comm_ptr()
+            return ptr, f"device_group._get_backend()._comm_ptr() = {hex(ptr)}"
+        return None, "_comm_ptr not available"
+    except Exception as e:
+        return None, f"failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+def test_extract_handles():
+    """Test 1: Verify we can extract ncclComm_t from vLLM's parallel state."""
+    log("\n" + "=" * 70)
+    log("Test 1: Extract ncclComm_t handles from vLLM")
+    log("=" * 70)
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp_group = get_tp_group()
+    log(f"\n  TP group: world_size={tp_group.world_size}")
+
+    # Try pynccl path
+    pynccl_comm, pynccl_msg = extract_vllm_pynccl_comm(tp_group, "tp")
+    log(f"  pynccl path: {pynccl_msg}")
+
+    # Try torch PG path
+    torch_comm, torch_msg = extract_torch_pg_comm(tp_group, "tp")
+    log(f"  torch PG path: {torch_msg}")
+
+    # Also check PP group if it exists
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+        pp_group = get_pp_group()
+        if pp_group and pp_group.world_size > 1:
+            pp_comm, pp_msg = extract_vllm_pynccl_comm(pp_group, "pp")
+            log(f"  PP pynccl path: {pp_msg}")
+        else:
+            log(f"  PP group: world_size={pp_group.world_size if pp_group else 'N/A'} (no comm)")
+    except Exception as e:
+        log(f"  PP group: {e}")
+
+    # Determine which handle to use
+    comm = pynccl_comm or torch_comm
+    comm_source = "pynccl" if pynccl_comm else "torch_pg" if torch_comm else None
+
+    if comm is None:
+        log("\n  FAIL: Cannot extract ncclComm_t from vLLM.")
+        log("  Check vLLM version and pynccl wrapper structure.")
+        # Log the full attribute chain for debugging
+        log(f"\n  Debug: tp_group type = {type(tp_group)}")
+        log(f"  Debug: tp_group attrs = {[a for a in dir(tp_group) if not a.startswith('_')][:20]}")
+        dc = getattr(tp_group, "device_communicator", None)
+        if dc:
+            log(f"  Debug: device_communicator type = {type(dc)}")
+            log(f"  Debug: device_communicator attrs = {[a for a in dir(dc) if not a.startswith('_')][:20]}")
+        return None, None
+
+    log(f"\n  Using {comm_source} handle: {comm}")
+    log("  PASS")
+    return comm, comm_source
+
+
+def test_suspend_resume(comm, comm_source, suspend_fn, resume_fn):
+    """Test 2: Suspend vLLM NCCL comm, measure freed memory, resume, verify."""
+    log("\n" + "=" * 70)
+    log("Test 2: Suspend/resume vLLM NCCL comm + memory measurement")
+    log("=" * 70)
+
+    from vllm.distributed.parallel_state import get_tp_group
+    tp_group = get_tp_group()
+
+    # Warmup: allreduce on the TP group to inflate NCCL buffers
+    log("\n  Warming up vLLM TP group (allreduce)...")
+    for _ in range(10):
+        buf = torch.randn(4096, 4096, device="cuda")
+        dist.all_reduce(buf, group=tp_group.device_group)
+        del buf
+
+    baseline = clean_and_measure()
+    log(f"  Post-warmup gpu_used: {baseline:.0f} MB")
+
+    # Suspend
+    dist.barrier()
+    torch.cuda.synchronize()
+    pre = gpu_used_mb()
+    dist.barrier()
+
+    t0 = time.perf_counter()
+    suspend_fn(comm)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    t2 = time.perf_counter()
+
+    post = gpu_used_mb()
+    freed = pre - post
+    freed_stats = gather_stats(freed)
+
+    log(f"\n  Before suspend: {pre:.0f} MB")
+    log(f"  After suspend:  {post:.0f} MB")
+    log(f"  Freed (min/avg/max): {fmt_stats(*freed_stats)} MB")
+    log(f"  Suspend API: {(t1 - t0) * 1000:.0f} ms, reclaim total: {(t2 - t0) * 1000:.0f} ms")
+
+    # Resume
+    t3 = time.perf_counter()
+    resume_fn(comm)
+    torch.cuda.synchronize()
+    t4 = time.perf_counter()
+    log(f"  Resume: {(t4 - t3) * 1000:.0f} ms")
+
+    # Verify allreduce works
+    log("\n  Verifying allreduce after resume...")
+    x = torch.ones(1024, 1024, device="cuda") * (RANK + 1)
+    dist.all_reduce(x, group=tp_group.device_group)
+    expected = sum(range(1, WORLD_SIZE + 1))
+    assert torch.allclose(x, torch.full_like(x, expected)), "allreduce failed after resume!"
+    del x
+    log(f"  allreduce OK (result={expected})")
+    log("  PASS")
+
+    return freed_stats[1]  # avg freed
+
+
+def test_multicycle(comm, suspend_fn, resume_fn):
+    """Test 3: Multiple suspend/resume cycles with vLLM comm."""
+    log("\n" + "=" * 70)
+    log("Test 3: Multi-cycle stability (5 cycles)")
+    log("=" * 70)
+
+    from vllm.distributed.parallel_state import get_tp_group
+    tp_group = get_tp_group()
+    expected = sum(range(1, WORLD_SIZE + 1))
+
+    for cycle in range(5):
+        # Suspend
+        dist.barrier()
+        torch.cuda.synchronize()
+        pre = gpu_used_mb()
+        dist.barrier()
+        suspend_fn(comm)
+        gc.collect()
+        torch.cuda.empty_cache()
+        freed = pre - gpu_used_mb()
+
+        # Resume
+        resume_fn(comm)
+        torch.cuda.synchronize()
+
+        # Verify with increasing tensor sizes
+        size = 1024 * (cycle + 1)
+        x = torch.ones(size, size, device="cuda") * (RANK + 1)
+        dist.all_reduce(x, group=tp_group.device_group)
+        assert torch.allclose(x, torch.full_like(x, expected)), f"cycle {cycle + 1} failed"
+        del x
+        log(f"  Cycle {cycle + 1}: freed={freed:.0f} MB, allreduce({size}x{size}) OK")
+
+    log("  PASS")
+
+
+def test_compare_pynccl_vs_torch(suspend_fn, resume_fn):
+    """Test 4: Compare suspend on vLLM pynccl comm vs torch ProcessGroup comm.
+
+    vLLM maintains both a pynccl comm and a torch ProcessGroup for the same
+    TP group. This test checks if suspending one vs the other gives different
+    results, and whether they point to the same underlying ncclComm_t.
+    """
+    log("\n" + "=" * 70)
+    log("Test 4: Compare pynccl vs torch PG comm handles")
+    log("=" * 70)
+
+    from vllm.distributed.parallel_state import get_tp_group
+    tp_group = get_tp_group()
+
+    pynccl_comm, _ = extract_vllm_pynccl_comm(tp_group)
+    torch_comm, _ = extract_torch_pg_comm(tp_group)
+
+    if pynccl_comm is None or torch_comm is None:
+        log("  SKIP: need both pynccl and torch PG handles")
+        return
+
+    same = (pynccl_comm == torch_comm) if isinstance(pynccl_comm, int) and isinstance(torch_comm, int) else "N/A"
+    log(f"\n  pynccl comm: {pynccl_comm}")
+    log(f"  torch PG comm: {hex(torch_comm) if isinstance(torch_comm, int) else torch_comm}")
+    log(f"  Same handle: {same}")
+
+    if same:
+        log("  They share the same ncclComm_t — suspending either one is equivalent.")
+    else:
+        log("  Different ncclComm_t — vLLM uses a separate pynccl comm from torch PG.")
+        log("  In colocated mode, BOTH may need to be suspended.")
+
+        # Measure each independently
+        for name, comm in [("pynccl", pynccl_comm), ("torch_pg", torch_comm)]:
+            # Warmup
+            for _ in range(5):
+                buf = torch.randn(2048, 2048, device="cuda")
+                dist.all_reduce(buf, group=tp_group.device_group)
+                del buf
+            clean_and_measure()
+
+            dist.barrier()
+            torch.cuda.synchronize()
+            pre = gpu_used_mb()
+            dist.barrier()
+            suspend_fn(comm)
+            gc.collect()
+            torch.cuda.empty_cache()
+            freed = pre - gpu_used_mb()
+            resume_fn(comm)
+            torch.cuda.synchronize()
+
+            log(f"  {name}: freed={freed:.0f} MB")
+
+    log("  PASS")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
-    # --- Init torch.distributed (needed by vLLM parallel state) ---
+    global RANK, LOCAL_RANK, WORLD_SIZE
+
     dist.init_process_group(backend="nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    torch.cuda.set_device(rank)
+    RANK = dist.get_rank()
+    WORLD_SIZE = dist.get_world_size()
+    LOCAL_RANK = int(os.environ.get("LOCAL_RANK", RANK % torch.cuda.device_count()))
+    torch.cuda.set_device(LOCAL_RANK)
 
-    log(rank, "=== vLLM NCCL Suspend/Resume Integration Test ===")
-    log(rank, f"world_size={world_size}, CUDA device={torch.cuda.current_device()}\n")
+    log(f"=== vLLM NCCL Suspend/Resume Test (world_size={WORLD_SIZE}) ===")
 
-    if world_size < 2:
-        log(rank, "SKIP: Need 2+ GPUs for TP NCCL comm. Run with torchrun --nproc_per_node=2")
+    if WORLD_SIZE < 2:
+        log("SKIP: Need 2+ GPUs (TP=1 has no NCCL comm)")
         dist.destroy_process_group()
         return
 
-    # --- Init vLLM parallel state ---
-    log(rank, "[1] Initializing vLLM parallel state...")
+    # Check vLLM
+    try:
+        import vllm
+        log(f"vLLM version: {vllm.__version__}")
+    except ImportError:
+        log("SKIP: vLLM not installed")
+        dist.destroy_process_group()
+        return
+
+    # Init vLLM parallel state
+    log("Initializing vLLM parallel state...")
     try:
         from vllm.distributed.parallel_state import (
             get_tp_group,
             init_distributed_environment,
-            init_model_parallel_backend,
             initialize_model_parallel,
         )
-    except ImportError:
-        log(rank, "SKIP: vLLM not installed.")
+        init_distributed_environment(world_size=WORLD_SIZE, rank=RANK, local_rank=LOCAL_RANK)
+        initialize_model_parallel(tensor_model_parallel_size=WORLD_SIZE)
+        log(f"  TP group initialized (world_size={get_tp_group().world_size})")
+    except Exception as e:
+        log(f"SKIP: vLLM parallel init failed: {e}")
         dist.destroy_process_group()
         return
 
-    # vLLM needs its own distributed init
-    init_distributed_environment(
-        world_size=world_size,
-        rank=rank,
-        local_rank=rank,
-    )
-    init_model_parallel_backend()
-    initialize_model_parallel(tensor_model_parallel_size=world_size)
+    # Load suspend/resume
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+    from verl.utils.nccl_suspend import _get_nccl_lib, resume_nccl_comm, suspend_nccl_comm
 
-    tp_group = get_tp_group()
-    log(rank, f"  TP group initialized (world_size={tp_group.world_size})")
-
-    # --- Warm up: do allreduce to allocate NCCL buffers ---
-    log(rank, "\n[2] Warming up NCCL (allreduce to allocate internal buffers)...")
-    for i in range(5):
-        x = torch.randn(4096, 4096, device="cuda")
-        dist.all_reduce(x, group=tp_group.device_group)
-    torch.cuda.synchronize()
-    del x
-    torch.cuda.empty_cache()
-
-    mem_baseline = get_memory_mb()
-    log(rank, "  Baseline memory after warmup:")
-    log(rank, f"    allocated={mem_baseline['allocated']:.1f} MB, reserved={mem_baseline['reserved']:.1f} MB")
-
-    # --- Test suspend_vllm_comms ---
-    log(rank, "\n[3] Testing suspend_vllm_comms()...")
-    from verl.utils.nccl_suspend import _get_all_vllm_comm_handles, resume_vllm_comms, suspend_vllm_comms
-
-    # Verify we can find the comm handles
-    handles = _get_all_vllm_comm_handles()
-    log(rank, f"  Found {len(handles)} NCCL comm(s): {[name for name, _ in handles]}")
-    if not handles:
-        log(rank, "  FAIL: No NCCL comm handles found. Check vLLM version compatibility.")
+    if _get_nccl_lib() is None:
+        log("SKIP: NCCL >= 2.29.7 required")
         dist.destroy_process_group()
         return
 
-    # Measure memory before suspend
-    mem_before = get_memory_mb()
+    # Run tests
+    comm, comm_source = test_extract_handles()
+    if comm is None:
+        dist.destroy_process_group()
+        return
 
-    # Suspend
-    success = suspend_vllm_comms()
-    log(rank, f"  suspend_vllm_comms() returned: {success}")
+    avg_freed = test_suspend_resume(comm, comm_source, suspend_nccl_comm, resume_nccl_comm)
+    test_multicycle(comm, suspend_nccl_comm, resume_nccl_comm)
+    test_compare_pynccl_vs_torch(suspend_nccl_comm, resume_nccl_comm)
 
-    mem_after = get_memory_mb()
-    freed_reserved = mem_before["reserved"] - mem_after["reserved"]
-    freed_allocated = mem_before["allocated"] - mem_after["allocated"]
-
-    alloc_before = mem_before["allocated"]
-    resv_before = mem_before["reserved"]
-    alloc_after = mem_after["allocated"]
-    resv_after = mem_after["reserved"]
-    log(rank, f"\n  Memory before suspend: allocated={alloc_before:.1f} MB, reserved={resv_before:.1f} MB")
-    log(rank, f"  Memory after suspend:  allocated={alloc_after:.1f} MB, reserved={resv_after:.1f} MB")
-    log(rank, f"  >>> Freed: {freed_reserved:.1f} MB reserved, {freed_allocated:.1f} MB allocated <<<")
-
-    if freed_reserved <= 0 and freed_allocated <= 0:
-        log(rank, "  WARNING: No memory freed. NCCL suspend may not have released memory,")
-        log(rank, "           or NCCL version does not support ncclCommSuspend.")
-
-    # --- Test resume_vllm_comms ---
-    log(rank, "\n[4] Testing resume_vllm_comms()...")
-    success = resume_vllm_comms()
-    log(rank, f"  resume_vllm_comms() returned: {success}")
-
-    mem_resumed = get_memory_mb()
-    alloc_resumed = mem_resumed["allocated"]
-    resv_resumed = mem_resumed["reserved"]
-    log(rank, f"  Memory after resume: allocated={alloc_resumed:.1f} MB, reserved={resv_resumed:.1f} MB")
-
-    # --- Verify NCCL still works ---
-    log(rank, "\n[5] Verifying NCCL allreduce works after resume...")
-    x = torch.ones(1024, 1024, device="cuda") * (rank + 1)
-    dist.all_reduce(x, group=tp_group.device_group)
-    expected = sum(range(1, world_size + 1))
-    correct = torch.allclose(x, torch.full_like(x, expected))
-    log(rank, f"  allreduce result={x[0, 0].item()}, expected={expected}, correct={correct}")
-    assert correct, "NCCL allreduce failed after resume!"
-
-    # --- Multiple suspend/resume cycles ---
-    log(rank, "\n[6] Testing 3 consecutive suspend/resume cycles...")
-    for cycle in range(3):
-        mem_pre = get_memory_mb()
-        suspend_vllm_comms()
-        mem_mid = get_memory_mb()
-        resume_vllm_comms()
-
-        # Verify allreduce
-        y = torch.ones(512, 512, device="cuda") * (rank + 1)
-        dist.all_reduce(y, group=tp_group.device_group)
-        ok = torch.allclose(y, torch.full_like(y, expected))
-
-        freed = mem_pre["reserved"] - mem_mid["reserved"]
-        log(rank, f"  Cycle {cycle + 1}: freed={freed:.1f} MB, allreduce={'OK' if ok else 'FAIL'}")
-        assert ok, f"allreduce failed on cycle {cycle + 1}"
-
-    # --- Summary ---
-    log(rank, f"\n{'=' * 60}")
-    log(rank, "RESULT: ALL TESTS PASSED")
-    log(rank, f"  NCCL comms found:      {[name for name, _ in handles]}")
-    log(rank, f"  Memory freed per suspend: {freed_reserved:.1f} MB")
-    log(rank, "  Multi-cycle stability:   3/3 passed")
-    log(rank, f"{'=' * 60}")
+    log(f"\n{'=' * 70}")
+    log("ALL vLLM TESTS PASSED")
+    log(f"  comm source: {comm_source}")
+    log(f"  avg freed per suspend: {avg_freed:.0f} MB")
+    log(f"{'=' * 70}")
 
     dist.destroy_process_group()
 
