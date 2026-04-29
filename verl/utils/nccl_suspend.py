@@ -56,11 +56,11 @@ def _get_nccl_lib():
     try:
         lib = ctypes.CDLL("libnccl.so.2")
     except OSError:
-        logger.warning("[NCCLSuspend] Failed to load libnccl.so.2. Suspend/resume disabled.")
+        print("[NCCLSuspend] WARNING: Failed to load libnccl.so.2. Suspend/resume disabled.", flush=True)
         return None
 
     if not hasattr(lib, "ncclCommSuspend"):
-        logger.warning("[NCCLSuspend] ncclCommSuspend not found. Requires NCCL >= 2.29.7.")
+        print("[NCCLSuspend] WARNING: ncclCommSuspend not found. Requires NCCL >= 2.29.7.", flush=True)
         return None
 
     lib.ncclCommSuspend.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -133,7 +133,7 @@ def resume_nccl_comm(comm_handle) -> bool:
 def _suspend_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, float]:
     """Suspend a list of (name, handle) comms. Returns (any_suspended, freed_mb)."""
     if not handles:
-        logger.debug(f"[NCCLSuspend] {label}: no comms to suspend.")
+        print(f"[NCCLSuspend] {label}: no comms to suspend.", flush=True)
         return False, 0.0
 
     mem_before = _gpu_used_mb()
@@ -147,10 +147,10 @@ def _suspend_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, fl
         elapsed_ms = (time.perf_counter() - t0) * 1000
         if ok:
             succeeded.append(name)
-            logger.debug(f"[NCCLSuspend] {label}: suspend '{name}' (0x{handle:x}) OK ({elapsed_ms:.0f} ms)")
+            print(f"[NCCLSuspend] {label}: suspend '{name}' (0x{handle:x}) OK ({elapsed_ms:.0f} ms)", flush=True)
         else:
             failed.append(name)
-            logger.warning(f"[NCCLSuspend] {label}: suspend '{name}' (0x{handle:x}) FAILED ({elapsed_ms:.0f} ms)")
+            print(f"[NCCLSuspend] {label}: suspend '{name}' (0x{handle:x}) FAILED ({elapsed_ms:.0f} ms)", flush=True)
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -158,14 +158,14 @@ def _suspend_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, fl
     mem_after = _gpu_used_mb()
     freed = mem_before - mem_after
 
-    if succeeded:
-        logger.info(
-            f"[NCCLSuspend] {label}: suspended {len(succeeded)}/{len(handles)} comms "
-            f"in {total_ms:.0f} ms, freed {freed:.0f} MB "
-            f"(gpu: {mem_before:.0f} → {mem_after:.0f} MB)"
-        )
+    print(
+        f"[NCCLSuspend] {label}: suspended {len(succeeded)}/{len(handles)} comms "
+        f"in {total_ms:.0f} ms, freed {freed:.0f} MB "
+        f"(gpu: {mem_before:.0f} → {mem_after:.0f} MB)",
+        flush=True,
+    )
     if failed:
-        logger.warning(f"[NCCLSuspend] {label}: {len(failed)} comms failed: {failed}")
+        print(f"[NCCLSuspend] {label}: {len(failed)} comms failed: {failed}", flush=True)
 
     return len(succeeded) > 0, freed
 
@@ -173,7 +173,7 @@ def _suspend_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, fl
 def _resume_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, float]:
     """Resume a list of (name, handle) comms. Returns (any_resumed, reclaimed_mb)."""
     if not handles:
-        logger.debug(f"[NCCLSuspend] {label}: no comms to resume.")
+        print(f"[NCCLSuspend] {label}: no comms to resume.", flush=True)
         return False, 0.0
 
     mem_before = _gpu_used_mb()
@@ -187,24 +187,24 @@ def _resume_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, flo
         elapsed_ms = (time.perf_counter() - t0) * 1000
         if ok:
             succeeded.append(name)
-            logger.debug(f"[NCCLSuspend] {label}: resume '{name}' (0x{handle:x}) OK ({elapsed_ms:.0f} ms)")
+            print(f"[NCCLSuspend] {label}: resume '{name}' (0x{handle:x}) OK ({elapsed_ms:.0f} ms)", flush=True)
         else:
             failed.append(name)
-            logger.warning(f"[NCCLSuspend] {label}: resume '{name}' (0x{handle:x}) FAILED ({elapsed_ms:.0f} ms)")
+            print(f"[NCCLSuspend] {label}: resume '{name}' (0x{handle:x}) FAILED ({elapsed_ms:.0f} ms)", flush=True)
 
     torch.cuda.synchronize()
     total_ms = (time.perf_counter() - total_start) * 1000
     mem_after = _gpu_used_mb()
     reclaimed = mem_after - mem_before
 
-    if succeeded:
-        logger.info(
-            f"[NCCLSuspend] {label}: resumed {len(succeeded)}/{len(handles)} comms "
-            f"in {total_ms:.0f} ms, reclaimed {reclaimed:.0f} MB "
-            f"(gpu: {mem_before:.0f} → {mem_after:.0f} MB)"
-        )
+    print(
+        f"[NCCLSuspend] {label}: resumed {len(succeeded)}/{len(handles)} comms "
+        f"in {total_ms:.0f} ms, reclaimed {reclaimed:.0f} MB "
+        f"(gpu: {mem_before:.0f} → {mem_after:.0f} MB)",
+        flush=True,
+    )
     if failed:
-        logger.warning(f"[NCCLSuspend] {label}: {len(failed)} comms failed: {failed}")
+        print(f"[NCCLSuspend] {label}: {len(failed)} comms failed: {failed}", flush=True)
 
     return len(succeeded) > 0, reclaimed
 
@@ -274,11 +274,11 @@ def _extract_training_comm_handles() -> list[tuple[str, int]]:
         logger.debug(f"[NCCLSuspend] Training: failed to enumerate sub-groups: {e}")
 
     if handles:
-        logger.info(f"[NCCLSuspend] Training: extracted {len(handles)} comm handles "
-                     f"({[name for name, _ in handles]})")
+        print(f"[NCCLSuspend] Training: extracted {len(handles)} comm handles "
+              f"({[name for name, _ in handles]})", flush=True)
         _training_comm_handles = handles
     else:
-        logger.info("[NCCLSuspend] Training: no comm handles found (comms may not be initialized yet)")
+        print("[NCCLSuspend] Training: no comm handles found (comms may not be initialized yet)", flush=True)
         # Don't cache empty — retry next time (comms may get initialized later)
 
     return handles
@@ -385,11 +385,11 @@ def _extract_rollout_comm_handles() -> list[tuple[str, int]]:
             logger.debug(f"[NCCLSuspend] Rollout: failed to get '{name}' comm: {e}")
 
     if handles:
-        logger.info(f"[NCCLSuspend] Rollout: extracted {len(handles)} comm handles "
-                     f"({[name for name, _ in handles]})")
+        print(f"[NCCLSuspend] Rollout: extracted {len(handles)} comm handles "
+              f"({[name for name, _ in handles]})", flush=True)
         _rollout_comm_handles = handles
     else:
-        logger.info("[NCCLSuspend] Rollout: no comm handles found")
+        print("[NCCLSuspend] Rollout: no comm handles found", flush=True)
 
     return handles
 
