@@ -31,10 +31,20 @@ import torch.distributed as dist
 
 
 def get_memory_mb():
-    """Get current GPU memory usage in MB."""
+    """Get GPU memory usage in MB.
+
+    Uses torch.cuda.mem_get_info() to query driver-level free/total memory,
+    which captures NCCL's internal cudaMalloc allocations that are invisible
+    to PyTorch's caching allocator (memory_allocated/reserved).
+    """
+    torch.cuda.synchronize()
+    free, total = torch.cuda.mem_get_info()
     return {
         "allocated": torch.cuda.memory_allocated() / 1024**2,
         "reserved": torch.cuda.memory_reserved() / 1024**2,
+        "gpu_used": (total - free) / 1024**2,
+        "gpu_free": free / 1024**2,
+        "gpu_total": total / 1024**2,
     }
 
 
@@ -95,7 +105,8 @@ def test_nccl_suspend_resume():
 
     mem_before = get_memory_mb()
     log(rank, f"\n  Memory after warmup + empty_cache:")
-    log(rank, f"  allocated={mem_before['allocated']:.1f} MB, reserved={mem_before['reserved']:.1f} MB")
+    log(rank, f"  pytorch: allocated={mem_before['allocated']:.1f} MB, reserved={mem_before['reserved']:.1f} MB")
+    log(rank, f"  driver:  gpu_used={mem_before['gpu_used']:.1f} MB, gpu_free={mem_before['gpu_free']:.1f} MB")
 
     # --- Step 3: Load nccl_suspend and check availability ---
     log(rank, "\n[Step 3] Loading NCCL suspend API...")
@@ -144,7 +155,8 @@ def test_nccl_suspend_resume():
 
     mem_before_suspend = get_memory_mb()
     log(rank, "\n[Step 5] Memory before suspend:")
-    log(rank, f"  allocated={mem_before_suspend['allocated']:.1f} MB, reserved={mem_before_suspend['reserved']:.1f} MB")
+    log(rank, f"  pytorch: allocated={mem_before_suspend['allocated']:.1f} MB, reserved={mem_before_suspend['reserved']:.1f} MB")
+    log(rank, f"  driver:  gpu_used={mem_before_suspend['gpu_used']:.1f} MB, gpu_free={mem_before_suspend['gpu_free']:.1f} MB")
 
     log(rank, "\n  Calling ncclCommSuspend on all comms...")
     dist.barrier()  # ensure all ranks suspend together
@@ -154,14 +166,13 @@ def test_nccl_suspend_resume():
         log(rank, f"  Suspend '{name}': {'OK' if success else 'FAILED'}")
 
     torch.cuda.empty_cache()
-    torch.cuda.synchronize()
 
     mem_after_suspend = get_memory_mb()
-    freed_reserved = mem_before_suspend["reserved"] - mem_after_suspend["reserved"]
-    freed_allocated = mem_before_suspend["allocated"] - mem_after_suspend["allocated"]
+    freed_gpu = mem_before_suspend["gpu_used"] - mem_after_suspend["gpu_used"]
     log(rank, "\n  Memory after suspend + empty_cache:")
-    log(rank, f"  allocated={mem_after_suspend['allocated']:.1f} MB, reserved={mem_after_suspend['reserved']:.1f} MB")
-    log(rank, f"  Freed: {freed_reserved:.1f} MB reserved, {freed_allocated:.1f} MB allocated")
+    log(rank, f"  pytorch: allocated={mem_after_suspend['allocated']:.1f} MB, reserved={mem_after_suspend['reserved']:.1f} MB")
+    log(rank, f"  driver:  gpu_used={mem_after_suspend['gpu_used']:.1f} MB, gpu_free={mem_after_suspend['gpu_free']:.1f} MB")
+    log(rank, f"  >>> GPU memory freed by suspend: {freed_gpu:.1f} MB <<<")
 
     # --- Step 6: Resume and verify ---
     # NOTE: cannot use dist.barrier() here — NCCL comms are suspended!
@@ -176,7 +187,8 @@ def test_nccl_suspend_resume():
 
     mem_after_resume = get_memory_mb()
     log(rank, "\n  Memory after resume:")
-    log(rank, f"  allocated={mem_after_resume['allocated']:.1f} MB, reserved={mem_after_resume['reserved']:.1f} MB")
+    log(rank, f"  pytorch: allocated={mem_after_resume['allocated']:.1f} MB, reserved={mem_after_resume['reserved']:.1f} MB")
+    log(rank, f"  driver:  gpu_used={mem_after_resume['gpu_used']:.1f} MB, gpu_free={mem_after_resume['gpu_free']:.1f} MB")
 
     # --- Step 7: Verify NCCL still works after resume ---
     log(rank, "\n[Step 7] Verify NCCL allreduce works after resume...")
@@ -195,7 +207,7 @@ def test_nccl_suspend_resume():
     log(rank, f"\n{'=' * 60}")
     log(rank, f"SUMMARY (rank {rank}):")
     log(rank, f"  NCCL comms tested:  {[name for name, _ in comm_handles]}")
-    log(rank, f"  Memory freed:       {freed_reserved:.1f} MB reserved, {freed_allocated:.1f} MB allocated")
+    log(rank, f"  GPU memory freed:   {freed_gpu:.1f} MB")
     log(rank, "  Post-resume verify: PASS")
     log(rank, f"{'=' * 60}")
 
