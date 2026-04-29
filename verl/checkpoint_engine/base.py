@@ -470,6 +470,9 @@ class CheckpointEngineManager:
         # 0. update weights for sync training with colocated trainer and rollout
         if self.backend == "naive":
             ray.get(self.trainer.update_weights(global_steps=global_steps))
+            # Transition to ROLLOUT state: suspend training, resume rollout
+            self.suspend_training_comms()
+            await self.resume_rollout_comms()
             return
 
         # 1. abort and save all unfinished requests for partial rollout
