@@ -32,6 +32,10 @@ import torch
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(levelname)s:%(asctime)s:%(message)s"))
+    logger.addHandler(_handler)
 
 NCCL_SUSPEND_MEM = 0x01  # Release dynamic GPU memory allocations
 NCCL_SUCCESS = 0
