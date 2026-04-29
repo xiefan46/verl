@@ -362,6 +362,7 @@ class CheckpointEngineManager:
         self.trainer = trainer
         self.replicas = replicas
         self.suspend_nccl_comms_enabled = getattr(config, "suspend_nccl_comms", False)
+        print(f"[NCCLSuspend] CheckpointEngineManager init: suspend_nccl_comms_enabled={self.suspend_nccl_comms_enabled}, backend={self.backend}")
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
@@ -423,29 +424,37 @@ class CheckpointEngineManager:
 
     def suspend_training_comms(self):
         """Suspend training-side NCCL comms (torch PG) on all training workers."""
+        print(f"[NCCLSuspend] suspend_training_comms called, enabled={self.suspend_nccl_comms_enabled}")
         if not self.suspend_nccl_comms_enabled:
             return
         self.trainer.suspend_training_nccl_comms()
+        print("[NCCLSuspend] suspend_training_comms done")
 
     def resume_training_comms(self):
         """Resume training-side NCCL comms on all training workers."""
+        print(f"[NCCLSuspend] resume_training_comms called, enabled={self.suspend_nccl_comms_enabled}")
         if not self.suspend_nccl_comms_enabled:
             return
         self.trainer.resume_training_nccl_comms()
+        print("[NCCLSuspend] resume_training_comms done")
 
     @auto_await
     async def suspend_rollout_comms(self):
         """Suspend rollout-side NCCL comms (vLLM pynccl) on all rollout servers."""
+        print(f"[NCCLSuspend] suspend_rollout_comms called, enabled={self.suspend_nccl_comms_enabled}")
         if not self.suspend_nccl_comms_enabled:
             return
         await asyncio.gather(*[r.suspend_nccl_comms() for r in self.replicas])
+        print("[NCCLSuspend] suspend_rollout_comms done")
 
     @auto_await
     async def resume_rollout_comms(self):
         """Resume rollout-side NCCL comms on all rollout servers."""
+        print(f"[NCCLSuspend] resume_rollout_comms called, enabled={self.suspend_nccl_comms_enabled}")
         if not self.suspend_nccl_comms_enabled:
             return
         await asyncio.gather(*[r.resume_nccl_comms() for r in self.replicas])
+        print("[NCCLSuspend] resume_rollout_comms done")
 
     @auto_await
     async def update_weights(self, global_steps: int = None):
