@@ -235,23 +235,30 @@ def exp_group_size(suspend_fn, resume_fn):
 # ---------------------------------------------------------------------------
 # Exp 2: Message size
 #
-# Real-world message sizes in training:
-#   ~256KB  → Megatron TP allreduce for small hidden layers (batch=1, seq=512, hidden=128)
-#   ~4MB    → FSDP gradient bucket (PyTorch default bucket size ~25MB, but per-param can be smaller)
-#   ~32MB   → Megatron TP allreduce (batch=1, seq=4096, hidden=4096, bf16)
-#   ~128MB  → Megatron TP allreduce (batch=2, seq=4096, hidden=8192, bf16)
-#   ~256MB  → Large activation allreduce (batch=4, seq=4096, hidden=8192, float32)
-#   ~1GB    → FSDP allgather full layer params (Qwen-72B: ~1B params/layer × 2 bytes)
+# Real-world message sizes in training (bf16):
+#   ~4MB    → FSDP gradient bucket (PyTorch default ~25MB, per-param smaller)
+#   ~32MB   → Megatron TP allreduce: batch=1, seq=4k, hidden=4096
+#   ~80MB   → Megatron TP allreduce: batch=2, seq=4k, hidden=5120 (Qwen-32B)
+#   ~128MB  → Megatron TP allreduce: batch=2, seq=4k, hidden=8192 (Qwen-72B)
+#   ~512MB  → TP allreduce long seq: batch=1, seq=32k, hidden=8192 (Qwen-72B)
+#             or FSDP allgather: Qwen-72B layer/TP4 = 245M params × 2B
+#   ~1GB    → MoE all_to_all: batch=2, seq=4k, hidden=4096, top_k=8 (Qwen3-30B)
+#   ~2GB    → FSDP allgather no TP: Qwen-72B full layer ~980M params × 2B
+#
+# NOTE: NCCL uses fixed-size channel buffers (NCCL_BUFFSIZE ~4-8MB) and
+# streams data through ring/tree. Message size may NOT directly affect
+# internal memory. This experiment verifies that hypothesis.
 # ---------------------------------------------------------------------------
 
 def exp_message_size(suspend_fn, resume_fn):
     sizes = [
-        (64 * 1024,          "256KB",  "small TP (hidden=128)"),
         (1024 * 1024,        "4MB",    "FSDP grad bucket"),
-        (8 * 1024 * 1024,    "32MB",   "TP (b=1,s=4k,h=4096,bf16)"),
-        (32 * 1024 * 1024,   "128MB",  "TP (b=2,s=4k,h=8192,bf16)"),
-        (64 * 1024 * 1024,   "256MB",  "TP (b=4,s=4k,h=8192,f32)"),
-        (256 * 1024 * 1024,  "1GB",    "FSDP allgather full layer"),
+        (8 * 1024 * 1024,    "32MB",   "TP (b=1,s=4k,h=4096)"),
+        (20 * 1024 * 1024,   "80MB",   "TP Qwen-32B (b=2,s=4k,h=5120)"),
+        (32 * 1024 * 1024,   "128MB",  "TP Qwen-72B (b=2,s=4k,h=8192)"),
+        (128 * 1024 * 1024,  "512MB",  "TP long-seq / FSDP Qwen-72B/TP4"),
+        (256 * 1024 * 1024,  "1GB",    "MoE all_to_all (b=2,s=4k,top8)"),
+        (512 * 1024 * 1024,  "2GB",    "FSDP allgather Qwen-72B no TP"),
     ]
     warmup = 10
 
