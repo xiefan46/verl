@@ -195,13 +195,20 @@ def test_alltoall(suspend_fn, resume_fn):
 def test_multicycle_mixed(suspend_fn, resume_fn):
     log("\n[Test 4] Multi-cycle stability with mixed collective ops")
     pg = dist.new_group(ranks=list(range(WORLD_SIZE)))
+
+    # Warmup first — NCCL comm is lazy-init, _comm_ptr() needs at least one
+    # collective to return a fully initialized handle
+    for _ in range(3):
+        buf = torch.randn(2048, 2048, device="cuda")
+        dist.all_reduce(buf, group=pg)
+        del buf
+    torch.cuda.synchronize()
+
     comm = extract_comm(pg, "mixed")
     assert comm is not None
 
     for cycle in range(10):
-        # Mix of collective ops before suspend (no all_to_all — it can put
-        # the comm in a state that rejects suspend on some NCCL versions;
-        # all_to_all suspend is already tested separately in Test 3)
+        # Mix of collective ops before suspend
         buf = torch.randn(2048, 2048, device="cuda")
         dist.all_reduce(buf, group=pg)
         dist.broadcast(buf, src=0, group=pg)
@@ -209,7 +216,6 @@ def test_multicycle_mixed(suspend_fn, resume_fn):
         dist.all_gather(gathered, buf, group=pg)
         del gathered
 
-        # reduce_scatter: input=2048*2048*ws, output=2048*2048
         rs_inp = torch.randn(2048 * 2048 * WORLD_SIZE, device="cuda")
         rs_out = torch.empty(2048 * 2048, device="cuda")
         dist.reduce_scatter_tensor(rs_out, rs_inp, group=pg)
