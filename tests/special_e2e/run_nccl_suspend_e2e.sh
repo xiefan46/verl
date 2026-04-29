@@ -33,8 +33,9 @@ gen_tp=2
 sp_size=1
 fsdp_size=${NUM_GPUS}
 
-# Must be colocated + NCCL checkpoint engine for suspend to matter
-checkpoint_engine_backend="nccl"
+# Use naive backend for weight transfer (avoids double-sleep bug in nccl backend).
+# NCCL suspend/resume targets training/rollout comms, not the weight transfer path.
+checkpoint_engine_backend="naive"
 
 exp_name="nccl-suspend-e2e-${NUM_GPUS}gpu"
 
@@ -85,7 +86,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.checkpoint_engine.backend=${checkpoint_engine_backend} \
-    actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=1024 \
     +actor_rollout_ref.rollout.checkpoint_engine.suspend_nccl_comms=true \
     algorithm.use_kl_in_reward=False \
     algorithm.kl_ctrl.kl_coef=0.0 \
