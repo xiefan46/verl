@@ -31,6 +31,7 @@ import time
 import torch
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 NCCL_SUSPEND_MEM = 0x01  # Release dynamic GPU memory allocations
 NCCL_SUCCESS = 0
