@@ -119,6 +119,7 @@ STUDENT=(
     actor_rollout_ref.actor.optim.lr_warmup_steps=-1
     actor_rollout_ref.actor.optim.lr_decay_steps=10000000
     actor_rollout_ref.actor.optim.weight_decay=0.1
+    actor_rollout_ref.actor.ppo_mini_batch_size=16
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
     actor_rollout_ref.actor.entropy_coeff=0
     actor_rollout_ref.actor.loss_agg_mode="token-mean"
