@@ -86,7 +86,7 @@ jobs:
       - name: Prepare datasets
         run: |
           python3 examples/data_preprocess/gsm8k.py --local_dataset_path ${HOME}/models/hf_data/gsm8k
-          python3 examples/data_preprocess/geo3k.py --local_save_dir ${HOME}/data/geo3k
+          python3 examples/data_preprocess/geo3k.py --local_dataset_path ${HOME}/models/hf_data/hiyouga/geometry3k/ --local_save_dir ${HOME}/data/geo3k
       - name: Running the E2E test with fully_async_policy + Multi-Teacher OPD (Megatron)
         run: |
           ray stop --force
