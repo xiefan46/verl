@@ -577,15 +577,16 @@ class vLLMHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def suspend_nccl_comms(self):
-        """Suspend rollout NCCL communicators to free GPU memory."""
-        print(
-            f"[NCCLSuspend] AsyncServer.suspend_nccl_comms ENTRY: "
-            f"rollout_mode={self.rollout_mode}, node_rank={self.node_rank}",
-            flush=True,
-        )
+        """Suspend rollout NCCL communicators to free GPU memory.
+
+        Works for both HYBRID and COLOCATED modes: in both, vLLM spawns its own
+        worker subprocesses where pynccl_comm lives, and self.engine.collective_rpc
+        dispatches the suspend call to all of them. STANDALONE mode is skipped
+        because rollout has dedicated GPUs and there is nothing to free.
+        """
         if self.node_rank != 0:
             return
-        if self.rollout_mode != RolloutMode.COLOCATED:
+        if self.rollout_mode == RolloutMode.STANDALONE:
             return
         from verl.utils.memory_utils import log_memory_usage
 
@@ -595,14 +596,9 @@ class vLLMHttpServer:
 
     async def resume_nccl_comms(self):
         """Resume rollout NCCL communicators."""
-        print(
-            f"[NCCLSuspend] AsyncServer.resume_nccl_comms ENTRY: "
-            f"rollout_mode={self.rollout_mode}, node_rank={self.node_rank}",
-            flush=True,
-        )
         if self.node_rank != 0:
             return
-        if self.rollout_mode != RolloutMode.COLOCATED:
+        if self.rollout_mode == RolloutMode.STANDALONE:
             return
         await self.engine.collective_rpc("resume_nccl_comms")
 
