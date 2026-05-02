@@ -581,15 +581,23 @@ class vLLMHttpServer:
 
         Should be called after sleep() when the inference engine is idle.
         All TP ranks must call this simultaneously to avoid P2P dangling references.
+
+        The pynccl communicator lives in the vLLM Worker subprocess (not the
+        AsyncLLM server process), so we dispatch via collective_rpc to invoke
+        the suspend on every worker.
         """
+        print(
+            f"[NCCLSuspend] AsyncServer.suspend_nccl_comms entry, rollout_mode={self.rollout_mode}, "
+            f"node_rank={self.node_rank}",
+            flush=True,
+        )
         if self.rollout_mode != RolloutMode.COLOCATED:
             return
         from verl.utils.memory_utils import log_memory_usage
-        from verl.utils.nccl_suspend import suspend_vllm_comms
 
         if self.node_rank == 0:
             log_memory_usage("before_suspend_rollout_nccl")
-        suspend_vllm_comms()
+        await self.engine.collective_rpc("suspend_nccl_comms")
         if self.node_rank == 0:
             log_memory_usage("after_suspend_rollout_nccl")
 
@@ -599,11 +607,14 @@ class vLLMHttpServer:
         Must be called before wake_up() so the inference engine can use NCCL.
         All TP ranks must call this simultaneously.
         """
+        print(
+            f"[NCCLSuspend] AsyncServer.resume_nccl_comms entry, rollout_mode={self.rollout_mode}, "
+            f"node_rank={self.node_rank}",
+            flush=True,
+        )
         if self.rollout_mode != RolloutMode.COLOCATED:
             return
-        from verl.utils.nccl_suspend import resume_vllm_comms
-
-        resume_vllm_comms()
+        await self.engine.collective_rpc("resume_nccl_comms")
 
     async def start_profile(self, **kwargs):
         if (

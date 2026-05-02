@@ -160,6 +160,16 @@ class vLLMColocateWorkerExtension:
         # patch weight loader to support MoE model
         patch_vllm_moe_model_weight_loader(self.model_runner.model)
 
+    def suspend_nccl_comms(self):
+        from verl.utils.nccl_suspend import suspend_rollout_comms
+
+        return suspend_rollout_comms()
+
+    def resume_nccl_comms(self):
+        from verl.utils.nccl_suspend import resume_rollout_comms
+
+        return resume_rollout_comms()
+
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
         from vllm.platforms import current_platform
