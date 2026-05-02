@@ -269,10 +269,19 @@ class RolloutReplica(ABC):
 
     async def suspend_nccl_comms(self):
         """Suspend NCCL communicators on all rollout servers to free GPU memory."""
+        print(
+            f"[NCCLSuspend] Replica.suspend_nccl_comms: rollout_mode={self.rollout_mode}, "
+            f"n_servers={len(self.servers)}",
+            flush=True,
+        )
         await asyncio.gather(*[server.suspend_nccl_comms.remote() for server in self.servers])
 
     async def resume_nccl_comms(self):
         """Resume NCCL communicators on all rollout servers."""
+        print(
+            f"[NCCLSuspend] Replica.resume_nccl_comms: rollout_mode={self.rollout_mode}, n_servers={len(self.servers)}",
+            flush=True,
+        )
         await asyncio.gather(*[server.resume_nccl_comms.remote() for server in self.servers])
 
     async def abort_all_requests(self):

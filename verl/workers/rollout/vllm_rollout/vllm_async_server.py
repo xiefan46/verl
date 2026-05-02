@@ -577,20 +577,16 @@ class vLLMHttpServer:
             logger.info("skip sleep in standalone mode")
 
     async def suspend_nccl_comms(self):
-        """Suspend rollout NCCL communicators to free GPU memory.
-
-        Should be called after sleep() when the inference engine is idle.
-        All TP ranks must call this simultaneously to avoid P2P dangling references.
-
-        The pynccl communicator lives in the vLLM Worker subprocess (not the
-        AsyncLLM server process), so we dispatch via collective_rpc to invoke
-        the suspend on every worker.
-        """
+        """Suspend rollout NCCL communicators to free GPU memory."""
+        print(
+            f"[NCCLSuspend] AsyncServer.suspend_nccl_comms ENTRY: "
+            f"rollout_mode={self.rollout_mode}, node_rank={self.node_rank}",
+            flush=True,
+        )
         if self.node_rank != 0:
             return
         if self.rollout_mode != RolloutMode.COLOCATED:
             return
-        print("[NCCLSuspend] AsyncServer.suspend_nccl_comms dispatching collective_rpc", flush=True)
         from verl.utils.memory_utils import log_memory_usage
 
         log_memory_usage("before_suspend_rollout_nccl")
@@ -598,16 +594,16 @@ class vLLMHttpServer:
         log_memory_usage("after_suspend_rollout_nccl")
 
     async def resume_nccl_comms(self):
-        """Resume rollout NCCL communicators.
-
-        Must be called before wake_up() so the inference engine can use NCCL.
-        All TP ranks must call this simultaneously.
-        """
+        """Resume rollout NCCL communicators."""
+        print(
+            f"[NCCLSuspend] AsyncServer.resume_nccl_comms ENTRY: "
+            f"rollout_mode={self.rollout_mode}, node_rank={self.node_rank}",
+            flush=True,
+        )
         if self.node_rank != 0:
             return
         if self.rollout_mode != RolloutMode.COLOCATED:
             return
-        print("[NCCLSuspend] AsyncServer.resume_nccl_comms dispatching collective_rpc", flush=True)
         await self.engine.collective_rpc("resume_nccl_comms")
 
     async def start_profile(self, **kwargs):

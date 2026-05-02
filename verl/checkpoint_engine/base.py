@@ -362,7 +362,11 @@ class CheckpointEngineManager:
         self.trainer = trainer
         self.replicas = replicas
         self.suspend_nccl_comms_enabled = getattr(config, "suspend_nccl_comms", False)
-        print(f"[NCCLSuspend] CheckpointEngineManager init: suspend_nccl_comms_enabled={self.suspend_nccl_comms_enabled}, backend={self.backend}")
+        print(
+            f"[NCCLSuspend] CheckpointEngineManager init: "
+            f"suspend_nccl_comms_enabled={self.suspend_nccl_comms_enabled}, "
+            f"backend={self.backend}"
+        )
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
@@ -441,7 +445,10 @@ class CheckpointEngineManager:
     @auto_await
     async def suspend_rollout_comms(self):
         """Suspend rollout-side NCCL comms (vLLM pynccl) on all rollout servers."""
-        print(f"[NCCLSuspend] suspend_rollout_comms called, enabled={self.suspend_nccl_comms_enabled}")
+        print(
+            f"[NCCLSuspend] suspend_rollout_comms called, enabled={self.suspend_nccl_comms_enabled}, "
+            f"n_replicas={len(self.replicas)}"
+        )
         if not self.suspend_nccl_comms_enabled:
             return
         await asyncio.gather(*[r.suspend_nccl_comms() for r in self.replicas])
@@ -450,7 +457,10 @@ class CheckpointEngineManager:
     @auto_await
     async def resume_rollout_comms(self):
         """Resume rollout-side NCCL comms on all rollout servers."""
-        print(f"[NCCLSuspend] resume_rollout_comms called, enabled={self.suspend_nccl_comms_enabled}")
+        print(
+            f"[NCCLSuspend] resume_rollout_comms called, enabled={self.suspend_nccl_comms_enabled}, "
+            f"n_replicas={len(self.replicas)}"
+        )
         if not self.suspend_nccl_comms_enabled:
             return
         await asyncio.gather(*[r.resume_nccl_comms() for r in self.replicas])
