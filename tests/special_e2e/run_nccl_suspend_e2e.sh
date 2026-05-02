@@ -13,8 +13,9 @@ set -xeuo pipefail
 # Expected runtime: ~5 minutes on 2×H100
 #
 # Usage:
-#   bash tests/special_e2e/run_nccl_suspend_e2e.sh
-#   NUM_GPUS=4 bash tests/special_e2e/run_nccl_suspend_e2e.sh    # 4 GPU
+#   bash tests/special_e2e/run_nccl_suspend_e2e.sh                  # default TP=2 PP=1
+#   GEN_TP=1 GEN_PP=2 bash tests/special_e2e/run_nccl_suspend_e2e.sh  # PP mode (rollout PP send/recv)
+#   NUM_GPUS=4 GEN_TP=2 GEN_PP=2 bash tests/special_e2e/run_nccl_suspend_e2e.sh  # 4 GPU TP+PP
 #   NCCL_NVLS_ENABLE=0 bash tests/special_e2e/run_nccl_suspend_e2e.sh  # disable NVLS
 
 NUM_GPUS=${NUM_GPUS:-2}
@@ -28,8 +29,11 @@ max_prompt_length=256
 max_response_length=256
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
-# Parallelism — TP=2 to create NCCL comms on rollout side
-gen_tp=2
+# Parallelism — TP×PP must equal NUM_GPUS
+# TP=2/PP=1 (default): tests rollout TP all-reduce path
+# TP=1/PP=2:           tests rollout PP send/recv path (uses pynccl directly, NCCL buffer allocated)
+gen_tp=${GEN_TP:-2}
+gen_pp=${GEN_PP:-1}
 sp_size=1
 fsdp_size=${NUM_GPUS}
 
@@ -37,11 +41,11 @@ fsdp_size=${NUM_GPUS}
 # NCCL suspend/resume targets training/rollout comms, not the weight transfer path.
 checkpoint_engine_backend="naive"
 
-exp_name="nccl-suspend-e2e-${NUM_GPUS}gpu"
+exp_name="nccl-suspend-e2e-${NUM_GPUS}gpu-tp${gen_tp}pp${gen_pp}"
 
 echo "============================================"
 echo "NCCL Suspend/Resume E2E Test"
-echo "GPUs: ${NUM_GPUS}, TP: ${gen_tp}, FSDP: ${fsdp_size}"
+echo "GPUs: ${NUM_GPUS}, TP: ${gen_tp}, PP: ${gen_pp}, FSDP: ${fsdp_size}"
 echo "suspend_nccl_comms: true"
 echo "============================================"
 
@@ -79,6 +83,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.50 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
+    actor_rollout_ref.rollout.pipeline_model_parallel_size=${gen_pp} \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.max_model_len=${max_num_tokens} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_tokens} \
