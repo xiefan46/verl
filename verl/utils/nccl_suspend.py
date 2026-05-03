@@ -274,8 +274,10 @@ def _extract_training_comm_handles() -> list[tuple[str, int]]:
         logger.debug(f"[NCCLSuspend] Training: failed to enumerate sub-groups: {e}")
 
     if handles:
-        print(f"[NCCLSuspend] Training: extracted {len(handles)} comm handles "
-              f"({[name for name, _ in handles]})", flush=True)
+        print(
+            f"[NCCLSuspend] Training: extracted {len(handles)} comm handles ({[name for name, _ in handles]})",
+            flush=True,
+        )
         _training_comm_handles = handles
     else:
         print("[NCCLSuspend] Training: no comm handles found (comms may not be initialized yet)", flush=True)
@@ -344,9 +346,16 @@ _rollout_suspended = False
 
 
 def _extract_rollout_comm_handles() -> list[tuple[str, int]]:
-    """Extract ncclComm_t from vLLM's pynccl communicators.
+    """Extract ncclComm_t handles from all NCCL comms in the vLLM worker process.
 
-    Path: group.device_communicator.pynccl_comm.comm
+    vLLM workers hold MULTIPLE independent NCCL comms:
+      1. pynccl (vLLM's own ctypes-based NCCL): group.device_communicator.pynccl_comm.comm
+      2. torch.distributed ProcessGroupNCCL: dist.group.WORLD._get_backend()._comm_ptr()
+      3. Any sub-groups created via dist.new_group() for TP/PP/etc.
+
+    pynccl warm-up only does a 1-element all_reduce (small channel buffer).
+    The torch PG default comm is what carries actual barrier/broadcast traffic
+    and typically has the larger NCCL channel buffer.
 
     Returns list of (group_name, comm_ptr_int).
     """
@@ -354,45 +363,76 @@ def _extract_rollout_comm_handles() -> list[tuple[str, int]]:
     if _rollout_comm_handles is not None:
         return _rollout_comm_handles
 
+    handles = []
+
+    # --- 1) vLLM pynccl comms ---
     try:
         from vllm.distributed import parallel_state as ps
+
+        group_accessors = [("vllm_tp_pynccl", "get_tp_group"), ("vllm_pp_pynccl", "get_pp_group")]
+        for name, accessor_name in group_accessors:
+            accessor = getattr(ps, accessor_name, None)
+            if accessor is None:
+                continue
+            try:
+                group = accessor()
+                group_ws = getattr(group, "world_size", None)
+                if group_ws is not None and group_ws <= 1:
+                    continue
+                device_comm = getattr(group, "device_communicator", None)
+                if device_comm is None:
+                    continue
+                pynccl_comm = getattr(device_comm, "pynccl_comm", None)
+                if pynccl_comm is None:
+                    continue
+                comm = getattr(pynccl_comm, "comm", None)
+                if comm is None:
+                    continue
+                ptr = _normalize_comm_handle(comm)
+                if ptr and ptr != 0:
+                    handles.append((name, ptr))
+            except Exception as e:
+                print(f"[NCCLSuspend] Rollout: failed to get '{name}': {e}", flush=True)
     except ImportError:
-        logger.debug("[NCCLSuspend] Rollout: vLLM not available.")
-        return []
+        pass
 
-    handles = []
-    group_accessors = [("tp", "get_tp_group"), ("pp", "get_pp_group")]
+    # --- 2) torch.distributed default group NCCL comm ---
+    try:
+        import torch.distributed as dist
 
-    for name, accessor_name in group_accessors:
-        accessor = getattr(ps, accessor_name, None)
-        if accessor is None:
-            continue
-        try:
-            group = accessor()
-            group_ws = getattr(group, "world_size", None)
-            if group_ws is not None and group_ws <= 1:
-                continue
+        if dist.is_initialized():
+            default_pg = dist.group.WORLD
+            try:
+                backend = default_pg._get_backend(torch.device("cuda"))
+                ptr = backend._comm_ptr()
+                if ptr and ptr != 0:
+                    handles.append(("torch_pg_default", ptr))
+            except Exception as e:
+                print(f"[NCCLSuspend] Rollout: torch PG default _comm_ptr() failed: {e}", flush=True)
 
-            device_comm = getattr(group, "device_communicator", None)
-            if device_comm is None:
-                continue
-            pynccl_comm = getattr(device_comm, "pynccl_comm", None)
-            if pynccl_comm is None:
-                continue
-            comm = getattr(pynccl_comm, "comm", None)
-            if comm is None:
-                continue
-
-            ptr = _normalize_comm_handle(comm)
-            if ptr and ptr != 0:
-                handles.append((name, ptr))
-                logger.debug(f"[NCCLSuspend] Rollout: '{name}' pynccl_comm = 0x{ptr:x}")
-        except Exception as e:
-            logger.debug(f"[NCCLSuspend] Rollout: failed to get '{name}' comm: {e}")
+            # --- 3) named sub-groups (vllm typically registers TP/PP via init_model_parallel_group) ---
+            try:
+                for pg in dist.distributed_c10d._world.pg_map.keys():
+                    if pg is default_pg:
+                        continue
+                    try:
+                        backend = pg._get_backend(torch.device("cuda"))
+                        ptr = backend._comm_ptr()
+                        if ptr and ptr != 0 and not any(p == ptr for _, p in handles):
+                            pg_name = getattr(pg, "group_name", None) or "torch_pg_sub"
+                            handles.append((f"torch_pg:{pg_name}", ptr))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[NCCLSuspend] Rollout: torch.distributed introspection failed: {e}", flush=True)
 
     if handles:
-        print(f"[NCCLSuspend] Rollout: extracted {len(handles)} comm handles "
-              f"({[name for name, _ in handles]})", flush=True)
+        print(
+            f"[NCCLSuspend] Rollout: extracted {len(handles)} comm handles ({[name for name, _ in handles]})",
+            flush=True,
+        )
         _rollout_comm_handles = handles
     else:
         print("[NCCLSuspend] Rollout: no comm handles found", flush=True)
