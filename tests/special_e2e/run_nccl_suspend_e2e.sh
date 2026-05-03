@@ -13,10 +13,12 @@ set -xeuo pipefail
 # Expected runtime: ~5 minutes on 2×H100
 #
 # Usage:
-#   bash tests/special_e2e/run_nccl_suspend_e2e.sh                  # default TP=2 PP=1
-#   GEN_TP=1 GEN_PP=2 bash tests/special_e2e/run_nccl_suspend_e2e.sh  # PP mode (rollout PP send/recv)
-#   NUM_GPUS=4 GEN_TP=2 GEN_PP=2 bash tests/special_e2e/run_nccl_suspend_e2e.sh  # 4 GPU TP+PP
-#   NCCL_NVLS_ENABLE=0 bash tests/special_e2e/run_nccl_suspend_e2e.sh  # disable NVLS
+#   bash tests/special_e2e/run_nccl_suspend_e2e.sh                  # default small msg
+#   # Force large TP all-reduce (>4 MB) to trigger NCCL channel buffer:
+#   MODEL_PATH=Qwen/Qwen2.5-1.5B-Instruct MAX_PROMPT_LENGTH=2048 MAX_RESPONSE_LENGTH=512 \
+#     VLLM_ALLREDUCE_USE_SYMM_MEM=0 NCCL_NVLS_ENABLE=0 \
+#     bash tests/special_e2e/run_nccl_suspend_e2e.sh \
+#     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true
 
 NUM_GPUS=${NUM_GPUS:-2}
 MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-0.5B-Instruct}
@@ -25,8 +27,8 @@ MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-0.5B-Instruct}
 train_prompt_bsz=4
 n_resp_per_prompt=2
 train_prompt_mini_bsz=4
-max_prompt_length=256
-max_response_length=256
+max_prompt_length=${MAX_PROMPT_LENGTH:-256}
+max_response_length=${MAX_RESPONSE_LENGTH:-256}
 max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 
 # Parallelism — TP×PP must equal NUM_GPUS
