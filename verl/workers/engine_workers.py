@@ -763,17 +763,39 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def suspend_training_nccl_comms(self):
-        """Suspend all training-side NCCL comms in this worker process."""
-        from verl.utils.nccl_suspend import suspend_training_comms
+        """Suspend all training-side NCCL comms in this worker process.
 
-        suspend_training_comms()
+        Uses the new session-tagged ProcessGroupRegistry path:
+        delegates to per-role TrainingWorker.nccl_suspend(), which
+        suspend_by_tag for that worker's specific role tag.
+
+        Falls back to legacy reflection-based path on any failure for
+        backward compatibility during the transition period.
+        """
+        try:
+            if self.actor is not None:
+                self.actor.nccl_suspend()
+            if self.ref is not None:
+                self.ref.nccl_suspend()
+        except Exception as e:
+            logger.warning(f"[NCCLSuspend] Registry path failed ({e}), falling back to legacy reflection.")
+            from verl.utils.nccl_suspend import suspend_training_comms
+
+            suspend_training_comms()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def resume_training_nccl_comms(self):
         """Resume all training-side NCCL comms in this worker process."""
-        from verl.utils.nccl_suspend import resume_training_comms
+        try:
+            if self.actor is not None:
+                self.actor.nccl_resume()
+            if self.ref is not None:
+                self.ref.nccl_resume()
+        except Exception as e:
+            logger.warning(f"[NCCLSuspend] Registry path failed ({e}), falling back to legacy reflection.")
+            from verl.utils.nccl_suspend import resume_training_comms
 
-        resume_training_comms()
+            resume_training_comms()
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
