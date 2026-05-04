@@ -59,6 +59,7 @@ NCCL_KEYWORD_CHECK_WHITELIST = [
     "verl/utils/device.py",
     "verl/third_party/sglang/parallel_state.py",  # appear in default backend
     "verl/utils/nccl_suspend.py",  # NCCL ncclCommSuspend/Resume utility
+    "verl/utils/process_group_registry.py",  # session-tagged registry, calls pg._get_backend("cuda")
 ]
 
 SEARCH_WHITELIST = CUDA_KEYWORD_CHECK_WHITELIST + NCCL_KEYWORD_CHECK_WHITELIST
