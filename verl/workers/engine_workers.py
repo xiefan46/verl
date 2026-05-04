@@ -91,13 +91,6 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         initialize_global_process_group_ray(timeout_second=None)
 
-        # Install monkey-patch on dist.new_group BEFORE engine init.
-        # Idempotent — safe to call multiple times in the same process
-        # (e.g., when actor + ref TrainingWorkers coexist in one Ray actor).
-        from verl.utils.process_group_registry import ProcessGroupRegistry
-
-        ProcessGroupRegistry.install()
-
         set_numa_affinity()
 
         self.config = config
