@@ -136,7 +136,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         self.nccl_tag = f"training_{self.config.role}"
 
-        with comm_session(f"{self.config.role}_engine_init", tag=self.nccl_tag):
+        with comm_session(f"{self.config.role}_engine_construct", tag=self.nccl_tag):
             self.engine: BaseEngine = EngineRegistry.new(
                 model_type=self.config.model_type,
                 backend=self.engine_config.strategy,
@@ -199,7 +199,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
         Reset the model engine to the initial state. If the engine is not initialized,
         we initialize it. Otherwise, reload ckpt and reset states
         """
-        self.engine.initialize()
+        # FSDP wrap (and its NCCL group creation) happens inside engine.initialize().
+        # Tag those groups with the same role-tag used during construct.
+        from verl.utils.process_group_registry import comm_session
+
+        with comm_session(f"{self.config.role}_engine_initialize", tag=self.nccl_tag):
+            self.engine.initialize()
 
     def _postprocess_output(self, output, *, global_token_num, delta_time, forward_only, images_seqlens):
         """
