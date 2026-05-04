@@ -622,6 +622,7 @@ class PPOTrainer:
                 engine_config=critic_cfg.engine,
                 optimizer_config=critic_cfg.optim,
                 checkpoint_config=critic_cfg.checkpoint,
+                role="critic",
             )
             resource_pool = self.resource_pool_manager.get_resource_pool(Role.Critic)
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=worker_cfg)

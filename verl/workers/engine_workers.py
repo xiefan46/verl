@@ -91,6 +91,13 @@ class TrainingWorker(Worker, DistProfilerExtension):
 
         initialize_global_process_group_ray(timeout_second=None)
 
+        # Install monkey-patch on dist.new_group BEFORE engine init.
+        # Idempotent — safe to call multiple times in the same process
+        # (e.g., when actor + ref TrainingWorkers coexist in one Ray actor).
+        from verl.utils.process_group_registry import ProcessGroupRegistry
+
+        ProcessGroupRegistry.install()
+
         set_numa_affinity()
 
         self.config = config
@@ -128,14 +135,23 @@ class TrainingWorker(Worker, DistProfilerExtension):
         )
 
         self.model_config.model_type = self.config.model_type
-        self.engine: BaseEngine = EngineRegistry.new(
-            model_type=self.config.model_type,
-            backend=self.engine_config.strategy,
-            model_config=self.model_config,
-            engine_config=self.engine_config,
-            optimizer_config=self.optimizer_config,
-            checkpoint_config=self.checkpoint_config,
-        )
+
+        # Tag NCCL groups created during engine init with the worker's role,
+        # so that nccl_suspend/resume can target this engine selectively
+        # (without affecting sibling TrainingWorkers like actor vs ref).
+        from verl.utils.process_group_registry import comm_session
+
+        self.nccl_tag = f"training_{self.config.role}"
+
+        with comm_session(f"{self.config.role}_engine_init", tag=self.nccl_tag):
+            self.engine: BaseEngine = EngineRegistry.new(
+                model_type=self.config.model_type,
+                backend=self.engine_config.strategy,
+                model_config=self.model_config,
+                engine_config=self.engine_config,
+                optimizer_config=self.optimizer_config,
+                checkpoint_config=self.checkpoint_config,
+            )
 
         # build dispatch info
         self._register_dispatch_collect_info(
@@ -160,6 +176,25 @@ class TrainingWorker(Worker, DistProfilerExtension):
             device = get_device_name()
 
         self.engine.to(device=device, model=model, optimizer=optimizer, grad=grad)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def nccl_suspend(self):
+        """Release NCCL channel buffer memory for this engine's process groups.
+
+        Independent of `to(device)` (tensor offload) — the trainer decides when
+        to call this. Typical pattern: call after `to("cpu")` to release NCCL
+        memory in addition to the PyTorch tensor memory.
+        """
+        from verl.utils.process_group_registry import ProcessGroupRegistry
+
+        ProcessGroupRegistry.suspend_by_tag(self.nccl_tag)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def nccl_resume(self):
+        """Resume previously-suspended NCCL communicators."""
+        from verl.utils.process_group_registry import ProcessGroupRegistry
+
+        ProcessGroupRegistry.resume_by_tag(self.nccl_tag)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
@@ -519,6 +554,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 engine_config=ref_config.engine,
                 optimizer_config=ref_config.optim,
                 checkpoint_config=ref_config.checkpoint,
+                role="ref",
             )
 
             # assign engine configs
@@ -547,6 +583,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 engine_config=actor_config.engine,
                 optimizer_config=actor_config.optim,
                 checkpoint_config=actor_config.checkpoint,
+                role="actor",
             )
 
             assert self.config.actor.use_dynamic_bsz == self.config.rollout.log_prob_use_dynamic_bsz

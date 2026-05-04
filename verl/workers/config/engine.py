@@ -578,3 +578,9 @@ class TrainingWorkerConfig(BaseConfig):
     # This function takes model config and the device name as parameter.
     # Users can pass in a higher-order function to take more parameters
     auto_select_engine_optim_fn: Callable[["HFModelConfig", str], tuple["EngineConfig", "OptimizerConfig"]] = None
+    # Role of this TrainingWorker, used as suffix for the comm_session tag
+    # (e.g., "actor"/"ref"/"critic" → tag "training_actor"/"training_ref"/...).
+    # When the same Ray actor process hosts multiple TrainingWorker instances
+    # (e.g., actor + ref colocated), per-role tags allow selectively suspending
+    # one engine's NCCL comms without affecting the other.
+    role: str = "training"

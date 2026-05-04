@@ -169,6 +169,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                 engine_config=engine_config,
                 optimizer_config=self.orig_critic_cfg.optim,
                 checkpoint_config=self.orig_critic_cfg.checkpoint,
+                role="critic",
             )
 
             critic_cls = RayClassWithInitArgs(cls=self.role_worker_mapping[Role.Critic], config=critic_cfg)
