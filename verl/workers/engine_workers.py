@@ -772,13 +772,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         Falls back to legacy reflection-based path on any failure for
         backward compatibility during the transition period.
         """
+        print(
+            f"[NCCLSuspend] ActorRolloutRefWorker.suspend_training_nccl_comms entry: "
+            f"pid={os.getpid()}, actor={self.actor is not None}, ref={self.ref is not None}",
+            flush=True,
+        )
         try:
             if self.actor is not None:
                 self.actor.nccl_suspend()
             if self.ref is not None:
                 self.ref.nccl_suspend()
         except Exception as e:
-            logger.warning(f"[NCCLSuspend] Registry path failed ({e}), falling back to legacy reflection.")
+            print(
+                f"[NCCLSuspend] Registry path failed ({e}), falling back to legacy reflection.",
+                flush=True,
+            )
             from verl.utils.nccl_suspend import suspend_training_comms
 
             suspend_training_comms()
@@ -786,13 +794,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def resume_training_nccl_comms(self):
         """Resume all training-side NCCL comms in this worker process."""
+        print(
+            f"[NCCLSuspend] ActorRolloutRefWorker.resume_training_nccl_comms entry: "
+            f"pid={os.getpid()}, actor={self.actor is not None}, ref={self.ref is not None}",
+            flush=True,
+        )
         try:
             if self.actor is not None:
                 self.actor.nccl_resume()
             if self.ref is not None:
                 self.ref.nccl_resume()
         except Exception as e:
-            logger.warning(f"[NCCLSuspend] Registry path failed ({e}), falling back to legacy reflection.")
+            print(
+                f"[NCCLSuspend] Registry path failed ({e}), falling back to legacy reflection.",
+                flush=True,
+            )
             from verl.utils.nccl_suspend import resume_training_comms
 
             resume_training_comms()

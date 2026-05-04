@@ -158,7 +158,12 @@ class ProcessGroupRegistry:
         dist.original_new_group = dist.new_group  # type: ignore[attr-defined]
         dist.new_group = cls._hook_new_group  # type: ignore[assignment]
 
-        logger.info("ProcessGroupRegistry installed (patched torch.distributed.new_group)")
+        # Use print() rather than logger.info() because verl workers default
+        # to WARNING log level, which would hide INFO messages.
+        print(
+            f"[Registry] installed in pid={os.getpid()} (patched torch.distributed.new_group)",
+            flush=True,
+        )
 
     @classmethod
     def uninstall(cls):
@@ -215,7 +220,10 @@ class ProcessGroupRegistry:
         info = GroupInfo(pg=real_group, tag=tag, session_name=session_name)
         cls._registry.setdefault(os.getpid(), []).append(info)
 
-        logger.debug(f"[Registry] tracked group: tag={tag}, session={session_name}, world_size={ws}")
+        print(
+            f"[Registry] tracked group: tag={tag}, session={session_name}, world_size={ws}, pid={os.getpid()}",
+            flush=True,
+        )
 
         return real_group
 
@@ -236,6 +244,11 @@ class ProcessGroupRegistry:
             )
 
         groups = cls._registry.get(os.getpid(), [])
+        print(
+            f"[Registry] suspend_by_tag(tags={list(tags)}) called in pid={os.getpid()}, "
+            f"total tracked groups={len(groups)}",
+            flush=True,
+        )
         suspended_count = 0
         errors = []
 
@@ -246,9 +259,10 @@ class ProcessGroupRegistry:
                 backend = info.pg._get_backend(torch.device("cuda"))
                 comm_ptr = _normalize_comm_handle(backend._comm_ptr())
                 if not comm_ptr or comm_ptr == 0:
-                    logger.warning(
+                    print(
                         f"[Registry] skipping {info.session_name} (tag={info.tag}): "
-                        f"_comm_ptr() returned 0 (likely lazy-init, no collective yet)"
+                        f"_comm_ptr() returned 0 (likely lazy-init, no collective yet)",
+                        flush=True,
                     )
                     continue
                 if suspend_nccl_comm(comm_ptr):
@@ -257,11 +271,17 @@ class ProcessGroupRegistry:
                 else:
                     errors.append((info, RuntimeError("ncclCommSuspend returned non-success")))
             except Exception as e:
-                logger.error(f"[Registry] failed to suspend {info.session_name} (tag={info.tag}): {e}")
+                print(
+                    f"[Registry] failed to suspend {info.session_name} (tag={info.tag}): {e}",
+                    flush=True,
+                )
                 errors.append((info, e))
 
         total = sum(1 for info in groups if info.tag in tags)
-        logger.info(f"[Registry] suspended {suspended_count}/{total} groups for tags={list(tags)}")
+        print(
+            f"[Registry] suspended {suspended_count}/{total} groups for tags={list(tags)}",
+            flush=True,
+        )
 
         if errors:
             raise NcclSuspendError(
@@ -277,6 +297,11 @@ class ProcessGroupRegistry:
             raise ValueError(f"Cannot operate on '{CommTag.UNTRACKED}' tag directly.")
 
         groups = cls._registry.get(os.getpid(), [])
+        print(
+            f"[Registry] resume_by_tag(tags={list(tags)}) called in pid={os.getpid()}, "
+            f"total tracked groups={len(groups)}",
+            flush=True,
+        )
         resumed_count = 0
         errors = []
 
@@ -294,10 +319,13 @@ class ProcessGroupRegistry:
                 else:
                     errors.append((info, RuntimeError("ncclCommResume returned non-success")))
             except Exception as e:
-                logger.error(f"[Registry] failed to resume {info.session_name} (tag={info.tag}): {e}")
+                print(
+                    f"[Registry] failed to resume {info.session_name} (tag={info.tag}): {e}",
+                    flush=True,
+                )
                 errors.append((info, e))
 
-        logger.info(f"[Registry] resumed {resumed_count} groups for tags={list(tags)}")
+        print(f"[Registry] resumed {resumed_count} groups for tags={list(tags)}", flush=True)
 
         if errors:
             raise NcclSuspendError(f"Failed to resume {len(errors)} group(s).", errors)
