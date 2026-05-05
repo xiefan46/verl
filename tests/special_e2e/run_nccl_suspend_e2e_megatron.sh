@@ -87,8 +87,6 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.loss_agg_mode="token-mean" \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.grad_clip=1.0 \
-    actor_rollout_ref.actor.fsdp_config.strategy=megatron \
     actor_rollout_ref.actor.megatron.tensor_model_parallel_size=${megatron_tp} \
     actor_rollout_ref.actor.megatron.pipeline_model_parallel_size=${megatron_pp} \
     actor_rollout_ref.actor.megatron.context_parallel_size=${megatron_cp} \
