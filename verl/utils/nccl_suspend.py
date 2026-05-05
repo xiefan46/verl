@@ -248,31 +248,27 @@ def _resume_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, flo
 # Training side: torch.distributed ProcessGroup comms
 # ===========================================================================
 
-_training_comm_handles: list[tuple[str, int]] | None = None  # cached
+_training_suspended_handles: list[tuple[str, int]] = []  # handles currently suspended
 _training_suspended = False
 
 
-def _extract_training_comm_handles() -> list[tuple[str, int]]:
-    """Extract ncclComm_t from all torch.distributed ProcessGroups in this process.
+def _scan_warm_training_comms() -> list[tuple[str, int]]:
+    """Scan pg_map and return all PGs whose NCCL comm has been warmed up.
 
-    Uses ProcessGroupNCCL._comm_ptr() which returns the ncclComm_t as int.
-    Handles are cached after first successful extraction.
-
-    Returns list of (group_name, comm_ptr_int).
+    Re-scans every call — Megatron creates many PGs (TP/DP/PP/embedding/PP P2P
+    pairs/dist-optimizer/etc.) but `_comm_ptr()` is lazy and returns 0 until the
+    first collective runs on that PG. Late-warming PGs would be missed by a
+    one-shot cache, so we rescan before each suspend.
     """
-    global _training_comm_handles
-    if _training_comm_handles is not None:
-        return _training_comm_handles
-
     import torch.distributed as dist
 
     if not dist.is_initialized():
-        logger.debug("[NCCLSuspend] Training: torch.distributed not initialized.")
         return []
 
-    handles = []
+    handles: list[tuple[str, int]] = []
+    seen_ptrs: set[int] = set()
+    default_pg = None
 
-    # Extract from default group
     try:
         default_pg = dist.distributed_c10d._get_default_group()
         backend = default_pg._get_backend(torch.device("cuda"))
@@ -280,88 +276,75 @@ def _extract_training_comm_handles() -> list[tuple[str, int]]:
             ptr = backend._comm_ptr()
             if ptr != 0:
                 handles.append(("default", ptr))
-                logger.debug(f"[NCCLSuspend] Training: default group _comm_ptr() = 0x{ptr:x}")
-            else:
-                logger.debug("[NCCLSuspend] Training: default group _comm_ptr() = 0 (not initialized)")
+                seen_ptrs.add(ptr)
     except Exception as e:
         logger.debug(f"[NCCLSuspend] Training: failed to extract default group: {e}")
 
-    # Extract from all sub-groups via internal registry
+    pg_total = 0
     try:
         pg_map = dist.distributed_c10d._world.pg_map
-        seen_ptrs = {h[1] for h in handles}  # avoid duplicates
+        pg_total = len(pg_map)
         for pg, _ in pg_map.items():
-            if pg == default_pg:
+            if pg is default_pg:
                 continue
             try:
                 backend = pg._get_backend(torch.device("cuda"))
-                if hasattr(backend, "_comm_ptr"):
-                    ptr = backend._comm_ptr()
-                    if ptr != 0 and ptr not in seen_ptrs:
-                        # Try to get a name for the group
-                        pg_name = dist.distributed_c10d._world.pg_names.get(pg, f"pg_{len(handles)}")
-                        handles.append((pg_name, ptr))
-                        seen_ptrs.add(ptr)
-                        logger.debug(f"[NCCLSuspend] Training: '{pg_name}' _comm_ptr() = 0x{ptr:x}")
+                if not hasattr(backend, "_comm_ptr"):
+                    continue
+                ptr = backend._comm_ptr()
+                if ptr == 0 or ptr in seen_ptrs:
+                    continue
+                pg_name = dist.distributed_c10d._world.pg_names.get(pg, f"pg_{len(handles)}")
+                handles.append((pg_name, ptr))
+                seen_ptrs.add(ptr)
             except Exception:
                 pass
     except Exception as e:
         logger.debug(f"[NCCLSuspend] Training: failed to enumerate sub-groups: {e}")
 
-    if handles:
-        print(
-            f"[NCCLSuspend] Training: extracted {len(handles)} comm handles ({[name for name, _ in handles]})",
-            flush=True,
-        )
-        _training_comm_handles = handles
-    else:
-        print("[NCCLSuspend] Training: no comm handles found (comms may not be initialized yet)", flush=True)
-        # Don't cache empty — retry next time (comms may get initialized later)
-
+    print(
+        f"[NCCLSuspend] Training: pg_map size={pg_total}, warm comms={len(handles)} ({[name for name, _ in handles]})",
+        flush=True,
+    )
     return handles
 
 
 def suspend_training_comms() -> bool:
-    """Suspend all training-side NCCL comms (torch ProcessGroups) in this process.
+    """Suspend all currently-warm training-side NCCL comms in this process.
 
+    Re-scans pg_map each call so newly-warmed PGs get included.
     Idempotent: if already suspended, this is a no-op.
-    Must be called from the training worker process (not the driver).
 
     Returns True if any comm was suspended.
     """
-    global _training_suspended
+    global _training_suspended, _training_suspended_handles
     if _training_suspended:
         print("[NCCLSuspend] Training: already suspended, skipping.", flush=True)
         return False
 
-    handles = _extract_training_comm_handles()
+    handles = _scan_warm_training_comms()
     if not handles:
-        print("[NCCLSuspend] Training suspend: no handles available (comms not initialized yet)", flush=True)
+        print("[NCCLSuspend] Training suspend: no warm comms found", flush=True)
         return False
 
     ok, freed = _suspend_comms(handles, "Training")
     if ok:
         _training_suspended = True
+        _training_suspended_handles = handles
     return ok
 
 
 def resume_training_comms() -> bool:
-    """Resume all training-side NCCL comms in this process.
+    """Resume the comms that were suspended by the most recent suspend call.
 
     Idempotent: if not suspended, this is a no-op.
-    First call before any suspend is expected — just extract handles for caching.
-
-    Returns True if any comm was resumed.
     """
     global _training_suspended
     if not _training_suspended:
-        # Even if not suspended, try to extract handles so they get cached
-        # for the next suspend call (comms may have been initialized by now).
-        _extract_training_comm_handles()
         print("[NCCLSuspend] Training: not suspended, skipping resume.", flush=True)
         return False
 
-    handles = _extract_training_comm_handles()
+    handles = _training_suspended_handles
     if not handles:
         print("[NCCLSuspend] Training resume: no handles available", flush=True)
         return False
