@@ -26,7 +26,9 @@ set -xeuo pipefail
 #     bash tests/special_e2e/run_nccl_suspend_e2e_megatron.sh
 
 NUM_GPUS=${NUM_GPUS:-8}
-MODEL_PATH=${MODEL_PATH:-Qwen/Qwen2.5-0.5B-Instruct}
+# Default to local path populated by verl-deploy/download_models.sh.
+# Override with MODEL_PATH=Qwen/Qwen2.5-0.5B-Instruct to fall back to HF Hub.
+MODEL_PATH=${MODEL_PATH:-${HOME}/models/Qwen/Qwen2.5-0.5B-Instruct}
 
 # Training parameters — small config for fast E2E validation
 train_prompt_bsz=8
