@@ -131,37 +131,55 @@ def resume_nccl_comm(comm_handle) -> bool:
 
 
 def _suspend_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, float]:
-    """Suspend a list of (name, handle) comms. Returns (any_suspended, freed_mb)."""
+    """Suspend a list of (name, handle) comms. Returns (any_suspended, freed_mb).
+
+    Per-comm GPU memory delta is measured by calling empty_cache + synchronize
+    between each suspend call. This adds ~1-10 ms overhead per comm but lets us
+    verify each comm has its own independent NCCL channel buffer.
+    """
     if not handles:
         print(f"[NCCLSuspend] {label}: no comms to suspend.", flush=True)
         return False, 0.0
 
-    mem_before = _gpu_used_mb()
+    mem_total_before = _gpu_used_mb()
     total_start = time.perf_counter()
     succeeded = []
     failed = []
 
     for name, handle in handles:
+        mem_before = _gpu_used_mb()
         t0 = time.perf_counter()
         ok = suspend_nccl_comm(handle)
         elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        # Force per-comm reclaim so the delta isolates this comm's buffer.
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        mem_after = _gpu_used_mb()
+        per_comm_freed = mem_before - mem_after
+
         if ok:
             succeeded.append(name)
-            print(f"[NCCLSuspend] {label}: suspend '{name}' (0x{handle:x}) OK ({elapsed_ms:.0f} ms)", flush=True)
+            print(
+                f"[NCCLSuspend] {label}: suspend '{name}' (0x{handle:x}) OK ({elapsed_ms:.0f} ms), "
+                f"freed {per_comm_freed:.0f} MB ({mem_before:.0f} → {mem_after:.0f} MB)",
+                flush=True,
+            )
         else:
             failed.append(name)
-            print(f"[NCCLSuspend] {label}: suspend '{name}' (0x{handle:x}) FAILED ({elapsed_ms:.0f} ms)", flush=True)
+            print(
+                f"[NCCLSuspend] {label}: suspend '{name}' (0x{handle:x}) FAILED ({elapsed_ms:.0f} ms)",
+                flush=True,
+            )
 
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
     total_ms = (time.perf_counter() - total_start) * 1000
-    mem_after = _gpu_used_mb()
-    freed = mem_before - mem_after
+    mem_total_after = _gpu_used_mb()
+    freed = mem_total_before - mem_total_after
 
     print(
         f"[NCCLSuspend] {label}: suspended {len(succeeded)}/{len(handles)} comms "
-        f"in {total_ms:.0f} ms, freed {freed:.0f} MB "
-        f"(gpu: {mem_before:.0f} → {mem_after:.0f} MB)",
+        f"in {total_ms:.0f} ms, freed {freed:.0f} MB total "
+        f"(gpu: {mem_total_before:.0f} → {mem_total_after:.0f} MB)",
         flush=True,
     )
     if failed:
@@ -171,36 +189,53 @@ def _suspend_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, fl
 
 
 def _resume_comms(handles: list[tuple[str, int]], label: str) -> tuple[bool, float]:
-    """Resume a list of (name, handle) comms. Returns (any_resumed, reclaimed_mb)."""
+    """Resume a list of (name, handle) comms. Returns (any_resumed, reclaimed_mb).
+
+    Per-comm GPU memory delta is measured by calling synchronize between each
+    resume call. NCCL allocates channel buffers on the next collective, but
+    ncclCommResume itself reclaims most of the buffer state.
+    """
     if not handles:
         print(f"[NCCLSuspend] {label}: no comms to resume.", flush=True)
         return False, 0.0
 
-    mem_before = _gpu_used_mb()
+    mem_total_before = _gpu_used_mb()
     total_start = time.perf_counter()
     succeeded = []
     failed = []
 
     for name, handle in handles:
+        mem_before = _gpu_used_mb()
         t0 = time.perf_counter()
         ok = resume_nccl_comm(handle)
         elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        torch.cuda.synchronize()
+        mem_after = _gpu_used_mb()
+        per_comm_reclaimed = mem_after - mem_before
+
         if ok:
             succeeded.append(name)
-            print(f"[NCCLSuspend] {label}: resume '{name}' (0x{handle:x}) OK ({elapsed_ms:.0f} ms)", flush=True)
+            print(
+                f"[NCCLSuspend] {label}: resume '{name}' (0x{handle:x}) OK ({elapsed_ms:.0f} ms), "
+                f"reclaimed {per_comm_reclaimed:.0f} MB ({mem_before:.0f} → {mem_after:.0f} MB)",
+                flush=True,
+            )
         else:
             failed.append(name)
-            print(f"[NCCLSuspend] {label}: resume '{name}' (0x{handle:x}) FAILED ({elapsed_ms:.0f} ms)", flush=True)
+            print(
+                f"[NCCLSuspend] {label}: resume '{name}' (0x{handle:x}) FAILED ({elapsed_ms:.0f} ms)",
+                flush=True,
+            )
 
-    torch.cuda.synchronize()
     total_ms = (time.perf_counter() - total_start) * 1000
-    mem_after = _gpu_used_mb()
-    reclaimed = mem_after - mem_before
+    mem_total_after = _gpu_used_mb()
+    reclaimed = mem_total_after - mem_total_before
 
     print(
         f"[NCCLSuspend] {label}: resumed {len(succeeded)}/{len(handles)} comms "
-        f"in {total_ms:.0f} ms, reclaimed {reclaimed:.0f} MB "
-        f"(gpu: {mem_before:.0f} → {mem_after:.0f} MB)",
+        f"in {total_ms:.0f} ms, reclaimed {reclaimed:.0f} MB total "
+        f"(gpu: {mem_total_before:.0f} → {mem_total_after:.0f} MB)",
         flush=True,
     )
     if failed:
