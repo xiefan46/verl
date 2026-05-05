@@ -36,8 +36,8 @@ max_num_tokens=$(( max_prompt_length + max_response_length + 1 ))
 # TP=1/PP=2:           tests rollout PP send/recv path (uses pynccl directly, NCCL buffer allocated)
 gen_tp=${GEN_TP:-2}
 gen_pp=${GEN_PP:-1}
-sp_size=1
-fsdp_size=${NUM_GPUS}
+sp_size=${SP_SIZE:-1}
+fsdp_size=${FSDP_SIZE:-${NUM_GPUS}}
 
 # Use naive backend for weight transfer (avoids double-sleep bug in nccl backend).
 # NCCL suspend/resume targets training/rollout comms, not the weight transfer path.
