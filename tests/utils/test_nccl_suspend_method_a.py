@@ -128,26 +128,32 @@ def discover_megatron_groups(ps) -> dict:
 #   all_to_all                                          → ~3.2 GB / comm
 # An MoE EP group warmed up with allreduce would only allocate ~480 MB,
 # masking the real ~3 GB cost of the all_to_all dispatch path.
+#
+# Mapping reflects the dominant op each group sees in real training:
+#   TP            : allreduce (column/row-parallel matmul reduce)
+#   DP            : allreduce (DDP grad sync; FSDP would also use allgather/reduce_scatter)
+#   PP            : p2p (unbatched send/recv between adjacent PP stages — also
+#                        warms main PP comm via a leading broadcast so Method A
+#                        sees the parent PG)
+#   CP            : allgather (Ring-Attention KV gather)
+#   EP / ETP×EP   : all_to_all (MoE token dispatch / combine)
+#   embedding     : allreduce (cross-PP embedding sync)
+#   ETP / EDP     : allreduce (expert TP / DP grad sync)
 GROUP_TO_WARMUP_OP = {
-    # Core dims: matrix-multiply gradient sync, FSDP shard, etc. → allreduce.
     "tp": "allreduce",
     "dp": "allreduce",
-    "pp": "broadcast",  # PP main group is mostly used for metadata broadcast
-    "cp": "allreduce",
+    "pp": "p2p",
+    "cp": "allgather",
     "model_parallel": "allreduce",
     "tp_dp": "allreduce",
-    "tp_cp": "allreduce",
-    # Embedding sync.
+    "tp_cp": "allgather",
     "embedding": "allreduce",
     "position_embedding": "allreduce",
-    # MoE expert dims: token dispatch / combine in production goes through
-    # all_to_all, which is the dominant memory consumer in MoE training.
     "ep": "all_to_all",
     "etp_ep": "all_to_all",
     "etp_ep_pp": "all_to_all",
     "etp": "allreduce",
     "edp": "allreduce",
-    # Distributed optimizer reduce-scatter.
     "intra_dist_opt": "allreduce",
 }
 
@@ -157,18 +163,50 @@ def _run_warmup_op(op: str, group, world: int) -> None:
     allocates matches what real training would allocate on this group.
     """
     if op == "all_to_all":
-        # 1 MB per peer; per-rank tensor size scales with world. NCCL
-        # channel buffer for all_to_all is determined by world size, not
-        # message bytes, so the small size is fine for warmup.
+        # 1 MB per peer; per-rank tensor scales with world. NCCL channel
+        # buffer for all_to_all is determined by world size, not message
+        # bytes, so the small per-peer chunk is fine for warmup.
         chunk = 256 * 1024  # 1 MB float32 per peer
         inp = torch.zeros(chunk * world, dtype=torch.float32, device="cuda")
         out = torch.zeros_like(inp)
         dist.all_to_all_single(out, inp, group=group)
+    elif op == "allgather":
+        chunk = 256 * 1024
+        inp = torch.zeros(chunk, dtype=torch.float32, device="cuda")
+        out = torch.zeros(chunk * world, dtype=torch.float32, device="cuda")
+        dist.all_gather_into_tensor(out, inp, group=group)
     elif op == "broadcast":
         x = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
-        # src must be a global rank that's a member of this group.
         src_global_rank = dist.get_global_rank(group, 0)
         dist.broadcast(x, src=src_global_rank, group=group)
+    elif op == "p2p":
+        # Two-stage warmup for PP-style groups:
+        #   1. broadcast — warms the main PG ncclComm_t (what Method A reads).
+        #   2. unbatched send/recv ring — exercises the realistic PP path
+        #      that creates hidden 2-rank ncclComm_t per (src,dst) pair.
+        #      Those hidden comms are NOT visible to either Method A or B
+        #      (PyTorch stores them in a private map, not pg_map). This is
+        #      a known limitation; running p2p here at least exercises the
+        #      code path so future enumeration improvements can be tested
+        #      against this configuration.
+        bcast_x = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
+        src_global_rank = dist.get_global_rank(group, 0)
+        dist.broadcast(bcast_x, src=src_global_rank, group=group)
+
+        my_local = dist.get_rank(group=group)
+        next_local = (my_local + 1) % world
+        prev_local = (my_local - 1) % world
+        next_global = dist.get_global_rank(group, next_local)
+        prev_global = dist.get_global_rank(group, prev_local)
+        send_buf = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
+        recv_buf = torch.zeros_like(send_buf)
+        ops = [
+            dist.P2POp(dist.isend, send_buf, next_global, group=group),
+            dist.P2POp(dist.irecv, recv_buf, prev_global, group=group),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
     else:  # allreduce
         x = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
         dist.all_reduce(x, group=group)
@@ -273,7 +311,9 @@ def main() -> int:
     # ---------------------------------------------------------------- Method A
     from verl.utils.nccl_suspend import (  # noqa: PLC0415
         _collect_megatron_comms,
+        resume_nccl_comm,
         resume_training_comms_megatron,
+        suspend_nccl_comm,
         suspend_training_comms_megatron,
     )
 
@@ -289,7 +329,103 @@ def main() -> int:
         f"expected count <= warmed count after dedup"
     )
 
-    # 4. Suspend via Method A and check we release real memory.
+    # Map each comm name discovered by Method A to the warmup op that NCCL
+    # used to allocate its channel buffer. Names look like
+    # "TENSOR_MODEL_PARALLEL_GROUP" and need to be normalized to short keys.
+    PARALLEL_STATE_TO_SHORT = {
+        "TENSOR_MODEL_PARALLEL_GROUP": "tp",
+        "DATA_PARALLEL_GROUP": "dp",
+        "PIPELINE_MODEL_PARALLEL_GROUP": "pp",
+        "CONTEXT_PARALLEL_GROUP": "cp",
+        "MODEL_PARALLEL_GROUP": "model_parallel",
+        "TENSOR_AND_DATA_PARALLEL_GROUP": "tp_dp",
+        "TENSOR_AND_CONTEXT_PARALLEL_GROUP": "tp_cp",
+        "EMBEDDING_GROUP": "embedding",
+        "POSITION_EMBEDDING_GROUP": "position_embedding",
+        "EXPERT_MODEL_PARALLEL_GROUP": "ep",
+        "EXPERT_TENSOR_PARALLEL_GROUP": "etp",
+        "EXPERT_DATA_PARALLEL_GROUP": "edp",
+        "EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP": "etp_ep",
+        "EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP": "etp_ep_pp",
+        "INTRA_DISTRIBUTED_OPTIMIZER_INSTANCE_GROUP": "intra_dist_opt",
+    }
+
+    def _op_for(handle_name: str) -> str:
+        # Strip trailing "[i]" / "[k]" container index if present.
+        base = handle_name.split("[", 1)[0]
+        short = PARALLEL_STATE_TO_SHORT.get(base, base.lower())
+        return GROUP_TO_WARMUP_OP.get(short, "?")
+
+    # 4. Manual per-comm suspend → resume to collect detailed timing.
+    log("=" * 92)
+    log("Phase 1: per-comm suspend/resume timing (Method A)")
+    log("=" * 92)
+    per_comm_stats: list[dict] = []
+    mem_before_total = gpu_used_mb()
+    t_total = time.perf_counter()
+    for name, handle in handles_a:
+        op = _op_for(name)
+        mem_before = gpu_used_mb()
+        t0 = time.perf_counter()
+        ok_s = suspend_nccl_comm(handle)
+        suspend_ms = (time.perf_counter() - t0) * 1000.0
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        mem_after = gpu_used_mb()
+        per_comm_stats.append(
+            {
+                "name": name,
+                "handle": handle,
+                "op": op,
+                "ok_suspend": ok_s,
+                "suspend_ms": suspend_ms,
+                "freed_mb": mem_before - mem_after,
+            }
+        )
+    total_suspend_ms = (time.perf_counter() - t_total) * 1000.0
+    total_freed_mb = mem_before_total - gpu_used_mb()
+
+    t_total = time.perf_counter()
+    for entry in per_comm_stats:
+        mem_before = gpu_used_mb()
+        t0 = time.perf_counter()
+        ok_r = resume_nccl_comm(entry["handle"])
+        resume_ms = (time.perf_counter() - t0) * 1000.0
+        torch.cuda.synchronize()
+        mem_after = gpu_used_mb()
+        entry["ok_resume"] = ok_r
+        entry["resume_ms"] = resume_ms
+        entry["reclaimed_mb"] = mem_after - mem_before
+    total_resume_ms = (time.perf_counter() - t_total) * 1000.0
+    total_reclaimed_mb = sum(e["reclaimed_mb"] for e in per_comm_stats)
+
+    # Pretty-print summary table.
+    log("")
+    log(f"{'comm':<45} {'op':<11} {'suspend_ms':>11} {'freed_MB':>9} {'resume_ms':>10} {'reclaim_MB':>11}")
+    log("-" * 100)
+    for e in per_comm_stats:
+        log(
+            f"{e['name']:<45} {e['op']:<11} {e['suspend_ms']:>11.0f} {e['freed_mb']:>9.0f} "
+            f"{e['resume_ms']:>10.0f} {e['reclaimed_mb']:>11.0f}"
+        )
+    log("-" * 100)
+    log(
+        f"{'TOTAL':<45} {'':<11} {total_suspend_ms:>11.0f} {total_freed_mb:>9.0f} "
+        f"{total_resume_ms:>10.0f} {total_reclaimed_mb:>11.0f}"
+    )
+    log("")
+
+    # Sanity: resume reclaimed close to suspend freed.
+    assert total_freed_mb > 100.0 * len(handles_a), (
+        f"Phase 1 freed {total_freed_mb:.0f} MB across {len(handles_a)} comms "
+        f"(expected > {100.0 * len(handles_a):.0f} MB)"
+    )
+    assert abs(total_reclaimed_mb - total_freed_mb) / max(total_freed_mb, 1.0) < 0.05, (
+        f"Phase 1: resume reclaimed {total_reclaimed_mb:.0f} MB but suspend freed {total_freed_mb:.0f} MB"
+    )
+
+    # 5. Phase 2: high-level public API + idempotency.
+    log("Phase 2: public-API suspend/resume + idempotency")
     mem_before = gpu_used_mb()
     t0 = time.perf_counter()
     ok = suspend_training_comms_megatron()
@@ -298,23 +434,13 @@ def main() -> int:
     torch.cuda.synchronize()
     mem_after = gpu_used_mb()
     freed = mem_before - mem_after
-    log(
-        f"Method A suspend: ok={ok}, freed={freed:.0f} MB ({mem_before:.0f} -> {mem_after:.0f} MB), {suspend_ms:.0f} ms"
-    )
-    assert ok, "Method A suspend reported failure"
-
-    # Each NCCL comm is ~480 MB on H100; require at least one comm worth of
-    # release. Tighter check on per-comm average:
-    expected_min_freed = 100.0 * len(handles_a)
-    assert freed > expected_min_freed, (
-        f"Method A freed {freed:.0f} MB across {len(handles_a)} comms (expected > {expected_min_freed:.0f} MB)"
-    )
+    log(f"  suspend_training_comms_megatron(): ok={ok}, freed={freed:.0f} MB, {suspend_ms:.0f} ms")
+    assert ok, "Method A public suspend failed"
 
     # Idempotency: a second suspend should be a no-op.
     ok_again = suspend_training_comms_megatron()
     assert not ok_again, "Method A should be idempotent (second suspend = no-op)"
 
-    # 5. Resume via Method A.
     mem_before_resume = gpu_used_mb()
     t0 = time.perf_counter()
     ok = resume_training_comms_megatron()
@@ -322,11 +448,8 @@ def main() -> int:
     torch.cuda.synchronize()
     mem_after_resume = gpu_used_mb()
     reclaimed = mem_after_resume - mem_before_resume
-    log(
-        f"Method A resume: ok={ok}, reclaimed={reclaimed:.0f} MB "
-        f"({mem_before_resume:.0f} -> {mem_after_resume:.0f} MB), {resume_ms:.0f} ms"
-    )
-    assert ok, "Method A resume reported failure"
+    log(f"  resume_training_comms_megatron():  ok={ok}, reclaimed={reclaimed:.0f} MB, {resume_ms:.0f} ms")
+    assert ok, "Method A public resume failed"
 
     # Resume should reclaim approximately what suspend freed (within 5%).
     assert abs(reclaimed - freed) / max(freed, 1.0) < 0.05, (
