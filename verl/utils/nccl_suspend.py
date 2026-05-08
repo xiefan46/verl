@@ -356,6 +356,154 @@ def resume_training_comms() -> bool:
 
 
 # ===========================================================================
+# Method A: reflect over megatron.core.parallel_state named globals.
+# ===========================================================================
+#
+# Method B (above) walks torch.distributed._world.pg_map, which catches every
+# ProcessGroup registered with PyTorch — including non-Megatron PGs (e.g. weight
+# transfer PGs from KIMICheckpointEngine). Method A scans only Megatron's named
+# parallel groups, giving a precise scope with no false positives but no
+# coverage of FSDP / non-Megatron backends.
+
+_megatron_suspended_handles: list[tuple[str, int]] = []
+_megatron_suspended = False
+
+
+def _collect_megatron_comms() -> list[tuple[str, int]]:
+    """Reflect over megatron.core.parallel_state's module-level globals to
+    collect every warm NCCL ncclComm_t handle.
+
+    Walks attributes whose name matches ``_*GROUP*`` and skips ``_*GLOO*``
+    (CPU-only). Handles three container shapes:
+      * Singleton ProcessGroup (most groups, e.g. _TENSOR_MODEL_PARALLEL_GROUP)
+      * List of ProcessGroups (_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS)
+      * Dict of ProcessGroups (_HYBRID_DP_CP_GROUPS)
+
+    Deduplicates by ncclComm_t handle: PyTorch may share the underlying
+    communicator across multiple PG objects with the same rank set, and
+    ncclCommSuspend errors when called twice on the same handle.
+
+    Returns a list of (display_name, handle_int). Empty list if Megatron is
+    unavailable or model parallel is not yet initialized.
+    """
+    try:
+        from megatron.core import parallel_state as ps
+    except ImportError:
+        print("[NCCLSuspend] MethodA: megatron.core.parallel_state not importable", flush=True)
+        return []
+
+    try:
+        if not ps.model_parallel_is_initialized():
+            print("[NCCLSuspend] MethodA: model parallel not initialized", flush=True)
+            return []
+    except Exception as e:
+        print(f"[NCCLSuspend] MethodA: model_parallel_is_initialized check failed: {e}", flush=True)
+        return []
+
+    handles: list[tuple[str, int]] = []
+    seen_ptrs: set[int] = set()
+    inspected = 0
+
+    for attr_name in sorted(dir(ps)):
+        if not attr_name.startswith("_"):
+            continue
+        if "GROUP" not in attr_name:
+            continue
+        if "GLOO" in attr_name:
+            # CPU-backed groups never hold NCCL comms.
+            continue
+
+        attr = getattr(ps, attr_name, None)
+        if attr is None:
+            continue
+
+        # Normalize to a flat list of (label, pg).
+        if isinstance(attr, dict):
+            items = [(f"{attr_name.lstrip('_')}[{k}]", v) for k, v in attr.items()]
+        elif isinstance(attr, list | tuple):
+            items = [(f"{attr_name.lstrip('_')}[{i}]", v) for i, v in enumerate(attr)]
+        else:
+            items = [(attr_name.lstrip("_"), attr)]
+
+        for label, pg in items:
+            if pg is None:
+                continue
+            inspected += 1
+            try:
+                backend = pg._get_backend(torch.device("cuda"))
+            except Exception:
+                continue
+            if not hasattr(backend, "_comm_ptr"):
+                continue
+            try:
+                ptr = backend._comm_ptr()
+            except Exception:
+                continue
+            if ptr == 0 or ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
+            handles.append((label, int(ptr)))
+
+    print(
+        f"[NCCLSuspend] MethodA: inspected {inspected} parallel_state group attrs, "
+        f"found {len(handles)} unique warm comms ({[name for name, _ in handles]})",
+        flush=True,
+    )
+    return handles
+
+
+def suspend_training_comms_megatron() -> bool:
+    """Suspend all warm NCCL comms reachable via megatron.core.parallel_state.
+
+    Method A: reflective scan of parallel_state named globals. See
+    :func:`_collect_megatron_comms` for the enumeration policy.
+
+    Idempotent. Tracks its own suspension state independently of
+    :func:`suspend_training_comms` (Method B) so the two can be A/B compared
+    in the same process.
+
+    Returns True iff at least one comm was successfully suspended.
+    """
+    global _megatron_suspended, _megatron_suspended_handles
+    if _megatron_suspended:
+        print("[NCCLSuspend] MethodA: already suspended, skipping.", flush=True)
+        return False
+
+    handles = _collect_megatron_comms()
+    if not handles:
+        print("[NCCLSuspend] MethodA suspend: no warm comms found", flush=True)
+        return False
+
+    ok, _ = _suspend_comms(handles, "MethodA")
+    if ok:
+        _megatron_suspended = True
+        _megatron_suspended_handles = handles
+    return ok
+
+
+def resume_training_comms_megatron() -> bool:
+    """Resume the comms that were suspended by the most recent
+    :func:`suspend_training_comms_megatron` call.
+
+    Idempotent.
+    """
+    global _megatron_suspended
+    if not _megatron_suspended:
+        print("[NCCLSuspend] MethodA: not suspended, skipping resume.", flush=True)
+        return False
+
+    handles = _megatron_suspended_handles
+    if not handles:
+        print("[NCCLSuspend] MethodA resume: no handles available", flush=True)
+        return False
+
+    ok, _ = _resume_comms(handles, "MethodA")
+    if ok:
+        _megatron_suspended = False
+    return ok
+
+
+# ===========================================================================
 # Rollout side: vLLM pynccl comms
 # ===========================================================================
 
