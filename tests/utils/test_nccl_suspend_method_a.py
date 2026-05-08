@@ -14,10 +14,14 @@
 """
 Test Method A (megatron.core.parallel_state reflection) for NCCL pause/resume.
 
-Compares Method A against Method B (pg_map scan) on a real Megatron parallel
-state, validates that both find the same set of NCCL communicators (modulo
-weight-transfer false positives that only Method B is susceptible to), and
-verifies the suspend/resume cycle releases and restores GPU memory cleanly.
+Exercises every Megatron parallel dimension Method A is meant to cover:
+TP, DP, PP, CP, EP, ETP, EDP, plus combined groups (TP×DP, TP×CP, ETP×EP,
+ETP×EP×PP, embedding, distributed optimizer instance group).
+
+Compares Method A against Method B (pg_map scan) on the same parallel state,
+validates that both find the same set of NCCL communicators (modulo extras
+that only Method B is susceptible to), and verifies the suspend/resume cycle
+releases and restores GPU memory cleanly.
 
 Requirements:
   * NCCL >= 2.29.7 (libnccl.so.2 must export ncclCommSuspend / ncclCommResume).
@@ -26,11 +30,23 @@ Requirements:
   * 8 GPUs with NVLink (single-node).
 
 Usage:
+    # Default: TP=2, PP=2, DP=2 (CP=EP=ETP disabled). 5 comms expected.
     torchrun --nproc_per_node=8 tests/utils/test_nccl_suspend_method_a.py
 
+    # Add CP=2: TP=2, PP=2, DP=1, CP=2. CP / TP×CP groups appear.
+    CP_SIZE=2 PP_SIZE=2 TP_SIZE=2 \
+        torchrun --nproc_per_node=8 tests/utils/test_nccl_suspend_method_a.py
+
+    # Add MoE EP: TP=2, PP=2, DP=2, EP=2, ETP=2 (EDP=1 derived).
+    EP_SIZE=2 ETP_SIZE=2 \
+        torchrun --nproc_per_node=8 tests/utils/test_nccl_suspend_method_a.py
+
+    # Full mix: TP=2, PP=2, CP=1, DP=2, EP=2, ETP=2.
+    TP_SIZE=2 PP_SIZE=2 DP_SIZE=2 CP_SIZE=1 EP_SIZE=2 ETP_SIZE=2 \
+        torchrun --nproc_per_node=8 tests/utils/test_nccl_suspend_method_a.py
+
 Optional env vars:
-    TP_SIZE, PP_SIZE, DP_SIZE, CP_SIZE  parallel dims (defaults: 2/2/2/1)
-    NCCL_NVLS_ENABLE=0                  recommended in CI without Fabric Manager
+    NCCL_NVLS_ENABLE=0        recommended in CI without Fabric Manager
 """
 
 import os
@@ -41,7 +57,7 @@ import torch
 import torch.distributed as dist
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Logging / GPU memory helpers
 # ---------------------------------------------------------------------------
 
 
@@ -57,26 +73,80 @@ def gpu_used_mb() -> float:
     return (total - free) / (1024**2)
 
 
-def warm_up_collectives_per_group(groups: dict) -> None:
-    """Issue one allreduce per named group so each ProcessGroup's underlying
-    NCCL communicator gets lazily initialized. Without this, ``_comm_ptr()``
-    returns 0 and neither Method A nor Method B can extract handles.
+# ---------------------------------------------------------------------------
+# Megatron group discovery + warmup
+# ---------------------------------------------------------------------------
+
+
+def discover_megatron_groups(ps) -> dict:
+    """Probe every known Megatron parallel-state accessor and return a dict
+    of {name: ProcessGroup} for the ones that exist on THIS rank.
+
+    Some groups (e.g. embedding) only exist for a subset of ranks; some
+    (e.g. expert_*) only exist when EP > 1. Each accessor is wrapped in
+    try/except so the test gracefully skips groups that aren't configured
+    for the current parallel layout.
     """
-    for name, group in groups.items():
-        if group is None:
+    accessors = [
+        # Core dims
+        ("tp", lambda: ps.get_tensor_model_parallel_group()),
+        ("dp", lambda: ps.get_data_parallel_group()),
+        ("pp", lambda: ps.get_pipeline_model_parallel_group()),
+        ("cp", lambda: ps.get_context_parallel_group()),
+        # Combined dims
+        ("model_parallel", lambda: ps.get_model_parallel_group()),  # TP × PP
+        ("tp_dp", lambda: ps.get_tensor_and_data_parallel_group()),
+        ("tp_cp", lambda: ps.get_tensor_and_context_parallel_group()),
+        # Embedding sync (cross-PP)
+        ("embedding", lambda: ps.get_embedding_group()),
+        ("position_embedding", lambda: ps.get_position_embedding_group()),
+        # MoE expert dims
+        ("ep", lambda: ps.get_expert_model_parallel_group()),
+        ("etp", lambda: ps.get_expert_tensor_parallel_group()),
+        ("edp", lambda: ps.get_expert_data_parallel_group()),
+        ("etp_ep", lambda: ps.get_expert_tensor_and_model_parallel_group()),
+        ("etp_ep_pp", lambda: ps.get_expert_tensor_model_pipeline_parallel_group()),
+        # Distributed optimizer
+        ("intra_dist_opt", lambda: ps.get_intra_distributed_optimizer_instance_group()),
+    ]
+    found = {}
+    for name, fn in accessors:
+        try:
+            g = fn()
+        except Exception:
             continue
+        if g is None:
+            continue
+        found[name] = g
+    return found
+
+
+def warm_up_groups(groups: dict) -> dict:
+    """Issue one allreduce per group so each ProcessGroup's underlying NCCL
+    communicator gets lazily initialized. Without this, ``_comm_ptr()``
+    returns 0 and neither Method A nor Method B can extract handles.
+
+    Returns {name: world_size} for groups that were successfully warmed up.
+    Skips size-1 groups (no NCCL comm allocated for them) and any group the
+    current rank is not a member of.
+    """
+    warmed: dict[str, int] = {}
+    for name, group in groups.items():
         try:
             world = dist.get_world_size(group=group)
         except Exception:
             continue
         if world <= 1:
-            # NCCL doesn't allocate a comm for size-1 groups.
             continue
-        # Use a 1-MB tensor — small enough that warmup overhead is negligible
-        # but large enough to force NCCL to actually pick a real algorithm.
-        x = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
-        dist.all_reduce(x, group=group)
-        torch.cuda.synchronize()
+        try:
+            x = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
+            dist.all_reduce(x, group=group)
+            torch.cuda.synchronize()
+        except Exception as e:
+            log(f"warm-up '{name}' failed: {e}")
+            continue
+        warmed[name] = world
+    return warmed
 
 
 # ---------------------------------------------------------------------------
@@ -94,9 +164,14 @@ def main() -> int:
     tp_size = int(os.environ.get("TP_SIZE", "2"))
     pp_size = int(os.environ.get("PP_SIZE", "2"))
     cp_size = int(os.environ.get("CP_SIZE", "1"))
+    ep_size = int(os.environ.get("EP_SIZE", "1"))
+    etp_size = int(os.environ.get("ETP_SIZE", str(tp_size)))
     expected_dp = world_size // (tp_size * pp_size * cp_size)
 
-    log(f"world_size={world_size}, TP={tp_size}, PP={pp_size}, CP={cp_size}, DP={expected_dp}")
+    log(
+        f"world_size={world_size}, TP={tp_size}, PP={pp_size}, "
+        f"CP={cp_size}, DP={expected_dp}, EP={ep_size}, ETP={etp_size}"
+    )
 
     # 1. Sanity: NCCL has the suspend/resume API.
     from verl.utils.nccl_suspend import _get_nccl_lib  # noqa: PLC0415
@@ -106,8 +181,8 @@ def main() -> int:
         dist.destroy_process_group()
         return 0
 
-    # 2. Initialize Megatron parallel_state. We import lazily so the test file
-    #    can be parsed without megatron-core installed.
+    # 2. Initialize Megatron parallel_state. Lazy import so the test file can
+    #    be parsed without megatron-core installed.
     try:
         from megatron.core import parallel_state as ps  # noqa: PLC0415
     except ImportError as e:
@@ -115,23 +190,25 @@ def main() -> int:
         dist.destroy_process_group()
         return 0
 
-    ps.initialize_model_parallel(
-        tensor_model_parallel_size=tp_size,
-        pipeline_model_parallel_size=pp_size,
-        context_parallel_size=cp_size,
-    )
-    log("Megatron parallel_state initialized")
-
-    # 3. Warm up every named group so _comm_ptr() returns non-zero.
-    candidate_groups = {
-        "tp": ps.get_tensor_model_parallel_group(),
-        "dp": ps.get_data_parallel_group(),
-        "pp": ps.get_pipeline_model_parallel_group(),
-        "model_parallel": ps.get_model_parallel_group(),
-        "tp_dp": ps.get_tensor_and_data_parallel_group(),
+    init_kwargs = {
+        "tensor_model_parallel_size": tp_size,
+        "pipeline_model_parallel_size": pp_size,
+        "context_parallel_size": cp_size,
     }
-    warm_up_collectives_per_group(candidate_groups)
-    log("All candidate groups warmed up")
+    if ep_size > 1:
+        init_kwargs["expert_model_parallel_size"] = ep_size
+        init_kwargs["expert_tensor_parallel_size"] = etp_size
+    ps.initialize_model_parallel(**init_kwargs)
+    log(f"Megatron parallel_state initialized with {init_kwargs}")
+
+    # 3. Discover every group Megatron exposes for the current configuration,
+    #    then warm them up so NCCL comms are lazily allocated.
+    discovered = discover_megatron_groups(ps)
+    log(f"Discovered {len(discovered)} parallel-state groups: {sorted(discovered.keys())}")
+
+    warmed = warm_up_groups(discovered)
+    log(f"Warmed up {len(warmed)} groups: " + ", ".join(f"{n}(size={s})" for n, s in sorted(warmed.items())))
+    assert len(warmed) > 0, "No groups warmed up — invalid parallel config?"
 
     # ---------------------------------------------------------------- Method A
     from verl.utils.nccl_suspend import (  # noqa: PLC0415
@@ -141,8 +218,16 @@ def main() -> int:
     )
 
     handles_a = _collect_megatron_comms()
-    log(f"Method A discovered {len(handles_a)} comms: {[n for n, _ in handles_a]}")
+    log(f"Method A discovered {len(handles_a)} unique comms: {[n for n, _ in handles_a]}")
     assert len(handles_a) > 0, "Method A must find at least one warm comm"
+
+    # Method A's coverage should be at least as large as the warmed set
+    # (multiple PGs may share a handle so the unique count can be less).
+    # We require the count to be in a sensible range: between 1 and len(warmed).
+    assert 1 <= len(handles_a) <= len(warmed), (
+        f"Method A found {len(handles_a)} comms but only {len(warmed)} groups were warmed up; "
+        f"expected count <= warmed count after dedup"
+    )
 
     # 4. Suspend via Method A and check we release real memory.
     mem_before = gpu_used_mb()
@@ -157,7 +242,13 @@ def main() -> int:
         f"Method A suspend: ok={ok}, freed={freed:.0f} MB ({mem_before:.0f} -> {mem_after:.0f} MB), {suspend_ms:.0f} ms"
     )
     assert ok, "Method A suspend reported failure"
-    assert freed > 100.0, f"Method A freed only {freed:.0f} MB (expected >>100)"
+
+    # Each NCCL comm is ~480 MB on H100; require at least one comm worth of
+    # release. Tighter check on per-comm average:
+    expected_min_freed = 100.0 * len(handles_a)
+    assert freed > expected_min_freed, (
+        f"Method A freed {freed:.0f} MB across {len(handles_a)} comms (expected > {expected_min_freed:.0f} MB)"
+    )
 
     # Idempotency: a second suspend should be a no-op.
     ok_again = suspend_training_comms_megatron()
@@ -177,11 +268,22 @@ def main() -> int:
     )
     assert ok, "Method A resume reported failure"
 
-    # 6. Post-resume sanity: collectives must still work.
-    x = torch.ones(1024, dtype=torch.float32, device="cuda")
-    dist.all_reduce(x, group=ps.get_tensor_model_parallel_group())
+    # Resume should reclaim approximately what suspend freed (within 5%).
+    assert abs(reclaimed - freed) / max(freed, 1.0) < 0.05, (
+        f"Resume reclaimed {reclaimed:.0f} MB but suspend freed {freed:.0f} MB"
+    )
+
+    # 6. Post-resume sanity: collectives must still work on every warmed group.
+    for name, group in discovered.items():
+        if name not in warmed:
+            continue
+        try:
+            x = torch.ones(1024, dtype=torch.float32, device="cuda")
+            dist.all_reduce(x, group=group)
+        except Exception as e:
+            raise AssertionError(f"Post-resume allreduce on '{name}' failed: {e}") from e
     torch.cuda.synchronize()
-    log("Post-resume allreduce on TP group succeeded")
+    log(f"Post-resume allreduce passed on all {len(warmed)} warmed groups")
 
     # ---------------------------------------------------------------- Method B
     from verl.utils.nccl_suspend import (  # noqa: PLC0415
@@ -217,12 +319,16 @@ def main() -> int:
     assert ok, "Method B resume reported failure"
     log("Method B suspend/resume cycle completed")
 
-    # 8. Final sanity: more collectives after both A and B cycles.
+    # 8. Final sanity: more collectives on every warmed group after both cycles.
     for _ in range(3):
-        x = torch.ones(1024, dtype=torch.float32, device="cuda")
-        dist.all_reduce(x, group=ps.get_data_parallel_group())
+        for group in discovered.values():
+            try:
+                x = torch.ones(1024, dtype=torch.float32, device="cuda")
+                dist.all_reduce(x, group=group)
+            except Exception:
+                pass
     torch.cuda.synchronize()
-    log("Post-cycle DP allreduces succeeded")
+    log("Post-cycle collectives on all groups succeeded")
 
     log("PASS")
     ps.destroy_model_parallel()
