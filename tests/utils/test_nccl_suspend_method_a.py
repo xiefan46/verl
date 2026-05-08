@@ -121,16 +121,68 @@ def discover_megatron_groups(ps) -> dict:
     return found
 
 
-def warm_up_groups(groups: dict) -> dict:
-    """Issue one allreduce per group so each ProcessGroup's underlying NCCL
-    communicator gets lazily initialized. Without this, ``_comm_ptr()``
-    returns 0 and neither Method A nor Method B can extract handles.
+# Per-group collective for warmup. Picking the right op matters because NCCL
+# allocates different-shaped channel buffers depending on which collective
+# fires first. From profile_nccl_memory.py Exp3 (8×H100, 128 MB):
+#   allreduce / allgather / reduce_scatter / broadcast → ~480 MB / comm
+#   all_to_all                                          → ~3.2 GB / comm
+# An MoE EP group warmed up with allreduce would only allocate ~480 MB,
+# masking the real ~3 GB cost of the all_to_all dispatch path.
+GROUP_TO_WARMUP_OP = {
+    # Core dims: matrix-multiply gradient sync, FSDP shard, etc. → allreduce.
+    "tp": "allreduce",
+    "dp": "allreduce",
+    "pp": "broadcast",  # PP main group is mostly used for metadata broadcast
+    "cp": "allreduce",
+    "model_parallel": "allreduce",
+    "tp_dp": "allreduce",
+    "tp_cp": "allreduce",
+    # Embedding sync.
+    "embedding": "allreduce",
+    "position_embedding": "allreduce",
+    # MoE expert dims: token dispatch / combine in production goes through
+    # all_to_all, which is the dominant memory consumer in MoE training.
+    "ep": "all_to_all",
+    "etp_ep": "all_to_all",
+    "etp_ep_pp": "all_to_all",
+    "etp": "allreduce",
+    "edp": "allreduce",
+    # Distributed optimizer reduce-scatter.
+    "intra_dist_opt": "allreduce",
+}
 
-    Returns {name: world_size} for groups that were successfully warmed up.
-    Skips size-1 groups (no NCCL comm allocated for them) and any group the
-    current rank is not a member of.
+
+def _run_warmup_op(op: str, group, world: int) -> None:
+    """Dispatch to the right NCCL collective so the channel buffer NCCL
+    allocates matches what real training would allocate on this group.
     """
-    warmed: dict[str, int] = {}
+    if op == "all_to_all":
+        # 1 MB per peer; per-rank tensor size scales with world. NCCL
+        # channel buffer for all_to_all is determined by world size, not
+        # message bytes, so the small size is fine for warmup.
+        chunk = 256 * 1024  # 1 MB float32 per peer
+        inp = torch.zeros(chunk * world, dtype=torch.float32, device="cuda")
+        out = torch.zeros_like(inp)
+        dist.all_to_all_single(out, inp, group=group)
+    elif op == "broadcast":
+        x = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
+        # src must be a global rank that's a member of this group.
+        src_global_rank = dist.get_global_rank(group, 0)
+        dist.broadcast(x, src=src_global_rank, group=group)
+    else:  # allreduce
+        x = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
+        dist.all_reduce(x, group=group)
+
+
+def warm_up_groups(groups: dict) -> dict:
+    """Trigger NCCL lazy init on each group with the collective most
+    representative of its real-world traffic (see ``GROUP_TO_WARMUP_OP``).
+
+    Returns {name: (world_size, op_used)} for groups that were successfully
+    warmed up. Skips size-1 groups (no NCCL comm allocated) and any group
+    the current rank is not a member of.
+    """
+    warmed: dict[str, tuple[int, str]] = {}
     for name, group in groups.items():
         try:
             world = dist.get_world_size(group=group)
@@ -138,14 +190,14 @@ def warm_up_groups(groups: dict) -> dict:
             continue
         if world <= 1:
             continue
+        op = GROUP_TO_WARMUP_OP.get(name, "allreduce")
         try:
-            x = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
-            dist.all_reduce(x, group=group)
+            _run_warmup_op(op, group, world)
             torch.cuda.synchronize()
         except Exception as e:
-            log(f"warm-up '{name}' failed: {e}")
+            log(f"warm-up '{name}' (op={op}) failed: {e}")
             continue
-        warmed[name] = world
+        warmed[name] = (world, op)
     return warmed
 
 
@@ -207,8 +259,16 @@ def main() -> int:
     log(f"Discovered {len(discovered)} parallel-state groups: {sorted(discovered.keys())}")
 
     warmed = warm_up_groups(discovered)
-    log(f"Warmed up {len(warmed)} groups: " + ", ".join(f"{n}(size={s})" for n, s in sorted(warmed.items())))
+    log(
+        f"Warmed up {len(warmed)} groups: "
+        + ", ".join(f"{n}(size={s},op={op})" for n, (s, op) in sorted(warmed.items()))
+    )
     assert len(warmed) > 0, "No groups warmed up — invalid parallel config?"
+    # Highlight if any group used all_to_all — that's where the big
+    # (~3 GB/comm vs 480 MB) NCCL channel allocation lives.
+    a2a_groups = [n for n, (_, op) in warmed.items() if op == "all_to_all"]
+    if a2a_groups:
+        log(f"all_to_all warm-up applied to: {a2a_groups} (expect larger per-comm release)")
 
     # ---------------------------------------------------------------- Method A
     from verl.utils.nccl_suspend import (  # noqa: PLC0415
