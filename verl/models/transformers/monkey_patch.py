@@ -144,6 +144,7 @@ def _ulysses_flash_attention_forward(
     # (bsz, seq_len, n_head/n, head_dim)
     query_length = query_states.size(1)
 
+    # TEMPORARILY DISABLED — verifying bug reproduces in sync/colocate mode.
     # Qwen3.5 (and other mRoPE-using VL models) hand `position_ids` to flash
     # attention as a 3D tensor `(3, batch, seq)` instead of the usual 2D
     # `(batch, seq)`. Downstream `_prepare_from_posids` in transformers uses
@@ -153,10 +154,8 @@ def _ulysses_flash_attention_forward(
     # count. flash_attn_varlen then dereferences past the end of q/k/v and
     # crashes with `CUDA error: an illegal memory access`. Collapse to the
     # first mRoPE plane (the linear text position) before handing off.
-    # See https://github.com/verl-project/verl/issues/6284 (same root cause,
-    # fix there is for SP>1; this catches the SP=1 path too).
-    if position_ids is not None and position_ids.dim() == 3:
-        position_ids = position_ids[0]
+    # if position_ids is not None and position_ids.dim() == 3:
+    #     position_ids = position_ids[0]
 
     attn_output = _flash_attention_forward(
         query_states, key_states, value_states, attention_mask, query_length, *args, position_ids=position_ids, **kwargs
