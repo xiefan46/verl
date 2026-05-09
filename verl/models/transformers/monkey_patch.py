@@ -144,58 +144,19 @@ def _ulysses_flash_attention_forward(
     # (bsz, seq_len, n_head/n, head_dim)
     query_length = query_states.size(1)
 
-    # === DEBUG INSTRUMENTATION (issue #6281 root-cause hunt) ===
-    # Compare Qwen3-4B (works) vs Qwen3.5 (crashes) at this exact call site.
-    # Look for: position_ids None / wrong shape / non-monotonic, q/k/v stride
-    # anomalies, attention_mask presence in varlen path, etc.
-    import os
-
-    if os.environ.get("VERL_DEBUG_FA_INPUTS", "0") == "1":
-        # Skip ViT calls (visual tower's dummy forward uses seq=16 from grid_thw=[[1,4,4]])
-        # Only capture language model calls (query_length will be ~prompt_length + response_length).
-        if query_length > 100:
-            layer_id = getattr(_ulysses_flash_attention_forward, "_lm_call_count", 0)
-            _ulysses_flash_attention_forward._lm_call_count = layer_id + 1
-            if layer_id < 4:  # only first 4 LM calls to avoid log flood
-                print(f"[FA_DEBUG] LM call#{layer_id}", flush=True)
-                print(
-                    f"  q.shape={tuple(query_states.shape)} dtype={query_states.dtype} "
-                    f"contig={query_states.is_contiguous()} stride={query_states.stride()}",
-                    flush=True,
-                )
-                print(f"  k.shape={tuple(key_states.shape)} contig={key_states.is_contiguous()}", flush=True)
-                print(f"  v.shape={tuple(value_states.shape)} contig={value_states.is_contiguous()}", flush=True)
-                print(f"  query_length={query_length}", flush=True)
-                mask_repr = None if attention_mask is None else (tuple(attention_mask.shape), str(attention_mask.dtype))
-                print(f"  attention_mask={mask_repr}", flush=True)
-                if position_ids is None:
-                    print("  position_ids=None", flush=True)
-                else:
-                    print(
-                        f"  position_ids.shape={tuple(position_ids.shape)} dtype={position_ids.dtype}",
-                        flush=True,
-                    )
-                    print(f"  position_ids[0,:32]={position_ids[0, :32].tolist()}", flush=True)
-                    print(
-                        f"  position_ids min/max={position_ids.min().item()}/{position_ids.max().item()}",
-                        flush=True,
-                    )
-                    diffs = position_ids[:, 1:] - position_ids[:, :-1]
-                    print(f"  position_ids diffs min/max={diffs.min().item()}/{diffs.max().item()}", flush=True)
-                # Print cu_seq_lens_q/k and max_length_q/k from kwargs (key suspects)
-                for kw in ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"):
-                    val = kwargs.get(kw)
-                    if val is None:
-                        print(f"  {kw}=None", flush=True)
-                    elif hasattr(val, "shape"):
-                        cu_list = val.tolist() if val.numel() < 64 else f"<len={val.numel()}>"
-                        print(f"  {kw}.shape={tuple(val.shape)} dtype={val.dtype} value={cu_list}", flush=True)
-                    else:
-                        print(f"  {kw}={val}", flush=True)
-                cu_kw = {"cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k"}
-                other_kw = [k for k in kwargs if k not in cu_kw]
-                print(f"  other kwargs keys={other_kw}", flush=True)
-    # === END DEBUG ===
+    # Qwen3.5 (and other mRoPE-using VL models) hand `position_ids` to flash
+    # attention as a 3D tensor `(3, batch, seq)` instead of the usual 2D
+    # `(batch, seq)`. Downstream `_prepare_from_posids` in transformers uses
+    # `(position_ids == 0)` to find packed-sequence boundaries; on a 3D tensor
+    # it detects zeros across all 3 mRoPE dimensions, producing a corrupted
+    # `cu_seqlens` array that is multiple times longer than the true sub-seq
+    # count. flash_attn_varlen then dereferences past the end of q/k/v and
+    # crashes with `CUDA error: an illegal memory access`. Collapse to the
+    # first mRoPE plane (the linear text position) before handing off.
+    # See https://github.com/verl-project/verl/issues/6284 (same root cause,
+    # fix there is for SP>1; this catches the SP=1 path too).
+    if position_ids is not None and position_ids.dim() == 3:
+        position_ids = position_ids[0]
 
     attn_output = _flash_attention_forward(
         query_states, key_states, value_states, attention_mask, query_length, *args, position_ids=position_ids, **kwargs
