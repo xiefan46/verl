@@ -143,6 +143,41 @@ def _ulysses_flash_attention_forward(
 
     # (bsz, seq_len, n_head/n, head_dim)
     query_length = query_states.size(1)
+
+    # === DEBUG INSTRUMENTATION (issue #6281 root-cause hunt) ===
+    # Compare Qwen3-4B (works) vs Qwen3.5 (crashes) at this exact call site.
+    # Look for: position_ids None / wrong shape / non-monotonic, q/k/v stride
+    # anomalies, attention_mask presence in varlen path, etc.
+    import os
+
+    if os.environ.get("VERL_DEBUG_FA_INPUTS", "0") == "1":
+        layer_id = getattr(_ulysses_flash_attention_forward, "_call_count", 0)
+        _ulysses_flash_attention_forward._call_count = layer_id + 1
+        if layer_id < 4:  # only first 4 calls to avoid log flood
+            print(f"[FA_DEBUG] call#{layer_id}", flush=True)
+            print(
+                f"  q.shape={tuple(query_states.shape)} dtype={query_states.dtype} "
+                f"contig={query_states.is_contiguous()} stride={query_states.stride()}",
+                flush=True,
+            )
+            print(f"  k.shape={tuple(key_states.shape)} contig={key_states.is_contiguous()}", flush=True)
+            print(f"  v.shape={tuple(value_states.shape)} contig={value_states.is_contiguous()}", flush=True)
+            print(f"  query_length={query_length}", flush=True)
+            mask_repr = None if attention_mask is None else (tuple(attention_mask.shape), str(attention_mask.dtype))
+            print(f"  attention_mask={mask_repr}", flush=True)
+            if position_ids is None:
+                print("  position_ids=None  ← WARNING for varlen path", flush=True)
+            else:
+                print(f"  position_ids.shape={tuple(position_ids.shape)} dtype={position_ids.dtype}", flush=True)
+                print(f"  position_ids[0,:32]={position_ids[0, :32].tolist()}", flush=True)
+                print(f"  position_ids min/max={position_ids.min().item()}/{position_ids.max().item()}", flush=True)
+                # Check monotonicity within each batch row (varlen needs increasing-then-reset pattern)
+                diffs = position_ids[:, 1:] - position_ids[:, :-1]
+                print(f"  position_ids diffs min/max={diffs.min().item()}/{diffs.max().item()}", flush=True)
+            print(f"  args={args}", flush=True)
+            print(f"  kwargs keys={list(kwargs.keys())}", flush=True)
+    # === END DEBUG ===
+
     attn_output = _flash_attention_forward(
         query_states, key_states, value_states, attention_mask, query_length, *args, position_ids=position_ids, **kwargs
     )
