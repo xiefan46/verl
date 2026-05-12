@@ -259,6 +259,11 @@ class FSDPEngineConfig(EngineConfig):
     entropy_checkpointing: bool = False
     strategy: str = "fsdp"
     qat: QATEngineConfig = field(default_factory=QATEngineConfig)
+    # Tree training (mirrors actor.use_tree_training; populated by engine_workers
+    # when constructing the engine_config for the actor or ref worker).
+    # See verl/experimental/tree_training/ and Phase 2 design doc.
+    use_tree_training: bool = False
+    tree_training_max_tokens_per_mb: int = 4096
 
     def __post_init__(self):
         super().__post_init__()

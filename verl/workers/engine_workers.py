@@ -565,6 +565,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             actor_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
 
+            # Tree training: forward actor.use_tree_training + tree_training subconfig to engine_config.
+            actor_training_config.engine_config.use_tree_training = self.config.actor.use_tree_training
+            if self.config.actor.use_tree_training:
+                actor_training_config.engine_config.tree_training_max_tokens_per_mb = (
+                    self.config.actor.tree_training.max_tokens_per_mb
+                )
+
             if self.config.actor.use_dynamic_bsz:
                 assert self.config.rollout.log_prob_max_token_len_per_gpu is not None
                 assert self.config.actor.ppo_max_token_len_per_gpu is not None

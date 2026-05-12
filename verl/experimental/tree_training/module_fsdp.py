@@ -120,6 +120,22 @@ def _tree_attn_fwd_func(
     # Check for Triton path (dict key prefixed with "tree_" to avoid
     # collisions with HuggingFace's own kwargs during **kwargs forwarding)
     tree_triton_data = kwargs.get("tree_triton_data", None)
+    tree_block_mask = kwargs.get("tree_block_mask", None)
+
+    # verl: if neither tree kwarg is present, the caller is going through the
+    # patched module without intending tree-attention semantics (e.g. ref policy
+    # / critic forward, or any non-tree path on the same process). Fall back to
+    # the original flash_attention_forward so the global monkey-patch stays
+    # backward-compatible. See research/2026-05-12-tree-training-phase2-design.md
+    # §3.1 (insertion point) — without this fallback, enabling tree training on
+    # one engine breaks every other engine's forward in the same process.
+    if tree_triton_data is None and tree_block_mask is None:
+        assert ORIGINAL_FLASH_ATTENTION_FORWARD is not None, (
+            "_tree_attn_fwd_func reached with no tree kwargs but the original "
+            "flash_attention was never captured; this means patch_fsdp_for_"
+            "tree_training was bypassed."
+        )
+        return ORIGINAL_FLASH_ATTENTION_FORWARD(query, key, value, attention_mask, softmax_scale, *args, **kwargs)
 
     if USE_TRITON_TREE_ATTN and tree_triton_data is not None and TRITON_AVAILABLE:
         # [B, S, H, D] -> [B, H, S, D]
@@ -142,12 +158,11 @@ def _tree_attn_fwd_func(
         output = output.permute(0, 2, 1, 3).contiguous()
         return output
     else:
-        # Require pre-created block_mask
-        tree_block_mask = kwargs.get("tree_block_mask", None)
-        if tree_block_mask is None or not isinstance(tree_block_mask, BlockMask):
+        # tree_block_mask path; tree_block_mask must be a BlockMask at this point
+        if not isinstance(tree_block_mask, BlockMask):
             raise ValueError(
-                "_tree_attn_fwd_func requires a pre-created BlockMask in "
-                "kwargs['tree_block_mask']. "
+                "_tree_attn_fwd_func: kwargs['tree_block_mask'] must be a flex_attention "
+                f"BlockMask, got {type(tree_block_mask).__name__}. "
                 "Use create_block_mask_from_dense() during data preparation."
             )
 

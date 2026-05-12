@@ -81,6 +81,42 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
+def _postprocess_tree_batch(output_lst: list[dict]) -> dict:
+    """Aggregate output dicts from tree-path forward_step across micro-batches.
+
+    Mirrors :func:`postprocess_batch_func` but skips the nested-tensor concat
+    pass: tree-path ``model_output`` values are 1-D flat tensors in trie order
+    (not nested), and we do not need dynamic-batch reordering because tree
+    micro-batches don't get shuffled.
+
+    Returns a dict with the same shape as ``postprocess_batch_func``:
+      - ``model_output``: list of per-mb ``model_output`` dicts (downstream
+        decides how to combine them — ppo_loss tree branch consumes per-mb).
+      - ``loss``: list of per-mb loss scalars.
+      - ``metrics``: aggregated dict (last-write wins on duplicate keys; tree
+        metrics like ``tree_token_ratio`` were attached to ``output_lst[0]``).
+    """
+    from verl.utils.py_functional import append_to_dict
+
+    model_outputs: list[dict] = []
+    losses: list = []
+    aggregated_metrics: dict = {}
+
+    for o in output_lst:
+        if "model_output" in o:
+            model_outputs.append(o["model_output"])
+        if "loss" in o:
+            losses.append(o["loss"])
+        if "metrics" in o:
+            append_to_dict(aggregated_metrics, o["metrics"])
+
+    return {
+        "model_output": model_outputs,
+        "loss": losses,
+        "metrics": aggregated_metrics,
+    }
+
+
 class FSDPEngine(BaseEngine):
     """
     Concrete Engine implementation using PyTorch FullyShardedDataParallel (FSDP).
@@ -155,6 +191,25 @@ class FSDPEngine(BaseEngine):
             if self.engine_config.use_torch_compile  #  use torch compile by default
             else entropy_from_logits
         )
+
+        # Tree training: one-time global flash_attention monkey-patch + cache the
+        # resolved max_tokens_per_mb so forward_backward_batch can build the
+        # MicroBatchSpec without re-reading the config each call. The patch is
+        # global — same-process non-tree models fall back to the original
+        # flash_attention via the early-return in _tree_attn_fwd_func.
+        self._use_tree_training = getattr(self.engine_config, "use_tree_training", False)
+        if self._use_tree_training:
+            from verl.experimental.tree_training.module_fsdp import patch_fsdp_for_tree_training
+
+            self._tree_max_tokens_per_mb = int(getattr(self.engine_config, "tree_training_max_tokens_per_mb", 4096))
+            patch_fsdp_for_tree_training(enable=True)
+            logger.info(
+                f"[FSDPEngine] Tree training enabled, max_tokens_per_mb={self._tree_max_tokens_per_mb}. "
+                "flash_attention_forward has been globally patched; non-tree forwards on this "
+                "process fall back to the original flash_attention."
+            )
+        else:
+            self._tree_max_tokens_per_mb = None
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -616,9 +671,23 @@ class FSDPEngine(BaseEngine):
         tu.assign_non_tensor(data, batch_num_tokens=batch_num_tokens.item())
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
-        micro_batches, indices = prepare_micro_batches(
-            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
-        )
+        # Tree training: replace prepare_micro_batches with the AReaL-style trie packer.
+        # Adapter returns list[dict] (each ready for forward_step) plus a metrics dict.
+        tree_metrics: dict[str, float] = {}
+        if self._use_tree_training:
+            from verl.experimental.tree_training._verl_adapter import build_tree_mb_list
+
+            micro_batches, tree_metrics = build_tree_mb_list(
+                data,
+                max_tokens_per_mb=self._tree_max_tokens_per_mb,
+                dp_group=self.get_data_parallel_group(),
+                parallel_size=self.ulysses_sequence_parallel_size,
+            )
+            indices = None  # no dynamic-batch reordering; tree iteration order is canonical
+        else:
+            micro_batches, indices = prepare_micro_batches(
+                data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
+            )
 
         output_lst = []
 
@@ -640,7 +709,18 @@ class FSDPEngine(BaseEngine):
 
             output_lst.append(meta_info)
 
+        # Attach tree metrics to the first output so postprocess_batch_func picks them up
+        # via the standard metric aggregation path. (D11: tree_token_ratio flows here.)
+        if tree_metrics and output_lst:
+            output_lst[0].setdefault("metrics", {}).update(tree_metrics)
+
         # postprocess and return
+        if self._use_tree_training:
+            # Tree path: model_output tensors are 1-D flat (not nested), so the standard
+            # postprocess_batch_func (which calls nt.unbind() / as_nested_tensor) doesn't
+            # apply. Aggregate losses + metrics, leave model_output as a list[dict] that
+            # downstream (ppo_loss tree branch / compute_log_prob) can iterate.
+            return _postprocess_tree_batch(output_lst)
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
@@ -1202,7 +1282,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
 
         return model_output
 
-    def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
+    def forward_step(self, micro_batch, loss_function, forward_only):
+        # Tree path: micro_batch is a plain dict from _verl_adapter.build_tree_mb_list,
+        # not a TensorDict; dispatch to the tree-aware variant which handles the
+        # data flow (build_tree_model_inputs / unpack_tree_logprobs) end-to-end.
+        if self._use_tree_training:
+            return self._forward_step_tree(micro_batch, loss_function, forward_only)
+
         device_name = get_device_name()
         # actually, we should avoid assigning like this...
         micro_batch = micro_batch.to(get_device_id())
@@ -1243,6 +1329,82 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "metrics": metrics,
             }
 
+            return loss, output
+
+    def _forward_step_tree(self, mb: dict, loss_function, forward_only):
+        """Tree-training forward_step variant.
+
+        ``mb`` is a plain dict from :func:`_verl_adapter.build_tree_mb_list`
+        (not a TensorDict). The packed input has shape ``[1, T_padded]``;
+        the model forward goes through the globally-patched flash_attention
+        which reads ``tree_block_mask`` from kwargs and routes to flex_attention.
+
+        Output ``model_output`` carries ``is_tree_packed=True`` so the loss
+        function (ppo_loss tree branch, Task 2.5) can route accordingly.
+        Logprobs are flat 1-D in trie order; packed extras (advantages /
+        old_log_probs / response_mask) are passed through unchanged so the
+        loss layer can call :func:`align_packed_extras_to_labels`.
+        """
+        from verl.experimental.tree_training._verl_adapter import build_tree_model_inputs, unpack_tree_logprobs
+
+        device_id = get_device_id()
+        local_device_name = get_device_name()
+
+        # Move tensor entries to device; leave non-tensor (trie_node) alone.
+        mb_on_device = {k: (v.to(device_id) if torch.is_tensor(v) else v) for k, v in mb.items()}
+
+        temperature_raw = mb_on_device.get("temperature", 1.0)
+        temperature = float(temperature_raw.item()) if torch.is_tensor(temperature_raw) else float(temperature_raw)
+
+        model_inputs, output_args = build_tree_model_inputs(
+            mb_on_device, device_id, extra_inputs={"temperature": temperature}
+        )
+
+        autocast_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
+        autocast_ctx: ContextManager = (
+            nullcontext()
+            if autocast_dtype == torch.float32
+            else torch.autocast(device_type=local_device_name, dtype=autocast_dtype)
+        )
+
+        with autocast_ctx:
+            raw_output = self.module(**model_inputs, use_cache=False)
+            logits = raw_output.logits.squeeze(0).float()  # [T_padded, V]
+
+            log_probs_flat = unpack_tree_logprobs(
+                logits,
+                output_args["trie"],
+                output_args["packed_input_ids"],
+                temperature=temperature,
+            )
+
+            model_output: dict = {
+                "log_probs": log_probs_flat,
+                "is_tree_packed": True,
+                # Carry the trie + packed extras forward for the loss layer (Task 2.5):
+                # alignment between log_probs and extras is done by
+                # _verl_adapter.align_packed_extras_to_labels.
+                "trie": output_args["trie"],
+                "advantages_packed": mb_on_device.get("advantages"),
+                "old_log_probs_packed": mb_on_device.get("old_log_probs"),
+                "response_mask_packed": mb_on_device.get("response_mask"),
+                "ref_log_prob_packed": mb_on_device.get("ref_log_prob"),
+            }
+
+            if loss_function is not None:
+                loss, metrics = loss_function(
+                    model_output=model_output, data=mb_on_device, dp_group=self.get_data_parallel_group()
+                )
+            else:
+                assert forward_only, "forward_only must be True when loss_function is None"
+                loss = torch.tensor(1.0, device=local_device_name)
+                metrics = {}
+
+            output = {
+                "model_output": model_output,
+                "loss": loss.detach().item(),
+                "metrics": metrics,
+            }
             return loss, output
 
 
