@@ -54,8 +54,14 @@ def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     return loss, {}
 
 
-def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
+def ppo_loss(config: ActorConfig, model_output, data, dp_group=None):
     """Computes ppo loss from model output (log_prob, entropy, values, etc. ) and old_log_probs from data."""
+    # Tree training branch: model_output carries packed-tree tensors that don't
+    # go through no_padding_2_padding / TensorDict.select. Dispatch to the
+    # tree-aware variant. See research/2026-05-12-tree-training-phase2-design.md §D6.
+    if isinstance(model_output, dict) and model_output.get("is_tree_packed"):
+        return _ppo_loss_tree(config, model_output, data, dp_group=dp_group)
+
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)
     if entropy is not None:
@@ -140,6 +146,106 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         policy_loss += kl_loss * config.kl_loss_coef
         metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
         metrics["kl_coef"] = config.kl_loss_coef
+
+    return policy_loss, metrics
+
+
+def _ppo_loss_tree(config: ActorConfig, model_output: dict, data, dp_group=None):
+    """ppo_loss variant for tree-training packed outputs.
+
+    Bypasses ``no_padding_2_padding`` and ``TensorDict.select().to_padded_tensor()``
+    because tree micro-batches use plain dicts with flat 1-D tensors in trie
+    iteration order. Packed extras (``advantages_packed`` / ``old_log_probs_packed``
+    / ``response_mask_packed``) are length ``sum(seq_lens)``; ``log_probs`` from
+    :func:`unpack_tree_logprobs` is length ``sum(seq_lens - 1)``. We drop the
+    first position of each segment (``align_packed_extras_to_labels``) so all
+    four tensors have the same length ``K``, then unsqueeze to ``[1, K]`` and
+    reuse the dense ``compute_policy_loss_vanilla`` path unchanged.
+    """
+    from verl.experimental.tree_training._verl_adapter import (
+        align_packed_extras_to_labels,
+        segment_lens_from_trie,
+    )
+
+    log_prob_flat = model_output["log_probs"]
+    trie = model_output["trie"]
+    segment_lens = segment_lens_from_trie(trie)
+
+    # Align packed extras to next-token labels: drop position 0 of each segment.
+    advantages_flat = align_packed_extras_to_labels(model_output["advantages_packed"], segment_lens)
+    old_log_probs_flat = align_packed_extras_to_labels(model_output["old_log_probs_packed"], segment_lens)
+    response_mask_flat = align_packed_extras_to_labels(model_output["response_mask_packed"], segment_lens).to(bool)
+    ref_log_prob_packed = model_output.get("ref_log_prob_packed")
+    ref_log_prob_flat = (
+        align_packed_extras_to_labels(ref_log_prob_packed, segment_lens) if ref_log_prob_packed is not None else None
+    )
+
+    # global batch info for loss aggregation (mirrors the dense path).
+    config.global_batch_info["dp_size"] = data["dp_size"]
+    config.global_batch_info["batch_num_tokens"] = data["batch_num_tokens"]
+    config.global_batch_info["global_batch_size"] = data.get("global_batch_size")
+    config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
+
+    if (
+        data["dp_size"] > 1
+        or data["batch_num_tokens"] is not None
+        or data.get("global_batch_size") is not None
+        or config.loss_scale_factor is not None
+    ):
+        metric_aggregation = AggregationType.SUM
+    else:
+        metric_aggregation = AggregationType.MEAN
+
+    # Promote everything to [1, K] so compute_policy_loss_vanilla's [bsz, response_len]
+    # semantics apply unchanged. The trie's all_sequence_ids ordering is
+    # canonical and self-consistent across log_probs / advantages / old_log_probs.
+    log_prob = log_prob_flat.unsqueeze(0)
+    advantages = advantages_flat.unsqueeze(0)
+    old_log_prob = old_log_probs_flat.unsqueeze(0)
+    response_mask = response_mask_flat.unsqueeze(0)
+
+    loss_agg_mode = config.loss_agg_mode
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    policy_loss_fn = get_policy_loss_fn(loss_mode)
+    pg_loss, pg_metrics = policy_loss_fn(
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        advantages=advantages,
+        response_mask=response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=None,
+    )
+
+    metrics: dict = {}
+    pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)
+    metrics.update(pg_metrics)
+    metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
+    policy_loss = pg_loss
+
+    # KL loss against ref policy (if enabled). Mirrors the dense path math.
+    if config.use_kl_loss and ref_log_prob_flat is not None:
+        ref_log_prob = ref_log_prob_flat.unsqueeze(0)
+        kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
+        kl_loss = agg_loss(
+            loss_mat=kld,
+            loss_mask=response_mask,
+            loss_agg_mode=config.loss_agg_mode,
+            **config.global_batch_info,
+        )
+        policy_loss = policy_loss + kl_loss * config.kl_loss_coef
+        metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
+        metrics["kl_coef"] = config.kl_loss_coef
+
+    # Entropy loss is not supported on the tree path in MVP — gather_packed_tree_logprobs
+    # returns log_probs only; gather_packed_tree_logprobs_entropy is wired up but the
+    # adapter does not surface entropy yet. Validated by the fail-fast: if entropy is
+    # in model_output, raise so misuse is loud rather than silent.
+    if model_output.get("entropy") is not None:
+        raise NotImplementedError(
+            "Tree training does not surface entropy in MVP. Wire up unpack_tree_logprobs "
+            "via gather_packed_tree_logprobs_entropy to enable entropy regularization."
+        )
 
     return policy_loss, metrics
 

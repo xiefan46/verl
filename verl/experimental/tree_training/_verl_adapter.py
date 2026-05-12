@@ -50,7 +50,22 @@ __all__ = [
     "build_tree_model_inputs",
     "unpack_tree_logprobs",
     "align_packed_extras_to_labels",
+    "segment_lens_from_trie",
 ]
+
+
+def segment_lens_from_trie(trie: TrieNode) -> list[int]:
+    """Per-sequence packed-segment length in ``trie.all_sequence_ids`` order.
+
+    For each sequence id in the trie, sum the token counts of the nodes it
+    traverses — i.e., the original (full prompt + response) length. Matches
+    the per-segment slicing convention used inside :func:`build_packed_tree_batch`
+    (``_pack_extra_data``).
+    """
+    return [
+        sum(end - start + 1 for (start, end) in trie.get_sequence_tree_indices(seq_id))
+        for seq_id in trie.all_sequence_ids
+    ]
 
 
 def _seq_lens_from_nested(nested: torch.Tensor) -> torch.Tensor:
@@ -215,8 +230,42 @@ def build_tree_mb_list(
 
     metrics = {"tree_token_ratio": float(tree_token_ratio)}
 
-    # 6. Unwrap MicroBatchList into list[dict]; AReaL types stay behind the adapter.
-    return list(mb_list.padded_mbs), metrics
+    # 6. Propagate engine-side metadata (set by forward_backward_batch via
+    # tu.assign_non_tensor before calling this adapter) into each mb dict.
+    # ppo_loss and friends read these directly from `data` — for the dense
+    # path they live as TensorDict non_tensor entries; for the tree path
+    # we copy them into each plain-dict mb so the loss layer sees the same
+    # contract regardless of dispatch.
+    propagated_keys = (
+        "dp_size",
+        "batch_num_tokens",
+        "global_batch_size",
+        "temperature",
+        "pad_mode",
+        "use_remove_padding",
+        "use_fused_kernels",
+        "calculate_entropy",
+        "calculate_sum_pi_squared",
+    )
+    propagated: dict = {}
+    for key in propagated_keys:
+        try:
+            val = td.get(key, None)
+        except Exception:
+            val = None
+        if val is None:
+            continue
+        # Unwrap NonTensorData if present
+        unwrapped = getattr(val, "data", val) if hasattr(val, "data") and not torch.is_tensor(val) else val
+        propagated[key] = unwrapped
+
+    mbs = list(mb_list.padded_mbs)
+    for mb in mbs:
+        for k, v in propagated.items():
+            mb.setdefault(k, v)
+
+    # 7. Unwrap MicroBatchList into list[dict]; AReaL types stay behind the adapter.
+    return mbs, metrics
 
 
 def build_tree_model_inputs(
