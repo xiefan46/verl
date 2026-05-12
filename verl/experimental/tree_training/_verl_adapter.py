@@ -299,9 +299,16 @@ def build_tree_model_inputs(
 
     tree_attn_kwargs = build_tree_attn_kwargs(trie, padded_size, device=dev)
 
+    # Ensure position_ids has shape [1, T] for HF model compatibility. tree.py's
+    # get_packed_tree_position_ids returns 1-D [T]; HF RotaryEmbedding indexes
+    # position_ids[:, None, :] which fails on 1-D input.
+    position_ids = mb.get("position_ids")
+    if position_ids is not None and position_ids.dim() == 1:
+        position_ids = position_ids.unsqueeze(0)
+
     model_inputs: dict[str, Any] = {
         "input_ids": packed_input_ids,
-        "position_ids": mb.get("position_ids"),
+        "position_ids": position_ids,
         "attention_mask": None,  # tree_block_mask supersedes this for flash_attention
         **tree_attn_kwargs,
     }
