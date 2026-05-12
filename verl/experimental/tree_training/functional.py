@@ -313,16 +313,20 @@ def _gather_packed_tree_logprobs(
             if internal_logprobs.numel() > 0:
                 logprob_parts.append(internal_logprobs)
 
-            # Compute or retrieve cached transition logprob to next node
-            next_start = 0
+            # verl: only append transition logprob when there IS a next node.
+            # Upstream AReaL unconditionally appends, computing a spurious
+            # "predict packed_input_ids[0] from logits[end]" entry for the
+            # terminal node (next_start falls back to sentinel 0). The
+            # docstring above promises seq_len - 1 entries; this gate makes
+            # the implementation match. See research/2026-05-12-tree-training-phase2-design.md §D2.
             if i + 1 < len(indices):
                 next_start, _ = indices[i + 1]
-            trans_key = (end, next_start)
-            if trans_key not in transition_cache:
-                transition_cache[trans_key] = _compute_transition_logprob(
-                    logits, input_ids, end, next_start, temperature, tp_group
-                )
-            logprob_parts.append(transition_cache[trans_key].unsqueeze(0))
+                trans_key = (end, next_start)
+                if trans_key not in transition_cache:
+                    transition_cache[trans_key] = _compute_transition_logprob(
+                        logits, input_ids, end, next_start, temperature, tp_group
+                    )
+                logprob_parts.append(transition_cache[trans_key].unsqueeze(0))
 
         if logprob_parts:
             results[seq_id] = torch.cat(logprob_parts, dim=0)
@@ -403,18 +407,19 @@ def _gather_packed_tree_logprobs_entropy(
                 logprob_parts.append(internal_logprobs)
                 entropy_parts.append(internal_entropy)
 
-            # Compute or retrieve cached transition results to next node
-            next_start = 0
+            # verl: only append transition logprob/entropy when there IS a
+            # next node. Same fix as _gather_packed_tree_logprobs above.
+            # See research/2026-05-12-tree-training-phase2-design.md §D2.
             if i + 1 < len(indices):
                 next_start, _ = indices[i + 1]
-            trans_key = (end, next_start)
-            if trans_key not in transition_cache:
-                transition_cache[trans_key] = _compute_transition_logprob_entropy(
-                    logits, input_ids, end, next_start, temperature, tp_group
-                )
-            trans_lp, trans_ent = transition_cache[trans_key]
-            logprob_parts.append(trans_lp.unsqueeze(0))
-            entropy_parts.append(trans_ent.unsqueeze(0))
+                trans_key = (end, next_start)
+                if trans_key not in transition_cache:
+                    transition_cache[trans_key] = _compute_transition_logprob_entropy(
+                        logits, input_ids, end, next_start, temperature, tp_group
+                    )
+                trans_lp, trans_ent = transition_cache[trans_key]
+                logprob_parts.append(trans_lp.unsqueeze(0))
+                entropy_parts.append(trans_ent.unsqueeze(0))
 
         if logprob_parts:
             logprobs_results[seq_id] = torch.cat(logprob_parts, dim=0)

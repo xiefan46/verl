@@ -79,14 +79,10 @@ def _tree_logprobs(
 ) -> torch.Tensor:
     """Pack into tree, forward once per micro-batch with flex_attention, unpack.
 
-    Drops the trailing "spurious" logprob each sequence carries: the algorithm
-    in ``_gather_packed_tree_logprobs`` unconditionally appends one transition
-    logprob per node, including for the terminal node where ``next_start``
-    falls back to the sentinel value ``0`` — that final entry is a prediction
-    of ``input_ids[0]`` of the packed buffer from the last node's end position
-    and has no semantic counterpart in independent forward. Returns only the
-    first ``seq_len - 1`` logprobs per sequence (matching the docstring's
-    advertised shape, which the implementation overshoots by one).
+    Since the verl patch in ``_gather_packed_tree_logprobs`` (research/2026-05-12-
+    tree-training-phase2-design.md §D2) gates the terminal transition append,
+    the algorithm now emits ``seq_len - 1`` logprobs per sequence, matching
+    the baseline shape directly — no reshape/slice needed.
     """
     from verl.experimental.tree_training._areal_data import MicroBatchSpec
     from verl.experimental.tree_training.functional import gather_packed_tree_logprobs
@@ -132,14 +128,12 @@ def _tree_logprobs(
         restore_patch_fsdp_for_tree_training()
 
     flat = torch.cat(all_logprobs, dim=0).float()
-    # All synthetic sequences are equal length; the algorithm emits total_len
-    # logprobs per sequence with the spurious entry as the last one. Reshape
-    # to [N, T] and drop the last column to align with the baseline shape.
-    assert flat.numel() == n_seqs * total_len, (
-        f"unexpected tree logprob count: got {flat.numel()}, expected {n_seqs * total_len} "
-        f"({n_seqs} seqs × {total_len} entries/seq)"
+    expected = n_seqs * (total_len - 1)
+    assert flat.numel() == expected, (
+        f"unexpected tree logprob count: got {flat.numel()}, expected {expected} "
+        f"({n_seqs} seqs × {total_len - 1} entries/seq)"
     )
-    return flat.view(n_seqs, total_len)[:, :-1].reshape(-1)
+    return flat
 
 
 # build_packed_tree_batch requires max_tokens_per_mb to be a multiple of BLOCK_SIZE=128
