@@ -159,6 +159,10 @@ class _ActorCfgShim:
     We deliberately avoid instantiating the real ``ActorConfig`` because that
     requires a populated optimizer / engine / model sub-config tree. ``ppo_loss``
     only touches a handful of fields; we provide just those.
+
+    ``BaseConfig`` exposes a Mapping-like ``.get(key, default)``; verl's
+    ``compute_policy_loss_vanilla`` reads e.g. ``config.get("clip_ratio_c", 3.0)``,
+    so the shim must support the same interface.
     """
 
     clip_ratio: float = 0.2
@@ -173,6 +177,9 @@ class _ActorCfgShim:
     entropy_coeff: float = 0.0
     policy_loss: _PolicyLossCfg = field(default_factory=_PolicyLossCfg)
     global_batch_info: dict = field(default_factory=dict)
+
+    def get(self, key, default=None):
+        return getattr(self, key, default)
 
 
 def test_tree_training_e2e_one_step():
