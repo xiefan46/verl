@@ -197,6 +197,33 @@ def test_backward_equivalence(prompt_len: int, response_len: int, max_tokens_per
         f"grad key set mismatch: only_a={set(grads_a) - set(grads_b)}, only_b={set(grads_b) - set(grads_a)}"
     )
 
+    # Compute per-parameter error stats first (regardless of pass/fail) so the
+    # actual tightness is visible. Run with ``pytest -s`` to see live output.
+    por = prompt_len / (prompt_len + response_len)
+    per_param: list[tuple[str, float, float, tuple[int, ...]]] = []
+    for name in sorted(grads_a):
+        ga = grads_a[name].float()
+        gb = grads_b[name].float()
+        if ga.shape != gb.shape:
+            per_param.append((name, float("inf"), float("inf"), tuple(ga.shape)))
+            continue
+        abs_diff = (ga - gb).abs()
+        rel_diff = abs_diff / (ga.abs() + 1e-8)
+        per_param.append((name, abs_diff.max().item(), rel_diff.max().item(), tuple(ga.shape)))
+
+    worst_by_rel = sorted(per_param, key=lambda x: x[2], reverse=True)
+    overall_max_abs = max(p[1] for p in per_param)
+    overall_max_rel = max(p[2] for p in per_param)
+    print(
+        f"\n[backward POR≈{por:.2f}] N_params={len(per_param)}  "
+        f"loss_baseline={loss_a.item():.4f}  loss_tree={loss_b.item():.4f}  "
+        f"Δloss={(loss_a - loss_b).abs().item():.4e}\n"
+        f"  overall: max_abs={overall_max_abs:.4e}  max_rel={overall_max_rel:.4e}\n"
+        f"  top 5 worst params (by max_rel):"
+    )
+    for name, max_abs, max_rel, shape in worst_by_rel[:5]:
+        print(f"    {name:55s}  max_abs={max_abs:.4e}  max_rel={max_rel:.4e}  shape={shape}")
+
     # Compare gradients. Tolerance is looser than fp32 because flex_attention's
     # custom-mask backward path inherits the same precision quirks as forward
     # (see AReaL upstream test, which uses rtol=atol=0.2 for forward).
@@ -210,15 +237,16 @@ def test_backward_equivalence(prompt_len: int, response_len: int, max_tokens_per
             continue
         if not torch.allclose(ga, gb, rtol=rtol, atol=atol):
             abs_diff = (ga - gb).abs()
-            rel = abs_diff / (ga.abs() + 1e-8)
+            rel_diff = abs_diff / (ga.abs() + 1e-8)
             failures.append(
-                f"{name}: max_abs={abs_diff.max().item():.4e}, max_rel={rel.max().item():.4e}, shape={tuple(ga.shape)}"
+                f"{name}: max_abs={abs_diff.max().item():.4e}, "
+                f"max_rel={rel_diff.max().item():.4e}, shape={tuple(ga.shape)}"
             )
 
     if failures:
         head = failures[:10]
         more = f" (and {len(failures) - 10} more)" if len(failures) > 10 else ""
         pytest.fail(
-            f"backward equivalence failed at POR≈{prompt_len / (prompt_len + response_len):.2f}: "
+            f"backward equivalence failed at POR≈{por:.2f}: "
             f"{len(failures)}/{len(grads_a)} parameters differ.\n" + "\n".join(head) + more
         )

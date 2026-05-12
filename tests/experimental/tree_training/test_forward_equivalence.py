@@ -179,15 +179,30 @@ def test_forward_equivalence(prompt_len: int, response_len: int, max_tokens_per_
 
     assert baseline.shape == tree.shape, f"shape mismatch: baseline={tuple(baseline.shape)}, tree={tuple(tree.shape)}"
 
+    # Always print the empirical error magnitude — independent of pass/fail —
+    # so we can monitor whether the calibrated tolerance is actually tight.
+    # Run with ``pytest -s`` to see this output live; pytest also dumps captured
+    # stdout on failure.
+    abs_diff = (baseline - tree).abs()
+    rel_diff = abs_diff / (baseline.abs() + 1e-8)
+    por = prompt_len / (prompt_len + response_len)
+    print(
+        f"\n[forward POR≈{por:.2f}] N={batch['input_ids'].size(0)} T={batch['input_ids'].size(1)} "
+        f"({baseline.numel()} logprobs compared)\n"
+        f"  abs_diff: max={abs_diff.max().item():.4e}  "
+        f"mean={abs_diff.mean().item():.4e}  median={abs_diff.median().item():.4e}\n"
+        f"  rel_diff: max={rel_diff.max().item():.4e}  "
+        f"mean={rel_diff.mean().item():.4e}  median={rel_diff.median().item():.4e}"
+    )
+
     # Tolerance calibrated against AReaL upstream tests; flex_attention with
     # custom block masks introduces non-trivial numerical error vs eager attention.
     rtol, atol = 0.2, 0.2
     is_close = torch.isclose(baseline, tree, rtol=rtol, atol=atol)
     if not is_close.all():
-        abs_diff = (baseline - tree).abs()
         n_bad = int((~is_close).sum().item())
         pytest.fail(
-            f"forward equivalence failed at POR≈{prompt_len / (prompt_len + response_len):.2f}: "
+            f"forward equivalence failed at POR≈{por:.2f}: "
             f"{n_bad}/{is_close.numel()} elements differ "
             f"(max abs diff={abs_diff.max().item():.6f}, "
             f"mean={abs_diff.mean().item():.6f}, "
