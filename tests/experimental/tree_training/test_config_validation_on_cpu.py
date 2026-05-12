@@ -36,6 +36,7 @@ import unittest
 from types import SimpleNamespace
 
 import pytest
+from hydra.errors import InstantiationException
 from omegaconf import OmegaConf
 
 from verl.utils.config import omega_conf_to_dataclass
@@ -43,6 +44,13 @@ from verl.workers.config import (
     McoreActorConfig,
     TreeTrainingConfig,
 )
+
+# Hydra's instantiate wraps any exception raised from __post_init__ in
+# InstantiationException. The wrapped exception text is preserved in the
+# str of the wrapper, so ``match=`` still works on substring patterns.
+# Tests that go through omega_conf_to_dataclass need to catch this wrapper;
+# tests that construct dataclasses directly (e.g. TreeTrainingConfig()) get
+# the raw exception type.
 
 
 def _make_fsdp_actor_dict(**overrides):
@@ -111,11 +119,11 @@ class TestActorConfigTreeTrainingChecks(unittest.TestCase):
         self.assertFalse(cfg.use_tree_training)
 
     def test_tree_training_with_shuffle_raises(self):
-        with pytest.raises(ValueError, match="shuffle=True"):
+        with pytest.raises(InstantiationException, match="shuffle=True"):
             omega_conf_to_dataclass(_make_fsdp_actor_dict(use_tree_training=True, shuffle=True))
 
     def test_tree_training_with_dynamic_bsz_raises(self):
-        with pytest.raises(ValueError, match="use_dynamic_bsz=True"):
+        with pytest.raises(InstantiationException, match="use_dynamic_bsz=True"):
             omega_conf_to_dataclass(
                 _make_fsdp_actor_dict(
                     use_tree_training=True,
@@ -135,7 +143,7 @@ class TestFSDPActorConfigTreeTrainingChecks(unittest.TestCase):
     """FSDPActorConfig.__post_init__ ulysses_sp check."""
 
     def test_tree_training_with_ulysses_sp_raises(self):
-        with pytest.raises(NotImplementedError, match="ulysses_sequence_parallel_size"):
+        with pytest.raises(InstantiationException, match="ulysses_sequence_parallel_size"):
             omega_conf_to_dataclass(
                 _make_fsdp_actor_dict(
                     use_tree_training=True,
@@ -157,7 +165,7 @@ class TestMcoreActorConfigTreeTrainingChecks(unittest.TestCase):
     """McoreActorConfig.__post_init__ blanket Megatron-not-supported check."""
 
     def test_tree_training_on_megatron_raises(self):
-        with pytest.raises(NotImplementedError, match="Megatron"):
+        with pytest.raises(InstantiationException, match="Megatron"):
             omega_conf_to_dataclass(_make_mcore_actor_dict(use_tree_training=True))
 
     def test_megatron_without_tree_training_ok(self):
