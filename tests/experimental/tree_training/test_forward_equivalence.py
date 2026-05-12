@@ -195,9 +195,12 @@ def test_forward_equivalence(prompt_len: int, response_len: int, max_tokens_per_
         f"mean={rel_diff.mean().item():.4e}  median={rel_diff.median().item():.4e}"
     )
 
-    # Tolerance calibrated against AReaL upstream tests; flex_attention with
-    # custom block masks introduces non-trivial numerical error vs eager attention.
-    rtol, atol = 0.2, 0.2
+    # Empirical max_abs across 3 POR configs on H100 + bf16 sits ~5e-3, max_rel
+    # ~7e-4. Tolerance set to 0.01 leaves ~14x safety margin while still being
+    # tight enough to catch real regressions — far below the 0.2 AReaL upstream
+    # uses (their tests run through their engine + packed baseline path, which
+    # accumulates more error than our HF-direct setup).
+    rtol, atol = 0.01, 0.01
     is_close = torch.isclose(baseline, tree, rtol=rtol, atol=atol)
     if not is_close.all():
         n_bad = int((~is_close).sum().item())
