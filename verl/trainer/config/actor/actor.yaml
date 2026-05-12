@@ -101,6 +101,28 @@ use_kl_loss: false
 # Whether to enable PrefixGrouper shared-prefix forward
 use_prefix_grouper: false
 
+# Whether to enable tree training (AReaL-DTA style packed-tree forward).
+# Mutually exclusive with use_prefix_grouper and several other configs;
+# cross-section fail-fast validation lives in ActorConfig.__post_init__.
+use_tree_training: false
+
+# Tree training tunables (only effective when use_tree_training=true)
+tree_training:
+
+  # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
+  _target_: verl.workers.config.TreeTrainingConfig
+
+  # Max tokens per packed micro-batch. Must be a positive multiple of 128
+  # (flex_attention BLOCK_SIZE alignment).
+  max_tokens_per_mb: 4096
+
+  # If True, pad each tree to max_tokens_per_mb. Required for block-mask attention.
+  # MVP always True; kept as a field for forward compatibility.
+  pad_to_maximum: true
+
+  # Chunk size for gather_packed_tree_logprobs (memory-efficient processing).
+  chunk_size: 1024
+
 # Whether to use torch.compile()
 # oc.select: the default val for ref.use_torch_compile
 use_torch_compile: true

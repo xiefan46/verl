@@ -35,6 +35,7 @@ from .optimizer import OptimizerConfig
 __all__ = [
     "PolicyLossConfig",
     "RouterReplayConfig",
+    "TreeTrainingConfig",
     "ActorConfig",
     "FSDPActorConfig",
     "McoreActorConfig",
@@ -97,6 +98,39 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+
+
+@dataclass
+class TreeTrainingConfig(BaseConfig):
+    """Configuration for tree training (vendored from AReaL-DTA, paper arXiv:2602.00482).
+
+    Tree training packs prompt-sharing rollouts into a trie + custom block mask,
+    so the shared prefix only goes through the model once. Only effective when
+    ``actor.use_tree_training=True``. See ``verl/experimental/tree_training/`` for
+    the algorithm and ``research/2026-05-12-tree-training-phase2-design.md`` for
+    the integration design.
+
+    Args:
+        max_tokens_per_mb (int): Max tokens per packed micro-batch. Must be a
+            positive multiple of 128 (flex_attention BLOCK_SIZE alignment).
+        pad_to_maximum (bool): If True, pad each tree to max_tokens_per_mb. Required
+            for block-mask attention. Kept as a config field for forward-compat but
+            currently must be True; non-padded paths are not supported in MVP.
+        chunk_size (int): Chunk size for gather_packed_tree_logprobs (memory-
+            efficient processing along the sequence dimension).
+    """
+
+    max_tokens_per_mb: int = 4096
+    pad_to_maximum: bool = True
+    chunk_size: int = 1024
+
+    def __post_init__(self):
+        """Validate tree training configuration."""
+        if self.max_tokens_per_mb <= 0 or self.max_tokens_per_mb % 128 != 0:
+            raise ValueError(
+                f"tree_training.max_tokens_per_mb must be a positive multiple of 128 "
+                f"(flex_attention BLOCK_SIZE), got {self.max_tokens_per_mb}"
+            )
 
 
 @dataclass
@@ -170,6 +204,12 @@ class ActorConfig(BaseConfig):
     use_kl_loss: bool = False
     # Whether to enable PrefixGrouper-based shared-prefix forward
     use_prefix_grouper: bool = False
+    # Whether to enable tree training (AReaL-DTA style packed-tree forward).
+    # See `verl/experimental/tree_training/` and TreeTrainingConfig.
+    # Mutually exclusive with use_prefix_grouper and several other configs;
+    # cross-section fail-fast validation is added in Task 2.2.
+    use_tree_training: bool = False
+    tree_training: TreeTrainingConfig = field(default_factory=TreeTrainingConfig)
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"

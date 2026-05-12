@@ -107,6 +107,12 @@ actor_rollout_ref:
     calculate_sum_pi_squared: false
     use_kl_loss: false
     use_prefix_grouper: false
+    use_tree_training: false
+    tree_training:
+      _target_: verl.workers.config.TreeTrainingConfig
+      max_tokens_per_mb: 4096
+      pad_to_maximum: true
+      chunk_size: 1024
     use_torch_compile: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
