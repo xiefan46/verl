@@ -312,10 +312,40 @@ class RayPPOTrainer:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(self.config.algorithm.kl_ctrl)
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
+        self.use_tree_training = self.config.actor_rollout_ref.actor.get("use_tree_training", False)
+        if self.use_tree_training:
+            self._validate_tree_training_compatibility()
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
+
+    def _validate_tree_training_compatibility(self):
+        """Cross-section fail-fast checks for actor.use_tree_training=True.
+
+        Local config checks (shuffle / use_dynamic_bsz / ulysses_sp / Megatron strategy /
+        max_tokens_per_mb % 128) live in ActorConfig / FSDPActorConfig / McoreActorConfig
+        post_init. These checks need the data and algorithm sub-configs which the trainer
+        owns. See research/2026-05-12-tree-training-phase2-design.md §3.5.
+        """
+        if self.config.trainer.balance_batch:
+            raise ValueError(
+                "actor.use_tree_training=True is incompatible with trainer.balance_batch=True: "
+                "balance_batch reorders sequences across DP ranks, destroying N-rollout adjacency "
+                "required for prefix sharing. Set trainer.balance_batch=false."
+            )
+        if self.use_critic:
+            raise ValueError(
+                "actor.use_tree_training=True is incompatible with critic (algorithm.adv_estimator=gae "
+                "or any setting that enables critic). Tree training MVP supports GRPO/REINFORCE-style "
+                "actor-only training. Use algorithm.adv_estimator=grpo or similar."
+            )
+        if self.use_prefix_grouper:
+            raise ValueError(
+                "actor.use_tree_training=True is incompatible with actor.use_prefix_grouper=True: "
+                "both are competing shared-prefix optimizations that monkey-patch attention. "
+                "Pick one. Set actor.use_prefix_grouper=false."
+            )
 
     def _create_dataloader(self, train_dataset, val_dataset, collate_fn, train_sampler: Optional[Sampler]):
         """

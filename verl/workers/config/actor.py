@@ -258,6 +258,22 @@ class ActorConfig(BaseConfig):
         if self.loss_agg_mode not in valid_loss_agg_modes:
             raise ValueError(f"Invalid loss_agg_mode: {self.loss_agg_mode}")
 
+        # Tree training compatibility checks (cross-section checks live in RayPPOTrainer.__init__
+        # because they need access to data/algorithm sub-configs).
+        if self.use_tree_training:
+            if self.shuffle:
+                raise ValueError(
+                    "actor.use_tree_training=True is incompatible with actor.shuffle=True: "
+                    "shuffling destroys N-rollout adjacency required for prefix sharing. "
+                    "Set actor.shuffle=false."
+                )
+            if self.use_dynamic_bsz:
+                raise ValueError(
+                    "actor.use_tree_training=True is incompatible with actor.use_dynamic_bsz=True: "
+                    "tree training manages micro-batch sizing via actor.tree_training.max_tokens_per_mb. "
+                    "Set actor.use_dynamic_bsz=false."
+                )
+
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate actor configuration with runtime parameters."""
         if not self.use_dynamic_bsz:
@@ -320,6 +336,13 @@ class McoreActorConfig(ActorConfig):
         super().__post_init__()
         self.engine = self.megatron
 
+        if self.use_tree_training:
+            raise NotImplementedError(
+                "Tree training is not supported on the Megatron actor (MVP scope is FSDP only). "
+                "Megatron path is planned for V2; see "
+                "research/2026-05-12-tree-training-phase2-design.md §3.5."
+            )
+
 
 @dataclass
 class FSDPActorConfig(ActorConfig):
@@ -359,6 +382,13 @@ class FSDPActorConfig(ActorConfig):
         # backward compatibility
         if self.ulysses_sequence_parallel_size > 1:
             self.fsdp_config.ulysses_sequence_parallel_size = self.ulysses_sequence_parallel_size
+
+        if self.use_tree_training and self.ulysses_sequence_parallel_size > 1:
+            raise NotImplementedError(
+                "Tree training does not support ulysses_sequence_parallel_size > 1 (MVP). "
+                f"Got ulysses_sequence_parallel_size={self.ulysses_sequence_parallel_size}. "
+                "Set actor.fsdp_config.ulysses_sequence_parallel_size=1."
+            )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
         """Validate FSDP actor configuration with runtime parameters."""
