@@ -241,8 +241,15 @@ class FSDPEngineConfig(EngineConfig):
         qat (QATEngineConfig): QAT configuration, default disabled
     """
 
-    # ulysses_sequence_parallel_size is mutable for backward compatibility
-    _mutable_fields = EngineConfig._mutable_fields | {"ulysses_sequence_parallel_size"}
+    # ulysses_sequence_parallel_size is mutable for backward compatibility.
+    # Tree training fields are mutable because engine_workers.py:init_model() populates
+    # them after FSDPEngineConfig instantiation (from the actor's use_tree_training
+    # and tree_training.max_tokens_per_mb).
+    _mutable_fields = EngineConfig._mutable_fields | {
+        "ulysses_sequence_parallel_size",
+        "use_tree_training",
+        "tree_training_max_tokens_per_mb",
+    }
 
     # fsdp specific flags
     wrap_policy: dict[str, Any] = field(default_factory=dict)
