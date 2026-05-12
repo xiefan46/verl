@@ -184,16 +184,15 @@ def build_tree_mb_list(
         "input_ids": input_ids_padded,
         "attention_mask": attention_mask_padded,
     }
-
-    # 2. Re-pad position_ids if 1-D layout. Multi-modal (3-D) skipped in MVP.
-    if "position_ids" in td.keys():
-        position_ids_nested = td["position_ids"]
-        if position_ids_nested.is_nested:
-            if position_ids_nested.values().dim() == 1:
-                # 1-D position ids: nested with offsets, pad to [N, max_seq_len]
-                data["position_ids"] = _nested_to_padded(position_ids_nested, padding=0, max_seq_len=max_seq_len)
-            # else: 3-D position ids (Qwen-VL); intentionally not added to data,
-            # so _pack_extra_data won't try to pack them. MVP scope: 1-D only.
+    # NOTE: position_ids is intentionally NOT inserted into ``data``. The vendored
+    # build_packed_tree_batch computes its own trie-aligned position_ids via
+    # get_packed_tree_position_ids (length = padded_size, matching input_ids).
+    # If we passed the user-side position_ids through ``data`` instead,
+    # _pack_extra_data would pick them up as a packable extra (shape matches
+    # input_template) and pack them in seq-id-flat layout (length = sum(seq_lens)),
+    # then ``**extra_data`` in tree.py would override the trie-aligned ones.
+    # That shape mismatch surfaced as a RuntimeError in HF Llama RotaryEmbedding
+    # during Task 2.6 e2e smoke (q seq=padded_size, cos/sin seq=sum(seq_lens)).
 
     # 3. Expand response-only fields to full-sequence layout if present.
     response_mask_2d = td.get("response_mask")
