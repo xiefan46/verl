@@ -81,37 +81,74 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 device_name = get_device_name()
 
 
-def _postprocess_tree_batch(output_lst: list[dict]) -> dict:
+def _postprocess_tree_batch(output_lst: list[dict], *, data: Optional[TensorDict] = None) -> dict:
     """Aggregate output dicts from tree-path forward_step across micro-batches.
 
-    Mirrors :func:`postprocess_batch_func` but skips the nested-tensor concat
-    pass: tree-path ``model_output`` values are 1-D flat tensors in trie order
-    (not nested), and we do not need dynamic-batch reordering because tree
-    micro-batches don't get shuffled.
+    Two modes depending on what ``_forward_step_tree`` emitted per mb:
 
-    Returns a dict with the same shape as ``postprocess_batch_func``:
-      - ``model_output``: list of per-mb ``model_output`` dicts (downstream
-        decides how to combine them — ppo_loss tree branch consumes per-mb).
-      - ``loss``: list of per-mb loss scalars.
-      - ``metrics``: aggregated dict (last-write wins on duplicate keys; tree
-        metrics like ``tree_token_ratio`` were attached to ``output_lst[0]``).
+    - **Loss path** (mb model_output has flat ``log_probs`` + packed extras):
+      The loss already ran inline; ``model_output`` is unused downstream
+      (``train_batch`` pops it before ``_postprocess_output``). We return a
+      placeholder empty dict for ``model_output`` to keep the contract
+      compatible with the non-tree ``postprocess_batch_func``.
+
+    - **Forward-only path** (mb model_output has ``log_probs_per_seq`` dict):
+      Assemble per-mb per-seq dicts into a single nested ``log_probs``
+      (and ``entropy``) tensor whose offsets match ``data["input_ids"]``.
+      The trainer's ``no_padding_2_padding`` then slices the response window
+      exactly like the non-tree path.
+
+    Args:
+        output_lst: per-mb ``output`` dicts from ``_forward_step_tree``.
+        data: engine-side TensorDict; required for the forward-only path to
+            recover the offsets for nested-tensor assembly.
+
+    Returns:
+        ``{"model_output": dict, "loss": [...], "metrics": {...}}``, matching
+        :func:`postprocess_batch_func`'s contract.
     """
+    from verl.experimental.tree_training._verl_adapter import assemble_tree_per_seq_to_nested
     from verl.utils.py_functional import append_to_dict
 
-    model_outputs: list[dict] = []
     losses: list = []
     aggregated_metrics: dict = {}
+    per_mb_model_outputs: list[dict] = []
 
     for o in output_lst:
         if "model_output" in o:
-            model_outputs.append(o["model_output"])
+            per_mb_model_outputs.append(o["model_output"])
         if "loss" in o:
             losses.append(o["loss"])
         if "metrics" in o:
             append_to_dict(aggregated_metrics, o["metrics"])
 
+    # Detect which path we're on by inspecting the first non-empty mb output.
+    is_forward_only_path = any("log_probs_per_seq" in mo for mo in per_mb_model_outputs)
+
+    if not is_forward_only_path:
+        # Loss path: model_output is consumed inline; downstream pops it before
+        # _postprocess_output. Return an empty dict to satisfy tu.get_tensordict.
+        model_output: dict = {}
+    else:
+        if data is None or "input_ids" not in data.keys() or not data["input_ids"].is_nested:
+            raise ValueError(
+                "_postprocess_tree_batch forward-only path requires data['input_ids'] "
+                "as a nested tensor to recover per-row offsets."
+            )
+        offsets = data["input_ids"].offsets()
+
+        log_probs_per_seq_list = [mo.get("log_probs_per_seq", {}) for mo in per_mb_model_outputs]
+        log_probs_nested = assemble_tree_per_seq_to_nested(log_probs_per_seq_list, offsets=offsets, sentinel=0.0)
+        model_output = {"log_probs": log_probs_nested}
+
+        has_entropy = any("entropy_per_seq" in mo for mo in per_mb_model_outputs)
+        if has_entropy:
+            entropy_per_seq_list = [mo.get("entropy_per_seq", {}) for mo in per_mb_model_outputs]
+            entropy_nested = assemble_tree_per_seq_to_nested(entropy_per_seq_list, offsets=offsets, sentinel=0.0)
+            model_output["entropy"] = entropy_nested
+
     return {
-        "model_output": model_outputs,
+        "model_output": model_output,
         "loss": losses,
         "metrics": aggregated_metrics,
     }
@@ -716,11 +753,12 @@ class FSDPEngine(BaseEngine):
 
         # postprocess and return
         if self._use_tree_training:
-            # Tree path: model_output tensors are 1-D flat (not nested), so the standard
-            # postprocess_batch_func (which calls nt.unbind() / as_nested_tensor) doesn't
-            # apply. Aggregate losses + metrics, leave model_output as a list[dict] that
-            # downstream (ppo_loss tree branch / compute_log_prob) can iterate.
-            return _postprocess_tree_batch(output_lst)
+            # Tree path: forward_only emits per-seq dicts (assembled into nested
+            # tensors below); loss path emits trie-order flat tensors that were
+            # already consumed inline by the loss kernel. Hand off to the
+            # tree-aware aggregator which routes both cases to a flat dict
+            # matching postprocess_batch_func's contract.
+            return _postprocess_tree_batch(output_lst, data=data)
         return postprocess_batch_func(output_lst=output_lst, indices=indices, data=data)
 
     def forward_step(self, micro_batch: TensorDict, loss_function, forward_only):
@@ -1339,13 +1377,28 @@ class FSDPEngineWithLMHead(FSDPEngine):
         the model forward goes through the globally-patched flash_attention
         which reads ``tree_block_mask`` from kwargs and routes to flex_attention.
 
-        Output ``model_output`` carries ``is_tree_packed=True`` so the loss
-        function (ppo_loss tree branch, Task 2.5) can route accordingly.
-        Logprobs are flat 1-D in trie order; packed extras (advantages /
-        old_log_probs / response_mask) are passed through unchanged so the
-        loss layer can call :func:`align_packed_extras_to_labels`.
+        Two output shapes depending on ``loss_function``:
+
+        - **Loss path** (``loss_function is not None``, e.g. ``update_actor``):
+          ``model_output`` carries flat 1-D ``log_probs`` in trie order plus
+          packed extras (advantages / old_log_probs / response_mask), so the
+          ppo_loss tree branch (Task 2.5) can route via ``is_tree_packed=True``
+          and call :func:`align_packed_extras_to_labels`. The loss runs
+          inline within the mb iteration; the ``model_output`` is later
+          discarded by ``_postprocess_tree_batch`` on this path.
+
+        - **Forward-only path** (``loss_function is None``, e.g.
+          ``compute_log_prob``): ``model_output`` carries per-seq dicts
+          (``log_probs_per_seq``, optional ``entropy_per_seq``) keyed by
+          original input row index, plus the ``trie``. Downstream
+          ``_postprocess_tree_batch`` assembles these into nested tensors
+          aligned with the engine-side TensorDict row order so the trainer
+          sees the same shape as the non-tree path.
         """
-        from verl.experimental.tree_training._verl_adapter import build_tree_model_inputs, unpack_tree_logprobs
+        from verl.experimental.tree_training._verl_adapter import (
+            build_tree_model_inputs,
+            unpack_tree_logprobs_per_seq,
+        )
 
         device_id = get_device_id()
         local_device_name = get_device_name()
@@ -1356,9 +1409,25 @@ class FSDPEngineWithLMHead(FSDPEngine):
         temperature_raw = mb_on_device.get("temperature", 1.0)
         temperature = float(temperature_raw.item()) if torch.is_tensor(temperature_raw) else float(temperature_raw)
 
+        calculate_entropy = bool(mb_on_device.get("calculate_entropy", False))
+        calculate_sum_pi_squared = bool(mb_on_device.get("calculate_sum_pi_squared", False))
+
+        # Phase 2.5 scope: vocab-stat extras (sum_pi_squared) and MoE routing
+        # aren't wired through the tree path yet. Fail fast rather than
+        # silently dropping these signals from the trainer pipeline.
+        if calculate_sum_pi_squared:
+            raise NotImplementedError(
+                "Tree training does not yet support calculate_sum_pi_squared=True; "
+                "set actor_rollout_ref.actor.calculate_sum_pi_squared=False."
+            )
+        if "routed_experts" in mb_on_device and mb_on_device["routed_experts"] is not None:
+            raise NotImplementedError("Tree training does not yet support MoE routed_experts.")
+
         model_inputs, output_args = build_tree_model_inputs(
             mb_on_device, device_id, extra_inputs={"temperature": temperature}
         )
+        trie = output_args["trie"]
+        packed_input_ids = output_args["packed_input_ids"]
 
         autocast_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
         autocast_ctx: ContextManager = (
@@ -1371,32 +1440,50 @@ class FSDPEngineWithLMHead(FSDPEngine):
             raw_output = self.module(**model_inputs, use_cache=False)
             logits = raw_output.logits.squeeze(0).float()  # [T_padded, V]
 
-            log_probs_flat = unpack_tree_logprobs(
+            # Always go through the per-seq variant: loss path cats back to flat
+            # for the kernel; forward-only path hands the dicts to postprocess
+            # for nested-tensor assembly. Avoids redundant logits scans.
+            need_entropy = loss_function is None and calculate_entropy
+            log_probs_per_seq, entropy_per_seq = unpack_tree_logprobs_per_seq(
                 logits,
-                output_args["trie"],
-                output_args["packed_input_ids"],
+                trie,
+                packed_input_ids,
                 temperature=temperature,
+                with_entropy=need_entropy,
             )
 
-            model_output: dict = {
-                "log_probs": log_probs_flat,
-                "is_tree_packed": True,
-                # Carry the trie + packed extras forward for the loss layer (Task 2.5):
-                # alignment between log_probs and extras is done by
-                # _verl_adapter.align_packed_extras_to_labels.
-                "trie": output_args["trie"],
-                "advantages_packed": mb_on_device.get("advantages"),
-                "old_log_probs_packed": mb_on_device.get("old_log_probs"),
-                "response_mask_packed": mb_on_device.get("response_mask"),
-                "ref_log_prob_packed": mb_on_device.get("ref_log_prob"),
-            }
-
             if loss_function is not None:
+                # Loss kernel expects flat 1-D in trie.all_sequence_ids order.
+                if trie.all_sequence_ids:
+                    log_probs_flat = torch.cat([log_probs_per_seq[sid] for sid in trie.all_sequence_ids], dim=0)
+                else:
+                    log_probs_flat = torch.empty(0, device=logits.device, dtype=torch.float)
+
+                model_output: dict = {
+                    "log_probs": log_probs_flat,
+                    "is_tree_packed": True,
+                    # Carry the trie + packed extras forward for the loss layer (Task 2.5):
+                    # alignment between log_probs and extras is done by
+                    # _verl_adapter.align_packed_extras_to_labels.
+                    "trie": trie,
+                    "advantages_packed": mb_on_device.get("advantages"),
+                    "old_log_probs_packed": mb_on_device.get("old_log_probs"),
+                    "response_mask_packed": mb_on_device.get("response_mask"),
+                    "ref_log_prob_packed": mb_on_device.get("ref_log_prob"),
+                }
                 loss, metrics = loss_function(
                     model_output=model_output, data=mb_on_device, dp_group=self.get_data_parallel_group()
                 )
             else:
                 assert forward_only, "forward_only must be True when loss_function is None"
+                # Forward-only path: postprocess assembles nested tensors from per-seq dicts.
+                model_output = {
+                    "is_tree_packed": True,
+                    "trie": trie,
+                    "log_probs_per_seq": log_probs_per_seq,
+                }
+                if calculate_entropy:
+                    model_output["entropy_per_seq"] = entropy_per_seq
                 loss = torch.tensor(1.0, device=local_device_name)
                 metrics = {}
 

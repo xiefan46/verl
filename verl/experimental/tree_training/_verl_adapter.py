@@ -41,7 +41,11 @@ from typing import Any
 import torch
 
 from verl.experimental.tree_training._areal_data import MicroBatchSpec
-from verl.experimental.tree_training.functional import gather_packed_tree_logprobs
+from verl.experimental.tree_training.functional import (
+    _gather_packed_tree_logprobs,
+    _gather_packed_tree_logprobs_entropy,
+    gather_packed_tree_logprobs,
+)
 from verl.experimental.tree_training.module import build_tree_attn_kwargs
 from verl.experimental.tree_training.tree import TrieNode, build_packed_tree_batch
 
@@ -49,6 +53,8 @@ __all__ = [
     "build_tree_mb_list",
     "build_tree_model_inputs",
     "unpack_tree_logprobs",
+    "unpack_tree_logprobs_per_seq",
+    "assemble_tree_per_seq_to_nested",
     "align_packed_extras_to_labels",
     "segment_lens_from_trie",
 ]
@@ -362,6 +368,118 @@ def unpack_tree_logprobs(
         chunk_size=chunk_size,
         tp_group=tp_group,
     )
+
+
+def unpack_tree_logprobs_per_seq(
+    logits: torch.Tensor,
+    trie: TrieNode,
+    packed_input_ids: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    chunk_size: int = 1024,
+    tp_group: Any = None,
+    with_entropy: bool = False,
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor] | None]:
+    """Per-seq variant of :func:`unpack_tree_logprobs`.
+
+    Same forward computation as :func:`unpack_tree_logprobs`, but skips the
+    trailing ``torch.cat`` so we keep per-sequence tensors keyed by ``seq_id``.
+    Used by ``compute_log_prob`` path (forward-only) to assemble a nested
+    tensor aligned with the engine-side TensorDict ordering; the loss-time path
+    keeps using the flat-cat variant where trie-order is what the loss kernel
+    expects.
+
+    Returns ``(log_probs_per_seq, entropy_per_seq_or_None)``. Empty dummy
+    tries (``all_sequence_ids == []``) return ``({}, {} | None)``.
+    """
+    if not trie.all_sequence_ids:
+        empty: dict[int, torch.Tensor] = {}
+        return empty, ({} if with_entropy else None)
+
+    if with_entropy:
+        logprob_results, entropy_results = _gather_packed_tree_logprobs_entropy(
+            logits, trie, packed_input_ids, temperature, chunk_size, tp_group
+        )
+        return logprob_results, entropy_results
+    logprob_results = _gather_packed_tree_logprobs(logits, trie, packed_input_ids, temperature, chunk_size, tp_group)
+    return logprob_results, None
+
+
+def assemble_tree_per_seq_to_nested(
+    per_mb_per_seq: list[dict[int, torch.Tensor]],
+    *,
+    offsets: torch.Tensor,
+    sentinel: float = 0.0,
+) -> torch.Tensor:
+    """Assemble per-mb per-seq logprobs into a nested tensor matching ``offsets``.
+
+    Each input dict maps ``seq_id`` (original input row index) to a 1-D tensor
+    of length ``seq_lens[seq_id] - 1`` — i.e., one logprob per next-token
+    prediction for that sequence. We:
+
+      1. For each ``seq_id`` in ``[0, N)``, look it up across all mb dicts;
+         exactly one dict must own it (rank-local; trie partition is disjoint).
+      2. Prepend a ``sentinel`` value so each row has length ``seq_lens[seq_id]``,
+         matching the offsets contract that downstream ``no_padding_2_padding``
+         enforces (input ``values.shape[0] == sum(seq_lens)``). The sentinel
+         lives at position 0 of each row and is discarded by the ``-1`` left
+         shift in ``no_padding_2_padding`` whenever ``prompt_len > 0``.
+      3. Concat in row order and wrap with ``nested_tensor_from_jagged``.
+
+    Dummy tries (mb dicts with no entries) contribute nothing.
+
+    Args:
+        per_mb_per_seq: one dict per micro-batch.
+        offsets: ``data["input_ids"].offsets()`` from the engine-side
+            TensorDict. ``offsets.diff()`` gives the per-row full seq_len.
+        sentinel: value to prepend at position 0 of each row.
+
+    Returns:
+        Nested tensor with the given offsets; ``.values()`` has length
+        ``offsets[-1].item() == sum(seq_lens)``.
+    """
+    row_lens = offsets.diff().tolist()
+    num_rows = len(row_lens)
+
+    by_row: dict[int, torch.Tensor] = {}
+    for mb_dict in per_mb_per_seq:
+        for seq_id, tensor in mb_dict.items():
+            if seq_id in by_row:
+                raise ValueError(
+                    f"seq_id={seq_id} appears in multiple micro-batch dicts; trie partitioning should be disjoint."
+                )
+            by_row[seq_id] = tensor
+
+    if len(by_row) != num_rows:
+        missing = sorted(set(range(num_rows)) - by_row.keys())
+        raise ValueError(
+            f"Tree per-seq unpack missing seq_ids: {missing[:10]}{'...' if len(missing) > 10 else ''} "
+            f"(got {len(by_row)} / {num_rows} rows)"
+        )
+
+    # Pick reference device/dtype from the first non-empty tensor; fall back to float32/cpu
+    # if every row is length-1 (no transitions anywhere — degenerate but legal).
+    ref: torch.Tensor | None = next((t for t in by_row.values() if t.numel() > 0), None)
+    if ref is None:
+        device, dtype = torch.device("cpu"), torch.float32
+    else:
+        device, dtype = ref.device, ref.dtype
+
+    parts: list[torch.Tensor] = []
+    for i in range(num_rows):
+        full_len = row_lens[i]
+        seg = by_row[i]
+        expected_transitions = full_len - 1
+        if seg.numel() != expected_transitions:
+            raise ValueError(
+                f"seq_id={i}: expected {expected_transitions} transitions (full_len={full_len}), got {seg.numel()}."
+            )
+        sentinel_val = torch.full((1,), sentinel, device=device, dtype=dtype)
+        # seg may be empty (full_len == 1); cat handles it
+        parts.append(torch.cat([sentinel_val, seg.to(device=device, dtype=dtype)], dim=0))
+
+    values = torch.cat(parts, dim=0) if parts else torch.zeros((0,), device=device, dtype=dtype)
+    return torch.nested.nested_tensor_from_jagged(values, offsets=offsets.to(values.device))
 
 
 def align_packed_extras_to_labels(packed: torch.Tensor, segment_lens: list[int]) -> torch.Tensor:
