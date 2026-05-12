@@ -83,7 +83,14 @@ def _tree_loss(
     batch: dict[str, torch.Tensor],
     max_tokens_per_mb: int,
 ) -> torch.Tensor:
-    """Sum of unpacked per-sequence logprobs from a single packed tree forward."""
+    """Sum of unpacked per-sequence logprobs from a single packed tree forward.
+
+    Drops the spurious trailing logprob each sequence carries — see the
+    matching comment in test_forward_equivalence._tree_logprobs. Without this
+    slice the tree loss is contaminated by predictions of ``input_ids[0]`` of
+    the packed buffer that have no counterpart in the baseline, and the
+    resulting gradient (especially on embed_tokens / lm_head) blows up.
+    """
     from verl.experimental.tree_training._areal_data import MicroBatchSpec
     from verl.experimental.tree_training.functional import gather_packed_tree_logprobs
     from verl.experimental.tree_training.module import build_tree_attn_kwargs
@@ -120,7 +127,14 @@ def _tree_loss(
                 **tree_attn_kwargs,
             )
             logits = out.logits.squeeze(0).float()
-            total = total + gather_packed_tree_logprobs(logits, trie, packed_input_ids).sum()
+            flat = gather_packed_tree_logprobs(logits, trie, packed_input_ids)
+            # Drop the spurious last logprob per sequence (see _tree_logprobs in
+            # the forward equivalence test). All synthetic sequences are equal
+            # length so the reshape is exact.
+            mb_n_seqs = len(trie.all_sequence_ids)
+            mb_seq_len = flat.numel() // mb_n_seqs
+            real = flat.view(mb_n_seqs, mb_seq_len)[:, :-1]
+            total = total + real.sum()
     finally:
         restore_patch_fsdp_for_tree_training()
     return total
