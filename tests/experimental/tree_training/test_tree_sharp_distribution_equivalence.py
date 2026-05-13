@@ -42,14 +42,21 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _make_sharper_tiny_llama(vocab_size: int, *, dtype: torch.dtype, device: torch.device, sharpen_steps: int = 30):
-    """Build a tiny Llama and pre-train briefly so distributions get sharper.
+def _make_sharper_tiny_llama(
+    vocab_size: int,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    train_batch: torch.Tensor,
+    sharpen_steps: int = 300,
+):
+    """Build a tiny Llama and overfit it on ``train_batch`` so distributions get sharp.
 
     Random Llama outputs ~uniform softmax (entropy ≈ ln(vocab_size)), which
-    masks per-position entropy mismatches. A few SGD steps on a fixed batch
-    drives the distribution toward delta functions (very low entropy on
-    seen tokens), reproducing the sharp regime that real instruct models
-    operate in.
+    masks per-position entropy mismatches. To reproduce production's sharp
+    regime, we overfit the model on the EXACT batch it will be evaluated on.
+    After enough steps, the model memorizes the sequence and produces
+    near-delta distributions on every position — entropy drops to ~ 0.
     """
     from transformers import LlamaConfig, LlamaForCausalLM
 
@@ -67,15 +74,11 @@ def _make_sharper_tiny_llama(vocab_size: int, *, dtype: torch.dtype, device: tor
     torch.manual_seed(0)
     model = LlamaForCausalLM(config).to(device=device, dtype=dtype)
 
-    # Brief CE training on a tiny fixed batch to sharpen output distribution.
-    train_input_ids = torch.randint(
-        0, vocab_size, (2, 64), device=device, generator=torch.Generator(device=device).manual_seed(1)
-    )
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
     model.train()
     for _ in range(sharpen_steps):
         optimizer.zero_grad()
-        out = model(input_ids=train_input_ids, labels=train_input_ids)
+        out = model(input_ids=train_batch, labels=train_batch)
         out.loss.backward()
         optimizer.step()
     model.eval()
@@ -197,7 +200,16 @@ def test_tree_dense_sharp_distribution_response_window_match() -> None:
     )
     bsz, total_len = batch["input_ids"].shape
 
-    model = _make_sharper_tiny_llama(vocab_size, dtype=dtype, device=device, sharpen_steps=30)
+    # Overfit the model on the EXACT test batch so distributions are sharp on
+    # the sequences we'll evaluate. 300 steps with lr=3e-3 typically drives
+    # response-position entropy below 1 nat on this tiny architecture.
+    model = _make_sharper_tiny_llama(
+        vocab_size,
+        dtype=dtype,
+        device=device,
+        train_batch=batch["input_ids"],
+        sharpen_steps=300,
+    )
 
     dense_log_probs_2d, dense_entropy_2d = _verl_dense_logprob_and_entropy_per_row(model, batch)
     tree_log_probs_nested, tree_entropy_nested = _tree_pipeline_nested(
