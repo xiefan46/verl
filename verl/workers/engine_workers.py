@@ -529,6 +529,20 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             )
             ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
 
+            # Tree training is a feature-level flag: when actor enables tree training,
+            # the entire actor_rollout_ref worker uses the same tree-attention kernel
+            # (flex_attention or Triton). Otherwise actor's logits and ref's logits would
+            # come from different attention kernels (flex_attention vs flash_attention_2),
+            # and bf16 numerical accumulation differences inflate KL by orders of magnitude
+            # (sharp instruct models amplify ~0.3-nat logit drift into ~5-nat kl_penalty).
+            # See research/2026-05-13-tree-training-phase4-resolution.md.
+            actor_section = self.config.get("actor") if hasattr(self.config, "get") else None
+            if actor_section is not None and actor_section.get("use_tree_training", False):
+                ref_training_config.engine_config.use_tree_training = True
+                ref_training_config.engine_config.tree_training_max_tokens_per_mb = int(
+                    actor_section.tree_training.max_tokens_per_mb
+                )
+
             self.ref = TrainingWorker(config=ref_training_config)
             self.ref.reset()
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
