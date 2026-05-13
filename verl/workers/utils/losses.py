@@ -227,55 +227,6 @@ def _ppo_loss_tree(config: ActorConfig, model_output: dict, data, dp_group=None)
     if config.use_kl_loss and ref_log_prob_flat is not None:
         ref_log_prob = ref_log_prob_flat.unsqueeze(0)
         kld = kl_penalty(logprob=log_prob, ref_logprob=ref_log_prob, kl_penalty=config.kl_loss_type)
-        # TEMP DEBUG (commit ????????): Phase 4 kl_loss=5.4 bug investigation.
-        # ppo_kl=0 after convention-A fix proves log_prob_flat ≈ old_log_probs_packed,
-        # but kl_loss=5.4 says log_prob_flat ≠ ref_log_prob_packed. Both should
-        # be identical at step 1 (actor==ref weights). Dump samples to localize.
-        import os as _os
-
-        if _os.environ.get("VERL_TREE_KL_DEBUG", "0") == "1":
-            import torch.distributed as _dist
-
-            _rank = _dist.get_rank() if _dist.is_initialized() else 0
-            if _rank == 0:
-                _resp_mask = response_mask.to(bool)
-                _n_resp = _resp_mask.sum().item()
-                _resp_log_prob = log_prob[_resp_mask]
-                _resp_ref = ref_log_prob[_resp_mask]
-                _diff = (_resp_log_prob - _resp_ref).abs()
-                _resp_kld = kld[_resp_mask]
-                # Find top divergent positions by |diff|
-                _topk_diff, _topk_idx = _diff.topk(min(10, _diff.numel()))
-                print(
-                    f"\n[TREE_KL_DEBUG] response positions: {_n_resp} "
-                    f"| log_prob mean={_resp_log_prob.mean().item():.4f} "
-                    f"std={_resp_log_prob.std().item():.4f} "
-                    f"| ref mean={_resp_ref.mean().item():.4f} "
-                    f"std={_resp_ref.std().item():.4f} "
-                    f"| |diff| mean={_diff.mean().item():.4f} max={_diff.max().item():.4f} "
-                    f"| kld mean={_resp_kld.mean().item():.4f}",
-                    flush=True,
-                )
-                # Per-decile diff stats to find where divergence concentrates
-                _n = _resp_log_prob.numel()
-                for _q_start, _q_end in [(0, 0.1), (0.1, 0.5), (0.5, 0.9), (0.9, 1.0)]:
-                    _s, _e = int(_n * _q_start), int(_n * _q_end)
-                    _seg_diff = _diff[_s:_e]
-                    if _seg_diff.numel() > 0:
-                        print(
-                            f"  [decile {_q_start:.1f}-{_q_end:.1f}] positions [{_s}:{_e}] "
-                            f"|diff| mean={_seg_diff.mean().item():.4f} "
-                            f"max={_seg_diff.max().item():.4f} "
-                            f"log_prob mean={_resp_log_prob[_s:_e].mean().item():.4f}",
-                            flush=True,
-                        )
-                # Top divergent: position + values
-                print(
-                    f"  [top 10 divergent] idx={_topk_idx.tolist()} "
-                    f"log_prob={_resp_log_prob[_topk_idx].tolist()} "
-                    f"ref={_resp_ref[_topk_idx].tolist()}",
-                    flush=True,
-                )
         kl_loss = agg_loss(
             loss_mat=kld,
             loss_mask=response_mask,
