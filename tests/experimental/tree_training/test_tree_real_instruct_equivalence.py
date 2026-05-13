@@ -36,7 +36,7 @@ import os
 import pytest
 import torch
 
-MODEL_PATH = "/root/models/Qwen/Qwen2.5-0.5B-Instruct"
+MODEL_PATH = "/root/models/Qwen/Qwen3-1.7B"
 
 pytestmark = [
     pytest.mark.skipif(
@@ -45,13 +45,13 @@ pytestmark = [
     ),
     pytest.mark.skipif(
         not os.path.isdir(MODEL_PATH),
-        reason=f"Qwen2.5-0.5B-Instruct not at {MODEL_PATH}; download via download_models.sh",
+        reason=f"Qwen3-1.7B not at {MODEL_PATH}; download via download_models.sh",
     ),
 ]
 
 
 def _load_qwen_instruct(device: torch.device, dtype: torch.dtype):
-    """Load Qwen2.5-0.5B-Instruct as eval-mode HF model on device."""
+    """Load Qwen3-1.7B as eval-mode HF model on device."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
