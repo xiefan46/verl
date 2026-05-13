@@ -108,7 +108,31 @@ def _postprocess_tree_batch(output_lst: list[dict], *, data: Optional[TensorDict
         :func:`postprocess_batch_func`'s contract.
     """
     from verl.experimental.tree_training._verl_adapter import assemble_tree_per_seq_to_nested
+    from verl.utils.metric.utils import Metric
     from verl.utils.py_functional import append_to_dict
+
+    # Detect dummy-trie micro-batches (loss path short-circuit emits empty
+    # model_output and empty metrics). These exist because tree.py:384-392
+    # pads DP-imbalanced ranks with empty TrieNodes so every rank sees the
+    # same mb count for FSDP backward sync. Backfill their metric slots with
+    # zero-valued copies of a real mb's Metric template so the per-key
+    # mb-level lists stay the same length across DP ranks — Metric.aggregate_dp
+    # (utils.py:139-147) asserts equal length.
+    real_metrics_template: Optional[dict] = None
+    for o in output_lst:
+        if o.get("model_output") and o.get("metrics"):
+            real_metrics_template = o["metrics"]
+            break
+    if real_metrics_template is not None:
+        for o in output_lst:
+            if not o.get("model_output"):  # dummy mb
+                placeholder: dict = {}
+                for key, real_metric in real_metrics_template.items():
+                    if isinstance(real_metric, Metric):
+                        placeholder[key] = Metric(value=0.0, aggregation=real_metric.aggregation)
+                    else:
+                        placeholder[key] = 0.0
+                o["metrics"] = placeholder
 
     losses: list = []
     aggregated_metrics: dict = {}
