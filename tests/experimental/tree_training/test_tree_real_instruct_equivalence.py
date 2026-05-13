@@ -141,7 +141,7 @@ def _verl_dense_logprob_per_row(model, batch):
     return log_probs_rows, entropy_rows, raw_logits_rows
 
 
-def _tree_pipeline_with_logits(model, batch, *, max_tokens_per_mb):
+def _tree_pipeline_with_logits(model, batch, *, max_tokens_per_mb, pad_to_maximum=True):
     """Run tree forward and return per-mb (logits, trie, packed_input_ids)."""
     from verl.experimental.tree_training._areal_data import MicroBatchSpec
     from verl.experimental.tree_training.module import build_tree_attn_kwargs
@@ -156,7 +156,7 @@ def _tree_pipeline_with_logits(model, batch, *, max_tokens_per_mb):
         "attention_mask": batch["attention_mask"].to(torch.long),
     }
     mb_spec = MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb)
-    mb_list = build_packed_tree_batch(data, mb_spec)
+    mb_list = build_packed_tree_batch(data, mb_spec, pad_to_maximum=pad_to_maximum)
 
     mb_results = []
     patch_fsdp_for_tree_training(enable=True)
@@ -185,13 +185,16 @@ def _tree_pipeline_with_logits(model, batch, *, max_tokens_per_mb):
 
 
 @pytest.mark.parametrize(
-    "max_tokens_per_mb,num_rollouts,max_new_tokens",
+    "max_tokens_per_mb,num_rollouts,max_new_tokens,pad_to_maximum",
     [
-        (2048, 4, 300),  # mid-scale
-        (4096, 4, 500),  # production-scale
+        (2048, 4, 300, True),  # mid-scale with padding (current production behavior)
+        (2048, 4, 300, False),  # mid-scale WITHOUT padding (probe: does padding cause it?)
+        (4096, 4, 500, True),  # production-scale
     ],
 )
-def test_tree_dense_real_instruct_logits_match(max_tokens_per_mb: int, num_rollouts: int, max_new_tokens: int) -> None:
+def test_tree_dense_real_instruct_logits_match(
+    max_tokens_per_mb: int, num_rollouts: int, max_new_tokens: int, pad_to_maximum: bool
+) -> None:
     """Compare tree-forward logits vs dense-forward logits at each trie position.
 
     For each trie node containing tokens from sequence i at trie positions
@@ -213,13 +216,16 @@ def test_tree_dense_real_instruct_logits_match(max_tokens_per_mb: int, num_rollo
 
     print(
         f"\n[batch] bsz={num_rollouts} prompt_len={batch['prompt_len']} "
-        f"total_len={batch['total_len']} max_tokens_per_mb={max_tokens_per_mb}"
+        f"total_len={batch['total_len']} max_tokens_per_mb={max_tokens_per_mb} "
+        f"pad_to_maximum={pad_to_maximum}"
     )
 
     _, _, dense_logits = _verl_dense_logprob_per_row(model, batch)
     # dense_logits[i, t] is the logits at seq i's seq position t.
 
-    mb_results, mb_list = _tree_pipeline_with_logits(model, batch, max_tokens_per_mb=max_tokens_per_mb)
+    mb_results, mb_list = _tree_pipeline_with_logits(
+        model, batch, max_tokens_per_mb=max_tokens_per_mb, pad_to_maximum=pad_to_maximum
+    )
     print(f"[tree] num mbs: {len(mb_results)}")
 
     # For each mb, walk trie nodes and compare tree logits at each trie position
@@ -228,6 +234,9 @@ def test_tree_dense_real_instruct_logits_match(max_tokens_per_mb: int, num_rollo
     total_compared = 0
     max_logit_diff_overall = 0.0
     max_logit_diff_position = None
+    # Per-seq stats: how many positions diverge per seq, by region (prompt vs response)
+    per_seq_stats = {sid: {"prompt_diffs": [], "response_diffs": []} for sid in range(num_rollouts)}
+    prompt_len_for_stats = batch["prompt_len"]
 
     for mb_idx, mb_r in enumerate(mb_results):
         trie = mb_r["trie"]
@@ -255,12 +264,24 @@ def test_tree_dense_real_instruct_logits_match(max_tokens_per_mb: int, num_rollo
                     if diff_max > 0.5:  # arbitrary loose threshold to count "mismatches"
                         total_mismatches += 1
                     total_compared += 1
+                    if seq_id in per_seq_stats:
+                        bucket = "prompt_diffs" if seq_pos < prompt_len_for_stats else "response_diffs"
+                        per_seq_stats[seq_id][bucket].append(diff_max)
 
     print(
         f"[compare] compared {total_compared} (trie_pos, seq) pairs, "
         f"mismatches (max|diff|>0.5): {total_mismatches} "
         f"({100 * total_mismatches / max(1, total_compared):.2f}%)"
     )
+    for sid, stats in per_seq_stats.items():
+        p_diffs = torch.tensor(stats["prompt_diffs"]) if stats["prompt_diffs"] else torch.zeros(1)
+        r_diffs = torch.tensor(stats["response_diffs"]) if stats["response_diffs"] else torch.zeros(1)
+        print(
+            f"  [seq {sid}] prompt: n={len(stats['prompt_diffs'])} mean={p_diffs.mean().item():.4f} "
+            f"max={p_diffs.max().item():.4f} | "
+            f"response: n={len(stats['response_diffs'])} mean={r_diffs.mean().item():.4f} "
+            f"max={r_diffs.max().item():.4f}"
+        )
     print(
         f"[max diff] {max_logit_diff_overall:.4f} at "
         f"mb={max_logit_diff_position[0] if max_logit_diff_position else None} "
