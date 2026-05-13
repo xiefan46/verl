@@ -244,21 +244,36 @@ def _ppo_loss_tree(config: ActorConfig, model_output: dict, data, dp_group=None)
                 _resp_ref = ref_log_prob[_resp_mask]
                 _diff = (_resp_log_prob - _resp_ref).abs()
                 _resp_kld = kld[_resp_mask]
+                # Find top divergent positions by |diff|
+                _topk_diff, _topk_idx = _diff.topk(min(10, _diff.numel()))
                 print(
                     f"\n[TREE_KL_DEBUG] response positions: {_n_resp} "
                     f"| log_prob mean={_resp_log_prob.mean().item():.4f} "
                     f"std={_resp_log_prob.std().item():.4f} "
-                    f"| ref_log_prob mean={_resp_ref.mean().item():.4f} "
+                    f"| ref mean={_resp_ref.mean().item():.4f} "
                     f"std={_resp_ref.std().item():.4f} "
                     f"| |diff| mean={_diff.mean().item():.4f} max={_diff.max().item():.4f} "
                     f"| kld mean={_resp_kld.mean().item():.4f}",
                     flush=True,
                 )
-                # Sample first 8 response positions
+                # Per-decile diff stats to find where divergence concentrates
+                _n = _resp_log_prob.numel()
+                for _q_start, _q_end in [(0, 0.1), (0.1, 0.5), (0.5, 0.9), (0.9, 1.0)]:
+                    _s, _e = int(_n * _q_start), int(_n * _q_end)
+                    _seg_diff = _diff[_s:_e]
+                    if _seg_diff.numel() > 0:
+                        print(
+                            f"  [decile {_q_start:.1f}-{_q_end:.1f}] positions [{_s}:{_e}] "
+                            f"|diff| mean={_seg_diff.mean().item():.4f} "
+                            f"max={_seg_diff.max().item():.4f} "
+                            f"log_prob mean={_resp_log_prob[_s:_e].mean().item():.4f}",
+                            flush=True,
+                        )
+                # Top divergent: position + values
                 print(
-                    f"[TREE_KL_DEBUG] first 8 response positions: "
-                    f"log_prob={_resp_log_prob[:8].tolist()} "
-                    f"ref={_resp_ref[:8].tolist()}",
+                    f"  [top 10 divergent] idx={_topk_idx.tolist()} "
+                    f"log_prob={_resp_log_prob[_topk_idx].tolist()} "
+                    f"ref={_resp_ref[_topk_idx].tolist()}",
                     flush=True,
                 )
         kl_loss = agg_loss(
