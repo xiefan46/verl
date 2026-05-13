@@ -1453,27 +1453,36 @@ class FSDPEngineWithLMHead(FSDPEngine):
             )
 
             if loss_function is not None:
-                # Loss kernel expects flat 1-D in trie.all_sequence_ids order.
-                if trie.all_sequence_ids:
-                    log_probs_flat = torch.cat([log_probs_per_seq[sid] for sid in trie.all_sequence_ids], dim=0)
+                # Dummy trie (multi-DP padding rank from tree.py:384-392): no real
+                # contribution, but we still need a loss that's grad-connected to
+                # logits so the FSDP backward all-reduce stays in sync with ranks
+                # that have non-dummy contributions. ``logits.sum() * 0.0`` gives
+                # a real-zero gradient at logits without polluting the loss value
+                # or going through the ppo_loss kernel (which would choke on the
+                # empty packed extras anyway).
+                if not trie.all_sequence_ids:
+                    loss = logits.sum() * 0.0
+                    model_output = {}
+                    metrics = {}
                 else:
-                    log_probs_flat = torch.empty(0, device=logits.device, dtype=torch.float)
+                    # Loss kernel expects flat 1-D in trie.all_sequence_ids order.
+                    log_probs_flat = torch.cat([log_probs_per_seq[sid] for sid in trie.all_sequence_ids], dim=0)
 
-                model_output: dict = {
-                    "log_probs": log_probs_flat,
-                    "is_tree_packed": True,
-                    # Carry the trie + packed extras forward for the loss layer (Task 2.5):
-                    # alignment between log_probs and extras is done by
-                    # _verl_adapter.align_packed_extras_to_labels.
-                    "trie": trie,
-                    "advantages_packed": mb_on_device.get("advantages"),
-                    "old_log_probs_packed": mb_on_device.get("old_log_probs"),
-                    "response_mask_packed": mb_on_device.get("response_mask"),
-                    "ref_log_prob_packed": mb_on_device.get("ref_log_prob"),
-                }
-                loss, metrics = loss_function(
-                    model_output=model_output, data=mb_on_device, dp_group=self.get_data_parallel_group()
-                )
+                    model_output = {
+                        "log_probs": log_probs_flat,
+                        "is_tree_packed": True,
+                        # Carry the trie + packed extras forward for the loss layer (Task 2.5):
+                        # alignment between log_probs and extras is done by
+                        # _verl_adapter.align_packed_extras_to_labels.
+                        "trie": trie,
+                        "advantages_packed": mb_on_device.get("advantages"),
+                        "old_log_probs_packed": mb_on_device.get("old_log_probs"),
+                        "response_mask_packed": mb_on_device.get("response_mask"),
+                        "ref_log_prob_packed": mb_on_device.get("ref_log_prob"),
+                    }
+                    loss, metrics = loss_function(
+                        model_output=model_output, data=mb_on_device, dp_group=self.get_data_parallel_group()
+                    )
             else:
                 assert forward_only, "forward_only must be True when loss_function is None"
                 # Forward-only path: postprocess assembles nested tensors from per-seq dicts.
