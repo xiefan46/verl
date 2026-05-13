@@ -305,3 +305,124 @@ def test_engine_postprocess_entropy_equivalence(prompt_len: int, response_len: i
         atol=0.01,
         rtol=0.01,
     )
+
+
+# =============================================================================
+# Phase 3 Task 3.2: edge cases
+# =============================================================================
+
+
+def test_engine_postprocess_degenerate_trie() -> None:
+    """Single-sequence batch (1 prompt × 1 rollout): trie has 1 segment, no sharing.
+
+    This is the degenerate case where the tree advantage vanishes (POR = 0) but
+    the pipeline must still produce correct row-major nested output. Catches
+    failures where ``assemble_tree_per_seq_to_nested`` accidentally requires
+    ``len(by_row) > 1`` or where ``unpack_tree_logprobs_per_seq`` mishandles
+    a single-seq trie.
+    """
+    from tests.experimental.tree_training.synthetic import make_prompt_sharing_batch
+
+    vocab_size = 1024
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    batch = make_prompt_sharing_batch(
+        num_prompts=1,
+        rollouts_per_prompt=1,
+        prompt_len=64,
+        response_len=64,
+        vocab_size=vocab_size,
+        device=device,
+    )
+    assert batch["input_ids"].shape[0] == 1, "degenerate test requires batch_size=1"
+
+    model = _make_tiny_llama(vocab_size, dtype=dtype, device=device)
+
+    baseline_logprobs_2d, _ = _dense_baseline_per_row(model, batch, with_entropy=False)
+    tree_log_probs_nested, _ = _tree_pipeline_nested(model, batch, max_tokens_per_mb=256, with_entropy=False)
+
+    bsz, total_len = batch["input_ids"].shape
+    tree_values_2d = tree_log_probs_nested.values().view(bsz, total_len)
+
+    diff = (tree_values_2d.float() - baseline_logprobs_2d.float()).abs()
+    print(f"\n[degenerate trie] max_abs={diff.max().item():.6f}, mean_abs={diff.mean().item():.6f}")
+
+    assert torch.all(tree_values_2d[:, 0] == 0.0), "sentinel position 0 should be 0.0"
+    torch.testing.assert_close(
+        tree_values_2d.float(),
+        baseline_logprobs_2d.float(),
+        atol=0.01,
+        rtol=0.01,
+    )
+
+
+def test_engine_postprocess_multi_mb() -> None:
+    """Large batch forced into multiple trie partitions (mb).
+
+    Ensures ``assemble_tree_per_seq_to_nested`` correctly stitches per-seq
+    dicts across multiple micro-batches in row-major order, not just within
+    a single mb. Catches failures where seq_ids from different mbs collide
+    or where the cross-mb merge accidentally reorders rows.
+    """
+    from tests.experimental.tree_training._areal_data import MicroBatchSpec
+    from tests.experimental.tree_training.synthetic import make_prompt_sharing_batch
+    from verl.experimental.tree_training.tree import build_packed_tree_batch
+
+    vocab_size = 1024
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    # 4 distinct prompts × 4 rollouts = 16 seqs × 128 tokens = 2048 raw tokens.
+    # Each prompt group's trie can share prompt tokens within group, so unique
+    # trie tokens ≈ 4 × 64 + 16 × 64 = 1280. max_tokens_per_mb=256 (BLOCK_SIZE=128
+    # multiple) forces split into multiple mbs.
+    num_prompts = 4
+    rollouts_per_prompt = 4
+    prompt_len = 64
+    response_len = 64
+    max_tokens_per_mb = 256
+
+    batch = make_prompt_sharing_batch(
+        num_prompts=num_prompts,
+        rollouts_per_prompt=rollouts_per_prompt,
+        prompt_len=prompt_len,
+        response_len=response_len,
+        vocab_size=vocab_size,
+        device=device,
+    )
+
+    # Verify we actually trigger a multi-mb split (otherwise the test is moot).
+    data = {"input_ids": batch["input_ids"], "attention_mask": batch["attention_mask"].to(torch.long)}
+    probe_mb_list = build_packed_tree_batch(data, MicroBatchSpec(max_tokens_per_mb=max_tokens_per_mb))
+    num_mbs = len(probe_mb_list.padded_mbs)
+    print(f"\n[multi-mb] split into {num_mbs} micro-batches")
+    assert num_mbs > 1, f"expected multi-mb split, got {num_mbs}; raise batch size or lower max_tokens_per_mb"
+
+    model = _make_tiny_llama(vocab_size, dtype=dtype, device=device)
+
+    baseline_logprobs_2d, _ = _dense_baseline_per_row(model, batch, with_entropy=False)
+    tree_log_probs_nested, _ = _tree_pipeline_nested(
+        model, batch, max_tokens_per_mb=max_tokens_per_mb, with_entropy=False
+    )
+
+    bsz, total_len = batch["input_ids"].shape
+    tree_values_2d = tree_log_probs_nested.values().view(bsz, total_len)
+
+    diff = (tree_values_2d.float() - baseline_logprobs_2d.float()).abs()
+    max_abs = diff.max().item()
+    mean_abs = diff.mean().item()
+    print(f"[multi-mb diff] max_abs={max_abs:.6f}, mean_abs={mean_abs:.6f}")
+
+    # Per-row diff to catch cross-mb stitch errors that would corrupt some rows
+    # while leaving others intact (a within-row max alone could miss this).
+    per_row_max = diff.max(dim=1).values
+    print(f"[multi-mb per-row max] {per_row_max.tolist()}")
+    assert per_row_max.max().item() < 0.01, f"per-row max exceeds tolerance: {per_row_max.tolist()}"
+
+    torch.testing.assert_close(
+        tree_values_2d.float(),
+        baseline_logprobs_2d.float(),
+        atol=0.01,
+        rtol=0.01,
+    )
