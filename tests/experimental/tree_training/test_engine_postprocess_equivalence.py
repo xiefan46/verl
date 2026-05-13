@@ -365,8 +365,8 @@ def test_engine_postprocess_multi_mb() -> None:
     a single mb. Catches failures where seq_ids from different mbs collide
     or where the cross-mb merge accidentally reorders rows.
     """
-    from tests.experimental.tree_training._areal_data import MicroBatchSpec
     from tests.experimental.tree_training.synthetic import make_prompt_sharing_batch
+    from verl.experimental.tree_training._areal_data import MicroBatchSpec
     from verl.experimental.tree_training.tree import build_packed_tree_batch
 
     vocab_size = 1024
