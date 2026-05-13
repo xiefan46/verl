@@ -78,8 +78,9 @@ def _build_real_batch(model, tokenizer, *, num_rollouts: int, max_new_tokens: in
     )
     messages = [{"role": "user", "content": prompt_text}]
     encoded = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt")
-    # apply_chat_template may return a tensor (older) or BatchEncoding dict (newer).
-    prompt_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded
+    # apply_chat_template may return a tensor (older transformers) or BatchEncoding
+    # (newer). BatchEncoding doesn't subclass dict cleanly so use tensor check.
+    prompt_ids = encoded if isinstance(encoded, torch.Tensor) else encoded["input_ids"]
     prompt_ids = prompt_ids.to(device)
     prompt_len = prompt_ids.shape[1]
 
