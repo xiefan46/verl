@@ -414,16 +414,26 @@ def assemble_tree_per_seq_to_nested(
     """Assemble per-mb per-seq logprobs into a nested tensor matching ``offsets``.
 
     Each input dict maps ``seq_id`` (original input row index) to a 1-D tensor
-    of length ``seq_lens[seq_id] - 1`` — i.e., one logprob per next-token
-    prediction for that sequence. We:
+    of length ``seq_lens[seq_id] - 1`` — one logprob per next-token prediction
+    for that sequence: ``transitions[t] = log P(input_ids[t+1] | input_ids[0..t])``.
+
+    Layout: **convention B** (matches verl's production dense path). Each row
+    has length ``seq_lens[seq_id]``; row position ``k`` stores
+    ``transitions[k] = log P(input_ids[k+1])`` for ``k in [0, L-1)``, with a
+    sentinel APPENDED at the last position ``L-1`` (analogous to verl's dense
+    path where the rolled-label wraparound puts garbage at the last position).
+
+    The trainer's ``no_padding_2_padding`` slice
+    ``values[seq_offset - resp_len - 1 : seq_offset - 1]`` (= within-row
+    positions ``[prompt_len-1, prompt_len+resp_len-1)``) is calibrated for
+    this convention: it extracts ``log P(input_ids[prompt_len]), ...,
+    log P(input_ids[prompt_len+resp_len-1])`` — exactly the response token
+    log_probs. The sentinel at position L-1 is the slice's exclusive endpoint
+    and never read.
 
       1. For each ``seq_id`` in ``[0, N)``, look it up across all mb dicts;
          exactly one dict must own it (rank-local; trie partition is disjoint).
-      2. Prepend a ``sentinel`` value so each row has length ``seq_lens[seq_id]``,
-         matching the offsets contract that downstream ``no_padding_2_padding``
-         enforces (input ``values.shape[0] == sum(seq_lens)``). The sentinel
-         lives at position 0 of each row and is discarded by the ``-1`` left
-         shift in ``no_padding_2_padding`` whenever ``prompt_len > 0``.
+      2. Append a ``sentinel`` value so each row has length ``seq_lens[seq_id]``.
       3. Concat in row order and wrap with ``nested_tensor_from_jagged``.
 
     Dummy tries (mb dicts with no entries) contribute nothing.
@@ -432,7 +442,7 @@ def assemble_tree_per_seq_to_nested(
         per_mb_per_seq: one dict per micro-batch.
         offsets: ``data["input_ids"].offsets()`` from the engine-side
             TensorDict. ``offsets.diff()`` gives the per-row full seq_len.
-        sentinel: value to prepend at position 0 of each row.
+        sentinel: value to append at position L-1 of each row.
 
     Returns:
         Nested tensor with the given offsets; ``.values()`` has length
@@ -475,8 +485,9 @@ def assemble_tree_per_seq_to_nested(
                 f"seq_id={i}: expected {expected_transitions} transitions (full_len={full_len}), got {seg.numel()}."
             )
         sentinel_val = torch.full((1,), sentinel, device=device, dtype=dtype)
-        # seg may be empty (full_len == 1); cat handles it
-        parts.append(torch.cat([sentinel_val, seg.to(device=device, dtype=dtype)], dim=0))
+        # Convention B: append sentinel at position L-1 (matches verl dense path's
+        # rolled-label wraparound). seg may be empty (full_len == 1); cat handles it.
+        parts.append(torch.cat([seg.to(device=device, dtype=dtype), sentinel_val], dim=0))
 
     values = torch.cat(parts, dim=0) if parts else torch.zeros((0,), device=device, dtype=dtype)
     return torch.nested.nested_tensor_from_jagged(values, offsets=offsets.to(values.device))

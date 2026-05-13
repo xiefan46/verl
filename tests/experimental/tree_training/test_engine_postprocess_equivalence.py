@@ -21,7 +21,8 @@ is the *engine postprocess* layer added in commit 03106821:
 
   - ``unpack_tree_logprobs_per_seq`` (returns ``dict[seq_id, Tensor]``)
   - ``assemble_tree_per_seq_to_nested`` (row-major nested with sentinel
-    prepended at position 0 of each row)
+    appended at position L-1 of each row, convention B matching verl's
+    production dense path)
 
 This pipeline is what ``compute_log_prob`` returns to the trainer, so a
 silent off-by-one or trie-order leak would corrupt PPO ratio computation
@@ -72,11 +73,12 @@ def _dense_baseline_per_row(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Forward each sequence independently; return ``[B, L]`` logprobs and entropy.
 
-    Position 0 of each row is a sentinel (0.0); positions ``[1, L)`` are the
-    next-token logprobs / entropies for that row, matching the layout that
-    ``assemble_tree_per_seq_to_nested`` produces. The sentinel mirrors what
-    the engine emits for the first input token (whose log-prob is not
-    computed; downstream ``no_padding_2_padding`` discards it via -1 shift).
+    Layout: **convention B** (matches verl production dense path and the
+    updated ``assemble_tree_per_seq_to_nested``). Positions ``[0, L-1)`` store
+    transitions ``log P(input_ids[k+1] | input_ids[0..k])``; position ``L-1``
+    is a sentinel (0.0) — analogous to verl dense path's rolled-label
+    wraparound garbage, and discarded by ``no_padding_2_padding``'s slice
+    exclusive endpoint.
     """
     from verl.experimental.tree_training._vocab_parallel import gather_logprobs
 
@@ -94,15 +96,15 @@ def _dense_baseline_per_row(
         shifted_logits = out.logits[0, :-1].float()  # [L-1, V]
         shifted_labels = input_ids[i, 1:]  # [L-1]
         per_seq_logprobs = gather_logprobs(shifted_logits, shifted_labels)  # [L-1]
-        # Place at positions [1, L) — position 0 stays sentinel 0.0
-        logprob_rows[i, 1:] = per_seq_logprobs.float()
+        # Convention B: place transitions at positions [0, L-1); leave position L-1 as sentinel 0.
+        logprob_rows[i, :-1] = per_seq_logprobs.float()
 
         if with_entropy:
             # H[p] = -sum(p log p); use log_softmax for numerical stability.
             log_probs_full = torch.log_softmax(shifted_logits, dim=-1)  # [L-1, V]
             probs_full = log_probs_full.exp()
             entropy_seq = -(probs_full * log_probs_full).sum(dim=-1)  # [L-1]
-            entropy_rows[i, 1:] = entropy_seq.float()
+            entropy_rows[i, :-1] = entropy_seq.float()
 
     return logprob_rows, entropy_rows
 
@@ -229,15 +231,14 @@ def test_engine_postprocess_logprob_equivalence(prompt_len: int, response_len: i
     tree_values_2d = tree_log_probs_nested.values().view(bsz, total_len)
 
     # Sentinel at position 0 must be exact (it's a fixed constant, not a forward output).
-    assert torch.all(tree_values_2d[:, 0] == 0.0), (
-        f"sentinel at position 0 should be exactly 0.0, got {tree_values_2d[:, 0].tolist()}"
+    assert torch.all(tree_values_2d[:, -1] == 0.0), (
+        f"sentinel at last position should be exactly 0.0, got {tree_values_2d[:, -1].tolist()}"
     )
 
-    # Response window: positions [prompt_len, prompt_len + response_len) of the row.
-    # Logprobs at index t predict input_ids[t]; response tokens are at [prompt_len, L).
-    # Per-row layout: row[t] is logprob predicting input_ids[row, t]. We want positions
-    # [prompt_len, L) of each row (which predict response tokens).
-    # Baseline's row[0] is sentinel; row[1..L-1] are transitions ⇒ rows align position-by-position.
+    # Convention B layout: row[t] is logprob predicting input_ids[t+1] for t in [0, L-1);
+    # row[L-1] is sentinel. Baseline and tree both follow this convention so rows align
+    # position-by-position; the trainer's no_padding_2_padding slice
+    # [prompt_len-1, prompt_len+resp_len-1) then extracts response-token logprobs.
     diff = (tree_values_2d.float() - baseline_logprobs_2d.float()).abs()
     max_abs = diff.max().item()
     mean_abs = diff.mean().item()
@@ -294,7 +295,7 @@ def test_engine_postprocess_entropy_equivalence(prompt_len: int, response_len: i
     bsz, total_len = batch["input_ids"].shape
     tree_values_2d = tree_entropy_nested.values().view(bsz, total_len)
 
-    assert torch.all(tree_values_2d[:, 0] == 0.0), "entropy sentinel at position 0 should be 0.0"
+    assert torch.all(tree_values_2d[:, -1] == 0.0), "entropy sentinel at last position should be 0.0"
 
     diff = (tree_values_2d.float() - baseline_entropy_2d.float()).abs()
     print(f"\n[entropy diff] max_abs={diff.max().item():.6f}, mean_abs={diff.mean().item():.6f}")
@@ -348,7 +349,7 @@ def test_engine_postprocess_degenerate_trie() -> None:
     diff = (tree_values_2d.float() - baseline_logprobs_2d.float()).abs()
     print(f"\n[degenerate trie] max_abs={diff.max().item():.6f}, mean_abs={diff.mean().item():.6f}")
 
-    assert torch.all(tree_values_2d[:, 0] == 0.0), "sentinel position 0 should be 0.0"
+    assert torch.all(tree_values_2d[:, -1] == 0.0), "sentinel at last position should be 0.0"
     torch.testing.assert_close(
         tree_values_2d.float(),
         baseline_logprobs_2d.float(),
