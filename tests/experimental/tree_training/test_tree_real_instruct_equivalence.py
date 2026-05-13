@@ -270,6 +270,60 @@ def test_tree_dense_real_instruct_logits_match(max_tokens_per_mb: int, num_rollo
         f"position_id={max_logit_diff_position[4] if max_logit_diff_position else None}"
     )
 
+    # ─── Diagnostic: examine the mask row + expected ancestors at the worst position ───
+    if max_logit_diff_position is not None:
+        from verl.experimental.tree_training.tree import build_attention_mask_from_trie
+
+        mb_idx, seq_id_worst, seq_pos_worst, trie_pos_worst, _ = max_logit_diff_position
+        mb_r = mb_results[mb_idx]
+        trie = mb_r["trie"]
+        packed_input_ids = mb_r["packed_input_ids"]
+        position_ids = mb_r["position_ids"]
+        padded_size = packed_input_ids.size(0)
+
+        # Build the dense attention mask used to construct flex_attention's BlockMask
+        dense_mask = build_attention_mask_from_trie(trie, padded_size, device=device)
+        # dense_mask shape: [padded_size, padded_size]; True = allowed to attend
+        mask_row = dense_mask[trie_pos_worst]
+        true_positions = torch.nonzero(mask_row).flatten().tolist()
+        print(
+            f"\n[diag] trie_pos={trie_pos_worst} attends to {len(true_positions)} positions "
+            f"(first 10: {true_positions[:10]}, last 10: {true_positions[-10:]})"
+        )
+
+        # Compute expected ancestors per trie structure: which trie positions are in seq's path up to trie_pos_worst
+        expected_ancestors = []
+        for node in trie.nodes:
+            if seq_id_worst in node.sequence_ids:
+                start, end = node.tree_indices
+                for p in range(start, end + 1):
+                    if p <= trie_pos_worst:
+                        expected_ancestors.append(p)
+        expected_ancestors.sort()
+        print(
+            f"[diag] expected ancestors (per trie struct, seq_id={seq_id_worst}): "
+            f"{len(expected_ancestors)} positions "
+            f"(first 10: {expected_ancestors[:10]}, last 10: {expected_ancestors[-10:]})"
+        )
+
+        # Set difference: any positions in mask but not in expected, or vice versa?
+        extra = sorted(set(true_positions) - set(expected_ancestors))
+        missing = sorted(set(expected_ancestors) - set(true_positions))
+        print(f"[diag] mask has EXTRA positions (not in expected): {len(extra)} -> {extra[:20]}")
+        print(f"[diag] mask MISSING positions (in expected but not mask): {len(missing)} -> {missing[:20]}")
+
+        # Also: position_id should equal seq_pos
+        print(
+            f"[diag] position_id at trie_pos {trie_pos_worst}: {position_ids[trie_pos_worst].item()} "
+            f"(expected: {seq_pos_worst})"
+        )
+
+        # Token id at that trie position
+        print(f"[diag] input_id at trie_pos {trie_pos_worst}: {packed_input_ids[trie_pos_worst].item()}")
+        # In the original seq, what token should be there?
+        seq_token = batch["input_ids"][seq_id_worst, seq_pos_worst].item()
+        print(f"[diag] expected token (batch[{seq_id_worst}, {seq_pos_worst}]): {seq_token}")
+
     # Loose tolerance — we're checking for the production-scale bug which gave
     # ~25 nat divergence. Within ~1.0 logit diff is reasonable noise.
     assert max_logit_diff_overall < 1.0, (
