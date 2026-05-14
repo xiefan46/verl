@@ -23,6 +23,7 @@ import torch
 from tensordict import TensorDict
 
 from verl.utils.device import get_device_name
+from verl.utils.nccl_suspend import ResumeResult, SuspendResult
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 
 
@@ -224,6 +225,22 @@ class BaseEngine:
         Disable all adapters temporarily under the context in the model for LoRA
         """
         return nullcontext()
+
+    def suspend_nccl_comms(self) -> SuspendResult:
+        """Release the GPU memory held by this engine's idle NCCL communicators.
+
+        Used in colocated training/rollout setups to free NCCL channel buffers
+        while the engine is idle (e.g. during the rollout phase). Backends
+        override this with their own communicator enumeration; the default
+        implementation is a no-op.
+
+        See RFC: https://github.com/verl-project/verl/issues/6266
+        """
+        return SuspendResult(success=False, skipped_reason="not_implemented")
+
+    def resume_nccl_comms(self) -> ResumeResult:
+        """Reverse of :meth:`suspend_nccl_comms`. Default implementation is a no-op."""
+        return ResumeResult(success=False, skipped_reason="not_implemented")
 
 
 class BaseEngineCtx:
