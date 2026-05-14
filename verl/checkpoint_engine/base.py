@@ -361,6 +361,30 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.trainer = trainer
         self.replicas = replicas
+        # Off-by-default gate for NCCL communicator suspend/resume. See
+        # CheckpointEngineConfig.suspend_nccl_comms and RFC verl-project/verl#6266.
+        self.suspend_nccl_comms_enabled: bool = bool(getattr(config, "suspend_nccl_comms", False))
+
+    def _suspend_training_nccl_comms(self) -> None:
+        """Fan out a suspend RPC to every training worker (no-op if disabled).
+
+        The RPC is registered with default ``blocking=True``, so the worker
+        group's wrapper already calls ``ray.get`` internally and returns a
+        list of :class:`SuspendResult` (one per worker). We ignore the list
+        here; per-comm telemetry is in each worker's logs.
+        """
+        if not self.suspend_nccl_comms_enabled:
+            return
+        self.trainer.suspend_training_nccl_comms()
+
+    def _resume_training_nccl_comms(self) -> None:
+        """Fan out a resume RPC to every training worker (no-op if disabled).
+
+        See :meth:`_suspend_training_nccl_comms` for the dispatch contract.
+        """
+        if not self.suspend_nccl_comms_enabled:
+            return
+        self.trainer.resume_training_nccl_comms()
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
@@ -408,8 +432,14 @@ class CheckpointEngineManager:
 
     @auto_await
     async def sleep_replicas(self):
-        """Sleep all rollout replicas: free weight and kv_cache device memory."""
+        """Sleep all rollout replicas: free weight and kv_cache device memory.
+
+        Also resumes training-side NCCL communicators (if previously suspended)
+        since the training phase begins next. No-op when suspend_nccl_comms is
+        disabled.
+        """
         await asyncio.gather(*[r.sleep() for r in self.replicas])
+        self._resume_training_nccl_comms()
 
     @auto_await
     async def wake_up_replicas(self):
@@ -448,6 +478,10 @@ class CheckpointEngineManager:
     async def update_weights(self, global_steps: int = None):
         """Update weights from trainer to rollout replicas.
 
+        On exit, suspends training-side NCCL communicators (if enabled) since
+        the rollout phase begins next and the training NCCL channel buffers
+        are idle until the next training step.
+
         Args:
             global_steps: The global steps of the trainer.
         """
@@ -455,6 +489,7 @@ class CheckpointEngineManager:
         # 0. update weights for sync training with colocated trainer and rollout
         if self.backend == "naive":
             ray.get(self.trainer.update_weights(global_steps=global_steps, mode=self.backend))
+            self._suspend_training_nccl_comms()
             return
 
         # 1. abort and save all unfinished requests for partial rollout
@@ -490,6 +525,9 @@ class CheckpointEngineManager:
 
         # 8. resume all unfinished requests for partial rollout
         await self.resume_generation_replicas()
+
+        # 9. suspend training-side NCCL comms — rollout is now serving
+        self._suspend_training_nccl_comms()
 
 
 async def split_weight_chunks(

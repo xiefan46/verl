@@ -742,6 +742,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self.base_sync_done = True
         set_expandable_segments(True)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def suspend_training_nccl_comms(self):
+        """Suspend the actor's NCCL communicators to free GPU memory while idle.
+
+        Dispatches to the engine-native :meth:`BaseEngine.suspend_nccl_comms`
+        API, which is a no-op on engines that haven't implemented it (e.g. FSDP
+        in the current PR). Megatron uses Method A reflection over
+        ``parallel_state``. See RFC verl-project/verl#6266.
+        """
+        if self.actor is None:
+            return None
+        return self.actor.engine.suspend_nccl_comms()
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def resume_training_nccl_comms(self):
+        """Reverse of :meth:`suspend_training_nccl_comms`. Idempotent."""
+        if self.actor is None:
+            return None
+        return self.actor.engine.resume_nccl_comms()
+
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):
         """Execute checkpoint engine method.
