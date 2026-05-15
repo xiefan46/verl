@@ -749,17 +749,17 @@ class MegatronEngine(BaseEngine):
     def suspend_nccl_comms(self, *, measure_per_comm: bool = False):
         """Suspend all warm Megatron NCCL communicators (Method A: parallel_state reflection).
 
-        See :func:`verl.utils.nccl_suspend.suspend_via_parallel_state` for the
-        enumeration policy. Gracefully no-ops on NCCL < 2.29.7.
+        See :func:`verl.workers.engine.megatron.utils.suspend_via_parallel_state`
+        for the enumeration policy. Gracefully no-ops on NCCL < 2.29.7.
         """
-        from verl.utils.nccl_suspend import suspend_via_parallel_state
+        from verl.workers.engine.megatron.utils import suspend_via_parallel_state
 
         return suspend_via_parallel_state(measure_per_comm=measure_per_comm)
 
     def resume_nccl_comms(self, *, measure_per_comm: bool = False):
         """Resume the Megatron NCCL comms suspended by the last
         :meth:`suspend_nccl_comms` call. Idempotent."""
-        from verl.utils.nccl_suspend import resume_via_parallel_state
+        from verl.workers.engine.megatron.utils import resume_via_parallel_state
 
         return resume_via_parallel_state(measure_per_comm=measure_per_comm)
 

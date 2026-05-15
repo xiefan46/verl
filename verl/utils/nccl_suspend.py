@@ -11,17 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""NCCL communicator suspend/resume utilities for colocated mode.
+"""NCCL communicator suspend/resume primitives.
 
-Uses the NCCL 2.29.7+ native ``ncclCommSuspend`` / ``ncclCommResume`` API
-(loaded via ctypes from ``libnccl.so.2``) to release the GPU memory held by
-idle communicators during sleep/wake transitions. On older NCCL the public
-entry points gracefully no-op so callers can enable the feature unconditionally.
+Provides a ctypes shim over NCCL 2.29.7+'s native ``ncclCommSuspend`` /
+``ncclCommResume`` API (loaded from ``libnccl.so.2``) plus batch helpers for
+releasing the GPU memory held by idle communicators. Backend engines supply
+their own enumeration of warm ``ncclComm_t`` handles and pass the resulting
+``[(name, handle)]`` list to :func:`suspend_batch` / :func:`resume_batch`.
+The Megatron enumeration (Method A: reflective scan of
+``megatron.core.parallel_state``'s named group globals) lives in
+``verl/workers/engine/megatron/utils.py``.
 
-This module implements **Method A**: a reflective scan of
-``megatron.core.parallel_state``'s named group globals. Other training
-backends are expected to land their own enumeration strategy when they
-expose an engine-native suspend/resume API.
+On older NCCL the public entry points gracefully no-op (``is_supported()``
+returns ``False``) so callers can enable the feature unconditionally.
 
 References:
   * RFC: https://github.com/verl-project/verl/issues/6266
@@ -162,8 +164,11 @@ def _resume_one(handle: int) -> bool:
     return True
 
 
-def _suspend_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool) -> SuspendResult:
-    """Suspend a batch of ``(name, handle)`` communicators.
+def suspend_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool = False) -> SuspendResult:
+    """Suspend a batch of ``(name, handle)`` NCCL communicators.
+
+    Engine-specific helpers (e.g. Method A reflection over Megatron's
+    ``parallel_state``) collect warm ``ncclComm_t`` handles and pass them here.
 
     When ``measure_per_comm`` is True, inserts ``empty_cache + synchronize``
     between each suspend so the freed memory can be attributed to individual
@@ -202,8 +207,8 @@ def _suspend_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool) ->
     return SuspendResult(success=n_ok > 0, freed_mb=freed_mb, total_ms=total_ms, comms=comms_stats)
 
 
-def _resume_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool) -> ResumeResult:
-    """Resume a batch of ``(name, handle)`` communicators."""
+def resume_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool = False) -> ResumeResult:
+    """Resume a batch of ``(name, handle)`` NCCL communicators."""
     if not handles:
         return ResumeResult(success=False, skipped_reason="no_warm_comms")
 
@@ -237,138 +242,3 @@ def _resume_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool) -> 
         reclaimed_mb,
     )
     return ResumeResult(success=n_ok > 0, reclaimed_mb=reclaimed_mb, total_ms=total_ms, comms=comms_stats)
-
-
-# Module state for idempotent suspend/resume of Megatron communicators.
-_megatron_suspended: bool = False
-_megatron_suspended_handles: list[tuple[str, int]] = []
-
-
-def _collect_megatron_comms() -> list[tuple[str, int]]:
-    """Reflect over ``megatron.core.parallel_state``'s named globals to collect
-    every warm NCCL ``ncclComm_t`` handle.
-
-    Walks module-level attributes matching ``_*GROUP*`` and skips ``_*GLOO*``
-    (CPU-only). Handles three container shapes Megatron uses for its group
-    globals:
-
-      * Singleton ``ProcessGroup`` (most groups, e.g. ``_TENSOR_MODEL_PARALLEL_GROUP``)
-      * List of groups (``_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS``)
-      * Dict of groups (``_HYBRID_DP_CP_GROUPS``)
-
-    Deduplicates by ``ncclComm_t`` handle: PyTorch may share an underlying
-    communicator across multiple ``ProcessGroup`` objects with the same rank
-    set, and ``ncclCommSuspend`` errors when called twice on the same handle.
-
-    Returns ``[(display_name, handle_int), ...]``. Empty list if Megatron is
-    unavailable or model parallel is not yet initialized.
-    """
-    try:
-        from megatron.core import parallel_state as ps
-    except ImportError:
-        logger.debug("megatron.core.parallel_state not importable; skipping comm collection.")
-        return []
-
-    try:
-        if not ps.model_parallel_is_initialized():
-            logger.debug("Megatron model parallel not initialized; skipping comm collection.")
-            return []
-    except Exception as e:
-        logger.debug("Megatron model_parallel_is_initialized check failed: %s", e)
-        return []
-
-    handles: list[tuple[str, int]] = []
-    seen_ptrs: set[int] = set()
-
-    for attr_name in sorted(dir(ps)):
-        if not attr_name.startswith("_") or "GROUP" not in attr_name or "GLOO" in attr_name:
-            continue
-        attr = getattr(ps, attr_name, None)
-        if attr is None:
-            continue
-
-        if isinstance(attr, dict):
-            items = [(f"{attr_name.lstrip('_')}[{k}]", v) for k, v in attr.items()]
-        elif isinstance(attr, list | tuple):
-            items = [(f"{attr_name.lstrip('_')}[{i}]", v) for i, v in enumerate(attr)]
-        else:
-            items = [(attr_name.lstrip("_"), attr)]
-
-        for label, pg in items:
-            if pg is None:
-                continue
-            try:
-                backend = pg._get_backend(torch.device("cuda"))
-            except Exception:
-                continue
-            if not hasattr(backend, "_comm_ptr"):
-                continue
-            try:
-                ptr = backend._comm_ptr()
-            except Exception:
-                continue
-            if ptr == 0 or ptr in seen_ptrs:
-                continue
-            seen_ptrs.add(ptr)
-            handles.append((label, int(ptr)))
-
-    logger.info(
-        "Method A discovered %d warm Megatron NCCL comm(s): %s",
-        len(handles),
-        [name for name, _ in handles],
-    )
-    return handles
-
-
-def suspend_via_parallel_state(*, measure_per_comm: bool = False) -> SuspendResult:
-    """Suspend all warm NCCL comms reachable via ``megatron.core.parallel_state``.
-
-    Idempotent: if already suspended, returns a no-op result.
-
-    Args:
-        measure_per_comm: When True, attribute freed memory per communicator.
-            Adds ~5-10 ms per comm; intended for tests, off in production.
-    """
-    global _megatron_suspended, _megatron_suspended_handles
-
-    if not is_supported():
-        return SuspendResult(success=False, skipped_reason="nccl_too_old")
-
-    if _megatron_suspended:
-        logger.debug("Megatron NCCL comms already suspended; no-op.")
-        return SuspendResult(success=False, skipped_reason="already_suspended")
-
-    handles = _collect_megatron_comms()
-    if not handles:
-        return SuspendResult(success=False, skipped_reason="no_warm_comms")
-
-    result = _suspend_batch(handles, measure_per_comm=measure_per_comm)
-    if result.success:
-        _megatron_suspended = True
-        _megatron_suspended_handles = handles
-    return result
-
-
-def resume_via_parallel_state(*, measure_per_comm: bool = False) -> ResumeResult:
-    """Resume the Megatron NCCL comms suspended by the last
-    :func:`suspend_via_parallel_state` call.
-
-    Idempotent: if not suspended, returns a no-op result.
-    """
-    global _megatron_suspended
-
-    if not is_supported():
-        return ResumeResult(success=False, skipped_reason="nccl_too_old")
-
-    if not _megatron_suspended:
-        logger.debug("Megatron NCCL comms not suspended; no-op.")
-        return ResumeResult(success=False, skipped_reason="not_suspended")
-
-    handles = _megatron_suspended_handles
-    if not handles:
-        return ResumeResult(success=False, skipped_reason="no_warm_comms")
-
-    result = _resume_batch(handles, measure_per_comm=measure_per_comm)
-    if result.success:
-        _megatron_suspended = False
-    return result
