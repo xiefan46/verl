@@ -58,11 +58,16 @@ def _maybe_skip_magi_import():
         pytest.skip(f"magi_attention not installed: {exc}")
 
 
-def _build_tiny_llama(num_heads_q: int = 8, num_heads_kv: int = 2, hidden_size: int = 256):
+def _build_tiny_llama(num_heads_q: int = 8, num_heads_kv: int = 2, hidden_size: int = 512):
     """Construct a tiny Llama-shaped model for fast equivalence tests.
 
     Uses HF AutoModel to get the standard attention dispatch. Returns the
     model and its config (so the test can read num_heads / head_dim).
+
+    ``hidden_size`` defaults to 512 so head_dim=64 (8 q heads), which matches
+    one of MagiAttention's two AOT-precompiled FFA shapes (the other is 128).
+    Smaller head dims like 32 fail with ``Expected head_size <= max_headdim``
+    because the FFA kernel only ships D=64/128 variants.
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 

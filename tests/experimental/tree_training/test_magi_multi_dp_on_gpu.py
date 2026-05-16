@@ -84,11 +84,12 @@ def _build_tiny_llama_for_fsdp():
 
     register_tree_attention()
 
+    # hidden=256 / heads=4 = D=64 (FFA AOT preset; D=32 unsupported by kernel).
     config = AutoConfig.for_model(
         "llama",
         vocab_size=512,
-        hidden_size=128,
-        intermediate_size=256,
+        hidden_size=256,
+        intermediate_size=512,
         num_attention_heads=4,
         num_key_value_heads=2,
         num_hidden_layers=2,
