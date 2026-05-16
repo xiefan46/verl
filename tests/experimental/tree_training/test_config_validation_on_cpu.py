@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fail-fast validation tests for tree training configuration (Task 2.2).
+"""Fail-fast validation tests for tree training configuration (Task 2.2 + Phase D.3).
 
-Covers the 8 incompatible configurations that should raise immediately when
+Covers the incompatible configurations that should raise immediately when
 ``actor.use_tree_training=True``:
 
   Local (in ActorConfig / FSDPActorConfig / McoreActorConfig __post_init__):
@@ -23,11 +23,14 @@ Covers the 8 incompatible configurations that should raise immediately when
     3. actor.fsdp_config.ulysses_sequence_parallel_size > 1
     4. actor.strategy=megatron (any McoreActorConfig)
     5. tree_training.max_tokens_per_mb not a positive multiple of 128
+    6. actor.strategy != "fsdp2" (MagiAttention requires FSDP2, Phase D.3)
+    7. tree_training.tree_cp_size < 1 (Phase D.3)
+    8. tree_training.tree_cp_size > 1 (V1 not implemented, Phase D.3)
 
   Cross-section (in RayPPOTrainer._validate_tree_training_compatibility):
-    6. trainer.balance_batch=True
-    7. use_critic (gae adv_estimator etc)
-    8. actor.use_prefix_grouper=True
+    9. trainer.balance_batch=True
+   10. use_critic (gae adv_estimator etc)
+   11. actor.use_prefix_grouper=True
 
 CPU-only — pure dataclass validation, no model / GPU / Ray.
 """
@@ -109,6 +112,25 @@ class TestTreeTrainingConfigPostInit(unittest.TestCase):
         with pytest.raises(ValueError, match="positive multiple of 128"):
             TreeTrainingConfig(max_tokens_per_mb=-128)
 
+    def test_d_t23_tree_cp_size_default_one(self):
+        """Phase D.3: tree_cp_size defaults to 1 (V1 supported value)."""
+        cfg = TreeTrainingConfig()
+        self.assertEqual(cfg.tree_cp_size, 1)
+
+    def test_d_t24_tree_cp_size_zero_raises(self):
+        """Phase D.3: tree_cp_size must be >= 1."""
+        with pytest.raises(ValueError, match="tree_cp_size must be >= 1"):
+            TreeTrainingConfig(tree_cp_size=0)
+        with pytest.raises(ValueError, match="tree_cp_size must be >= 1"):
+            TreeTrainingConfig(tree_cp_size=-1)
+
+    def test_d_t25_tree_cp_size_greater_than_one_raises_v1(self):
+        """Phase D.3: tree_cp_size > 1 is V3 scope; V1 must raise."""
+        with pytest.raises(NotImplementedError, match="V3 scope"):
+            TreeTrainingConfig(tree_cp_size=2)
+        with pytest.raises(NotImplementedError, match="V3 scope"):
+            TreeTrainingConfig(tree_cp_size=8)
+
 
 class TestActorConfigTreeTrainingChecks(unittest.TestCase):
     """ActorConfig.__post_init__ tree training compatibility checks."""
@@ -133,20 +155,22 @@ class TestActorConfigTreeTrainingChecks(unittest.TestCase):
             )
 
     def test_tree_training_clean_ok(self):
-        """Bare tree training enable with no conflicting fields — should succeed."""
-        cfg = omega_conf_to_dataclass(_make_fsdp_actor_dict(use_tree_training=True))
+        """Bare tree training enable with FSDP2 — should succeed."""
+        cfg = omega_conf_to_dataclass(_make_fsdp_actor_dict(use_tree_training=True, strategy="fsdp2"))
         self.assertTrue(cfg.use_tree_training)
         self.assertEqual(cfg.tree_training.max_tokens_per_mb, 4096)
+        self.assertEqual(cfg.tree_training.tree_cp_size, 1)
 
 
 class TestFSDPActorConfigTreeTrainingChecks(unittest.TestCase):
-    """FSDPActorConfig.__post_init__ ulysses_sp check."""
+    """FSDPActorConfig.__post_init__ ulysses_sp + FSDP2 strategy checks."""
 
     def test_tree_training_with_ulysses_sp_raises(self):
         with pytest.raises(InstantiationException, match="ulysses_sequence_parallel_size"):
             omega_conf_to_dataclass(
                 _make_fsdp_actor_dict(
                     use_tree_training=True,
+                    strategy="fsdp2",
                     ulysses_sequence_parallel_size=2,
                 )
             )
@@ -155,10 +179,26 @@ class TestFSDPActorConfigTreeTrainingChecks(unittest.TestCase):
         cfg = omega_conf_to_dataclass(
             _make_fsdp_actor_dict(
                 use_tree_training=True,
+                strategy="fsdp2",
                 ulysses_sequence_parallel_size=1,
             )
         )
         self.assertEqual(cfg.ulysses_sequence_parallel_size, 1)
+
+    def test_d_t26_tree_training_with_fsdp1_raises(self):
+        """Phase D.3: use_tree_training=True + strategy="fsdp" (FSDP1) must raise.
+
+        MagiAttention's official integration uses torch.distributed._composable.fsdp
+        (FSDP2). FSDP1 is not supported per research/2026-05-16-magi-integration-plan-v2.md §13.
+        """
+        with pytest.raises(InstantiationException, match="fsdp2"):
+            omega_conf_to_dataclass(_make_fsdp_actor_dict(use_tree_training=True, strategy="fsdp"))
+
+    def test_d_t26b_tree_training_with_fsdp2_ok(self):
+        """Phase D.3: strategy="fsdp2" + use_tree_training=True is the supported combo."""
+        cfg = omega_conf_to_dataclass(_make_fsdp_actor_dict(use_tree_training=True, strategy="fsdp2"))
+        self.assertEqual(cfg.strategy, "fsdp2")
+        self.assertTrue(cfg.use_tree_training)
 
 
 class TestMcoreActorConfigTreeTrainingChecks(unittest.TestCase):

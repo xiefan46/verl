@@ -102,34 +102,44 @@ class PolicyLossConfig(BaseConfig):
 
 @dataclass
 class TreeTrainingConfig(BaseConfig):
-    """Configuration for tree training (vendored from AReaL-DTA, paper arXiv:2602.00482).
+    """Configuration for tree training (MagiAttention-backed, V1 FSDP-only).
 
-    Tree training packs prompt-sharing rollouts into a trie + custom block mask,
-    so the shared prefix only goes through the model once. Only effective when
-    ``actor.use_tree_training=True``. See ``verl/experimental/tree_training/`` for
-    the algorithm and ``research/2026-05-12-tree-training-phase2-design.md`` for
-    the integration design.
+    Tree training packs prompt-sharing rollouts into a trie and routes attention
+    through MagiAttention's ``flex_flash_attn_func`` so the shared prefix only goes
+    through the model once. Only effective when ``actor.use_tree_training=True``.
+    See ``verl/experimental/tree_training/`` for the algorithm and
+    ``research/2026-05-16-magi-integration-plan-v2.md`` for the integration design.
 
     Args:
         max_tokens_per_mb (int): Max tokens per packed micro-batch. Must be a
-            positive multiple of 128 (flex_attention BLOCK_SIZE alignment).
+            positive multiple of 128 (greedy packer block alignment).
         pad_to_maximum (bool): If True, pad each tree to max_tokens_per_mb. Required
-            for block-mask attention. Kept as a config field for forward-compat but
-            currently must be True; non-padded paths are not supported in MVP.
+            in MVP; non-padded paths are not supported.
         chunk_size (int): Chunk size for gather_packed_tree_logprobs (memory-
             efficient processing along the sequence dimension).
+        tree_cp_size (int): Magi context-parallel size. V1 is locked to 1
+            (no actual CP sharding; cp_group is a 1-rank group). V3 enables
+            cp_size>1 by extending verl FSDP wrap to a (dp, cp) 2D mesh.
     """
 
     max_tokens_per_mb: int = 4096
     pad_to_maximum: bool = True
     chunk_size: int = 1024
+    tree_cp_size: int = 1
 
     def __post_init__(self):
         """Validate tree training configuration."""
         if self.max_tokens_per_mb <= 0 or self.max_tokens_per_mb % 128 != 0:
             raise ValueError(
                 f"tree_training.max_tokens_per_mb must be a positive multiple of 128 "
-                f"(flex_attention BLOCK_SIZE), got {self.max_tokens_per_mb}"
+                f"(greedy packer block alignment), got {self.max_tokens_per_mb}"
+            )
+        if self.tree_cp_size < 1:
+            raise ValueError(f"tree_training.tree_cp_size must be >= 1, got {self.tree_cp_size}")
+        if self.tree_cp_size > 1:
+            raise NotImplementedError(
+                f"tree_training.tree_cp_size > 1 is V3 scope (verl FSDP 2D mesh "
+                f"required). V1 supports tree_cp_size=1 only; got {self.tree_cp_size}."
             )
 
 
@@ -388,6 +398,20 @@ class FSDPActorConfig(ActorConfig):
                 "Tree training does not support ulysses_sequence_parallel_size > 1 (MVP). "
                 f"Got ulysses_sequence_parallel_size={self.ulysses_sequence_parallel_size}. "
                 "Set actor.fsdp_config.ulysses_sequence_parallel_size=1."
+            )
+
+        # MagiAttention's official integration uses torch.distributed._composable.fsdp
+        # (FSDP2) and the HuggingFace Accelerate docs state that context parallelism
+        # is only supported with FSDP2. The tree training path therefore requires
+        # actor.strategy="fsdp2"; FSDP1 ("fsdp") is unsupported.
+        # See research/2026-05-16-magi-integration-plan-v2.md §13.
+        if self.use_tree_training and self.strategy != "fsdp2":
+            raise NotImplementedError(
+                f"Tree training (MagiAttention path) requires actor.strategy='fsdp2', "
+                f"got actor.strategy={self.strategy!r}. FSDP1 is not supported because "
+                f"MagiAttention's official examples use torch.distributed._composable.fsdp "
+                f"(fully_shard) and HF Accelerate restricts CP to FSDP2. "
+                f"Set actor.strategy=fsdp2."
             )
 
     def validate(self, n_gpus: int, train_batch_size: int, model_config: dict = None):
