@@ -66,6 +66,10 @@ def _build_tiny_llama(num_heads_q: int = 8, num_heads_kv: int = 2, hidden_size: 
     """
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    from verl.experimental.tree_training._magi_backend import register_tree_attention
+
+    register_tree_attention()
+
     # Minimal Llama-like config.
     config = AutoConfig.for_model(
         "llama",
@@ -241,6 +245,10 @@ def _resolve_qwen_path() -> str | None:
 
 def _build_qwen_instruct(model_path: str):
     from transformers import AutoConfig, AutoModelForCausalLM
+
+    from verl.experimental.tree_training._magi_backend import register_tree_attention
+
+    register_tree_attention()
 
     config = AutoConfig.from_pretrained(model_path)
     config._attn_implementation = "Magi_Tree_Attention"

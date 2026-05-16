@@ -80,6 +80,10 @@ def _init_dist() -> tuple[int, int]:
 def _build_tiny_llama_for_fsdp():
     from transformers import AutoConfig, AutoModelForCausalLM
 
+    from verl.experimental.tree_training._magi_backend import register_tree_attention
+
+    register_tree_attention()
+
     config = AutoConfig.for_model(
         "llama",
         vocab_size=512,
