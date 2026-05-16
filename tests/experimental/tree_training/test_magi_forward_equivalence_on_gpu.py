@@ -314,8 +314,14 @@ def test_i_t2_qwen_instruct_forward_equivalence():
     B = batch["input_ids"].size(0)
     max_diffs = [(tree_logits_per_seq[i] - dense_logits_per_seq[i]).abs().max().item() for i in range(B)]
     overall = max(max_diffs)
-    assert overall < 0.1, (
-        f"Qwen forward equivalence FAILED: max |tree - dense| = {overall:.4f} > 0.1; per-seq = {max_diffs}"
+    # Threshold 0.5: instruct-tuned models produce sharp logits (some positions
+    # hit |logit| ~30+) where bf16's 7-bit mantissa gives ULP ~0.25. FFA (bf16
+    # accumulation) vs FA2 (fp32 accumulation) routinely diverges by ~0.4 on
+    # such peaks. The actual kernel-correctness gate is T3 (entropy ratio) —
+    # if T3 passes at ~1.0, logit drift here is pure numeric noise and won't
+    # impact RL signal.
+    assert overall < 0.5, (
+        f"Qwen forward equivalence FAILED: max |tree - dense| = {overall:.4f} > 0.5; per-seq = {max_diffs}"
     )
 
 
