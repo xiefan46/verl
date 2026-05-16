@@ -259,12 +259,29 @@ def _magi_tree_attention_forward(
     """
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
+    def _fa2_fallback():
+        # HF's flash_attention_forward reads ``attn_implementation`` from
+        # ``module.config._attn_implementation`` and passes it to a lazy kernel
+        # loader. Our config is set to "Magi_Tree_Attention" so the loader will
+        # crash (no such kernel on the hub). Temporarily flip config to
+        # "flash_attention_2" for the duration of the call. Single-threaded
+        # forward so no race window matters in practice.
+        config_obj = getattr(module, "config", None)
+        orig_impl = getattr(config_obj, "_attn_implementation", None) if config_obj else None
+        if config_obj is not None:
+            config_obj._attn_implementation = "flash_attention_2"
+        try:
+            return ALL_ATTENTION_FUNCTIONS["flash_attention_2"](
+                module, query, key, value, attention_mask, scaling, dropout, **kwargs
+            )
+        finally:
+            if config_obj is not None and orig_impl is not None:
+                config_obj._attn_implementation = orig_impl
+
     cp_group = getattr(module, "cp_group", None)
     if cp_group is None:
         # Module was not set up for tree training. Fall through.
-        return ALL_ATTENTION_FUNCTIONS["flash_attention_2"](
-            module, query, key, value, attention_mask, scaling, dropout, **kwargs
-        )
+        return _fa2_fallback()
 
     # Lazy import: avoid making this module require magi_attention at load time.
     from einops import rearrange
@@ -273,9 +290,7 @@ def _magi_tree_attention_forward(
     magi_attn_key = get_most_recent_key(cp_group)
     if magi_attn_key is None:
         # cp_group is set but no key registered for this forward — non-tree call.
-        return ALL_ATTENTION_FUNCTIONS["flash_attention_2"](
-            module, query, key, value, attention_mask, scaling, dropout, **kwargs
-        )
+        return _fa2_fallback()
 
     orig_dtype = query.dtype
 
