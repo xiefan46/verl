@@ -179,7 +179,8 @@ def h_t5_bwd_vs_dense() -> None:
     from magi_attention.api import flex_flash_attn_func
 
     torch.manual_seed(42)
-    T, H, D = 16, 2, 32
+    # D=64 to hit AOT-precompiled FFA kernel (D=32 falls back to JIT).
+    T, H, D = 16, 2, 64
     q = torch.randn(T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
     k = torch.randn(T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
     v = torch.randn(T, H, D, device=DEVICE, dtype=DTYPE, requires_grad=True)
@@ -247,7 +248,7 @@ def h_t6_dispatch_roundtrip_cp1() -> None:
         total_seqlen_k=T,
         num_heads_q=4,
         num_heads_kv=2,
-        head_dim=32,
+        head_dim=64,  # AOT-precompiled (D=32 hits JIT fallback)
         pad_size=pad,
         chunk_size=512,
         cp_group_or_mesh=cp_group,
