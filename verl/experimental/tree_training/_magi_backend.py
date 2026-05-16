@@ -266,13 +266,25 @@ def _magi_tree_attention_forward(
         # crash (no such kernel on the hub). Temporarily flip config to
         # "flash_attention_2" for the duration of the call. Single-threaded
         # forward so no race window matters in practice.
+        #
+        # Pass scaling/dropout as keywords — HF's flash_attention_forward
+        # signature is (module, q, k, v, attention_mask, scaling, softmax_scale,
+        # sliding_window, softcap, is_causal, dropout, **kwargs). Positional
+        # 7th would land in softmax_scale and zero out attention -> NaN.
         config_obj = getattr(module, "config", None)
         orig_impl = getattr(config_obj, "_attn_implementation", None) if config_obj else None
         if config_obj is not None:
             config_obj._attn_implementation = "flash_attention_2"
         try:
             return ALL_ATTENTION_FUNCTIONS["flash_attention_2"](
-                module, query, key, value, attention_mask, scaling, dropout, **kwargs
+                module,
+                query,
+                key,
+                value,
+                attention_mask,
+                scaling=scaling,
+                dropout=dropout,
+                **kwargs,
             )
         finally:
             if config_obj is not None and orig_impl is not None:
