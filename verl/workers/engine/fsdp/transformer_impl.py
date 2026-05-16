@@ -253,24 +253,36 @@ class FSDPEngine(BaseEngine):
             else entropy_from_logits
         )
 
-        # Tree training: one-time global flash_attention monkey-patch + cache the
-        # resolved max_tokens_per_mb so forward_backward_batch can build the
-        # MicroBatchSpec without re-reading the config each call. The patch is
-        # global — same-process non-tree models fall back to the original
-        # flash_attention via the early-return in _tree_attn_fwd_func.
+        # Tree training (V1 MagiAttention path, FSDP2 + cp_size=1).
+        # ``register_tree_attention`` is process-global and idempotent — installs
+        # ``Magi_Tree_Attention`` into HF's ``ALL_ATTENTION_FUNCTIONS`` registry.
+        # ``TreeCPContext.setup_model`` runs once per engine (during ``init_model``
+        # below, after the HF model is loaded) to propagate ``cp_group`` onto
+        # attention sub-modules and flip ``model.config._attn_implementation``.
+        # See research/2026-05-16-magi-integration-plan-v2.md §1, §5.
         self._use_tree_training = getattr(self.engine_config, "use_tree_training", False)
         if self._use_tree_training:
-            from verl.experimental.tree_training.module_fsdp import patch_fsdp_for_tree_training
+            from verl.experimental.tree_training._magi_backend import (
+                TreeCPContext,
+                register_tree_attention,
+            )
 
             self._tree_max_tokens_per_mb = int(getattr(self.engine_config, "tree_training_max_tokens_per_mb", 4096))
-            patch_fsdp_for_tree_training(enable=True)
+            # V1 locks tree_cp_size=1 (no real CP); engine_config carries the
+            # field for V3 forward-compat but Magi backend handles cp_size=1
+            # specially (single-rank cp_group or None).
+            tree_cp_size = int(getattr(self.engine_config, "tree_cp_size", 1))
+            register_tree_attention()
+            self._tree_cp_ctx = TreeCPContext(cp_size=tree_cp_size)
             logger.info(
-                f"[FSDPEngine] Tree training enabled, max_tokens_per_mb={self._tree_max_tokens_per_mb}. "
-                "flash_attention_forward has been globally patched; non-tree forwards on this "
-                "process fall back to the original flash_attention."
+                f"[FSDPEngine] Tree training (MagiAttention) enabled, "
+                f"max_tokens_per_mb={self._tree_max_tokens_per_mb}, tree_cp_size={tree_cp_size}. "
+                "Magi_Tree_Attention registered in HF ALL_ATTENTION_FUNCTIONS; "
+                "cp_group will propagate to attention modules at model load."
             )
         else:
             self._tree_max_tokens_per_mb = None
+            self._tree_cp_ctx = None
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -682,6 +694,18 @@ class FSDPEngine(BaseEngine):
         self.module = module
         self.optimizer = optimizer
         self.lr_scheduler = lr_scheduler
+
+        # Tree training: propagate cp_group onto attention sub-modules and flip
+        # model.config._attn_implementation to "Magi_Tree_Attention". Done
+        # post-FSDP-wrap because FSDP2 ``fully_shard`` preserves user attribute
+        # assignments and HF resolves ``_attn_implementation`` at each forward
+        # call via ``ALL_ATTENTION_FUNCTIONS`` (no bake-in at model load).
+        if self._use_tree_training and self._tree_cp_ctx is not None:
+            self._tree_cp_ctx.setup_model(self.module)
+            logger.info(
+                "[FSDPEngine] TreeCPContext.setup_model done: cp_group propagated to attention "
+                "modules, attn_implementation set to Magi_Tree_Attention."
+            )
 
     def train_mode(self, **kwargs):
         """
@@ -1394,12 +1418,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
             return loss, output
 
     def _forward_step_tree(self, mb: dict, loss_function, forward_only):
-        """Tree-training forward_step variant.
+        """Tree-training forward_step variant (MagiAttention path, V1).
 
         ``mb`` is a plain dict from :func:`_verl_adapter.build_tree_mb_list`
-        (not a TensorDict). The packed input has shape ``[1, T_padded]``;
-        the model forward goes through the globally-patched flash_attention
-        which reads ``tree_block_mask`` from kwargs and routes to flex_attention.
+        (not a TensorDict). The packed input has shape ``[1, T_padded]``.
+
+        The model forward is wrapped in a :func:`_magi_backend.tree_attn_scope`
+        context which builds Magi's ``magi_attn_flex_key`` runtime key and
+        registers it for ``cp_group``. Each attention layer's
+        ``Magi_Tree_Attention`` forward (registered into HF's
+        ``ALL_ATTENTION_FUNCTIONS``) retrieves the key via ``get_most_recent_key``
+        and routes through ``calc_attn``.
 
         Two output shapes depending on ``loss_function``:
 
@@ -1407,18 +1436,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
           ``model_output`` carries flat 1-D ``log_probs`` in trie order plus
           packed extras (advantages / old_log_probs / response_mask), so the
           ppo_loss tree branch (Task 2.5) can route via ``is_tree_packed=True``
-          and call :func:`align_packed_extras_to_labels`. The loss runs
-          inline within the mb iteration; the ``model_output`` is later
-          discarded by ``_postprocess_tree_batch`` on this path.
+          and call :func:`align_packed_extras_to_labels`.
 
         - **Forward-only path** (``loss_function is None``, e.g.
           ``compute_log_prob``): ``model_output`` carries per-seq dicts
           (``log_probs_per_seq``, optional ``entropy_per_seq``) keyed by
           original input row index, plus the ``trie``. Downstream
-          ``_postprocess_tree_batch`` assembles these into nested tensors
-          aligned with the engine-side TensorDict row order so the trainer
-          sees the same shape as the non-tree path.
+          ``_postprocess_tree_batch`` assembles these into nested tensors.
         """
+        from verl.experimental.tree_training._magi_backend import tree_attn_scope
         from verl.experimental.tree_training._verl_adapter import (
             build_tree_model_inputs,
             unpack_tree_logprobs_per_seq,
@@ -1447,11 +1473,22 @@ class FSDPEngineWithLMHead(FSDPEngine):
         if "routed_experts" in mb_on_device and mb_on_device["routed_experts"] is not None:
             raise NotImplementedError("Tree training does not yet support MoE routed_experts.")
 
-        model_inputs, output_args = build_tree_model_inputs(
+        model_inputs, output_args, scope_args = build_tree_model_inputs(
             mb_on_device, device_id, extra_inputs={"temperature": temperature}
         )
         trie = output_args["trie"]
         packed_input_ids = output_args["packed_input_ids"]
+
+        # Magi attention scope kwargs (model shape info supplied by engine).
+        model_config = self.module.config if hasattr(self.module, "config") else self.module.module.config
+        scope_args["num_heads_q"] = model_config.num_attention_heads
+        scope_args["num_heads_kv"] = getattr(model_config, "num_key_value_heads", model_config.num_attention_heads)
+        scope_args["head_dim"] = getattr(
+            model_config,
+            "head_dim",
+            model_config.hidden_size // model_config.num_attention_heads,
+        )
+        scope_args["cp_group"] = self._tree_cp_ctx.cp_group if self._tree_cp_ctx is not None else None
 
         autocast_dtype = getattr(self, "_autocast_dtype", torch.bfloat16)
         autocast_ctx: ContextManager = (
@@ -1460,7 +1497,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=local_device_name, dtype=autocast_dtype)
         )
 
-        with autocast_ctx:
+        with autocast_ctx, tree_attn_scope(**scope_args):
+            # tree_attn_scope registers the Magi runtime key keyed by cp_group;
+            # the HF-registered ``Magi_Tree_Attention`` forward inside each
+            # layer retrieves it via ``get_most_recent_key`` and calls
+            # ``calc_attn`` (CP-aware; no-op redistribution at cp_size=1).
             raw_output = self.module(**model_inputs, use_cache=False)
             logits = raw_output.logits.squeeze(0).float()  # [T_padded, V]
 

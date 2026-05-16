@@ -12,60 +12,36 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-#
-# This file is copied (with modifications) from AReaL:
-#   https://github.com/inclusionAI/AReaL
-# Original location: areal/models/tree_attn/module.py
-#
-# Based on the AReaL-DTA paper (arXiv:2602.00482):
-#   "AReaL-DTA: Dynamic Tree Attention for Efficient Reinforcement Learning
-#    of Large Language Models"
-#   Jiarui Zhang, Yuchen Yang, Ran Yan, Zhiyu Mei, Liyuan Zhang, Daifeng Li,
-#   Wei Fu, Jiaxuan Gao, Shusheng Xu, Yi Wu, Binhang Yuan
-#   https://arxiv.org/abs/2602.00482
 
-from verl.experimental.tree_training.constants import USE_TRITON_TREE_ATTN
-from verl.experimental.tree_training.module_fsdp import (
-    create_block_mask_from_dense,
-    patch_fsdp_for_tree_training,
-    restore_patch_fsdp_for_tree_training,
+"""Public re-export hub for the tree training package.
+
+MagiAttention-backed entry points (V1 FSDP2-only). The previous flex_attention
+re-exports (``create_block_mask_from_dense``, ``patch_fsdp_for_tree_training``,
+``build_block_mask_from_trie``, ``build_tree_attn_kwargs``, etc.) are gone — see
+``_areal_legacy/`` for the archived flex_attention implementation and
+``research/2026-05-16-magi-integration-plan-v2.md`` for the migration design.
+
+Megatron / Archon backends from AReaL were intentionally not vendored:
+  - module_megatron.py: verl has its own Megatron path; integration is V4 scope.
+  - module_archon.py: verl has no Archon engine.
+"""
+
+from verl.experimental.tree_training._magi_backend import (
+    TreeCPContext,
+    register_tree_attention,
+    tree_attn_scope,
 )
-from verl.experimental.tree_training.tree import (
-    build_attention_mask_from_trie,
-    build_block_mask_from_trie,
-    build_tree_attn_kwargs,
-    build_triton_attn_data_from_trie,
+from verl.experimental.tree_training._magi_kernel import (
+    build_attn_ranges_from_trie,
+    build_attn_ranges_tensors,
 )
-
-# Conditionally import Triton functionality
-try:
-    from verl.experimental.tree_training.triton_kernel import (
-        TRITON_AVAILABLE,
-        TreeAttentionData,
-        tree_attention,
-    )
-except ImportError:
-    TRITON_AVAILABLE = False
-    TreeAttentionData = None
-    tree_attention = None
-
-# Megatron / Archon backends from AReaL were intentionally not vendored:
-#   - module_megatron.py: verl uses its own Megatron path; integration deferred (Phase V2).
-#   - module_archon.py: verl has no Archon engine.
 
 __all__ = [
-    # Shared constants
-    "USE_TRITON_TREE_ATTN",
-    # FSDP/common exports
-    "create_block_mask_from_dense",
-    "patch_fsdp_for_tree_training",
-    "restore_patch_fsdp_for_tree_training",
-    "build_attention_mask_from_trie",
-    "build_block_mask_from_trie",
-    "build_tree_attn_kwargs",
-    "build_triton_attn_data_from_trie",
-    # Triton exports (may be None if Triton not installed)
-    "TRITON_AVAILABLE",
-    "TreeAttentionData",
-    "tree_attention",
+    # Magi mask construction
+    "build_attn_ranges_from_trie",
+    "build_attn_ranges_tensors",
+    # Magi HF + CP integration
+    "TreeCPContext",
+    "register_tree_attention",
+    "tree_attn_scope",
 ]

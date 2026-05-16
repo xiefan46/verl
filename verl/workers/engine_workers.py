@@ -542,6 +542,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 ref_training_config.engine_config.tree_training_max_tokens_per_mb = int(
                     actor_section.tree_training.max_tokens_per_mb
                 )
+                ref_training_config.engine_config.tree_cp_size = int(actor_section.tree_training.get("tree_cp_size", 1))
 
             self.ref = TrainingWorker(config=ref_training_config)
             self.ref.reset()
@@ -585,6 +586,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 actor_training_config.engine_config.tree_training_max_tokens_per_mb = (
                     self.config.actor.tree_training.max_tokens_per_mb
                 )
+                actor_training_config.engine_config.tree_cp_size = self.config.actor.tree_training.tree_cp_size
 
             if self.config.actor.use_dynamic_bsz:
                 assert self.config.rollout.log_prob_max_token_len_per_gpu is not None

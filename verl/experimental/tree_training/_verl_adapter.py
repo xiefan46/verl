@@ -41,12 +41,12 @@ from typing import Any
 import torch
 
 from verl.experimental.tree_training._areal_data import MicroBatchSpec
+from verl.experimental.tree_training._magi_kernel import build_attn_ranges_from_trie
 from verl.experimental.tree_training.functional import (
     _gather_packed_tree_logprobs,
     _gather_packed_tree_logprobs_entropy,
     gather_packed_tree_logprobs,
 )
-from verl.experimental.tree_training.module import build_tree_attn_kwargs
 from verl.experimental.tree_training.tree import TrieNode, build_packed_tree_batch
 
 __all__ = [
@@ -278,31 +278,44 @@ def build_tree_model_inputs(
     device: torch.device | str,
     *,
     extra_inputs: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     """Build the kwargs dict for ``model(**model_inputs)`` from a packed mb.
 
-    Returns ``(model_inputs, output_args)`` where:
-      - ``model_inputs``: kwargs passed to ``model.forward`` — includes
-        ``input_ids``, ``position_ids``, ``attention_mask=None`` (the patched
-        flash_attention reads ``tree_block_mask`` from kwargs instead), and
-        ``tree_block_mask`` (or ``tree_triton_data`` if Triton is enabled,
-        not in MVP).
-      - ``output_args``: opaque dict carrying ``trie_node`` and
-        ``packed_input_ids`` so ``unpack_tree_logprobs`` can be called after
-        the forward, plus anything from ``extra_inputs`` (e.g. ``temperature``).
+    MagiAttention path (V1, FSDP2 + cp_size=1). The mask is no longer threaded
+    through model kwargs — the caller wraps ``model.forward`` in
+    ``_magi_backend.tree_attn_scope`` which registers the runtime key into
+    Magi's cp_group registry; the HF-registered Magi attention function reads
+    that key inside each layer.
+
+    Returns ``(model_inputs, output_args, scope_args)`` where:
+
+    * ``model_inputs``: kwargs passed to ``model.forward`` — only
+      ``input_ids`` and ``position_ids``. No ``attention_mask`` field
+      (Magi doesn't use it; HF defaults to None).
+    * ``output_args``: opaque dict carrying ``trie`` and ``packed_input_ids``
+      so ``unpack_tree_logprobs`` can be called after the forward, plus
+      anything from ``extra_inputs`` (e.g. ``temperature``).
+    * ``scope_args``: kwargs for ``_magi_backend.tree_attn_scope``:
+      ``q_ranges_naive``, ``k_ranges_naive``, ``attn_type_map_list``,
+      ``total_seqlen``. The caller fills in shape kwargs (num_heads_q etc.)
+      and cp_group separately since they live on the engine, not the mb.
 
     Args:
         mb: one dict from the list returned by :func:`build_tree_mb_list`.
-        device: device for the on-the-fly BlockMask construction.
-        extra_inputs: optional metadata (e.g. ``{"temperature": 0.7}``) to be
-            stashed in ``output_args`` for later use by the loss / unpack layer.
+        device: target device for ``input_ids`` / ``position_ids``. Range
+            tensors are kept Python-list-side; ``tree_attn_scope`` builds
+            ``AttnRanges`` objects on its own.
+        extra_inputs: optional metadata (e.g. ``{"temperature": 0.7}``).
     """
     trie: TrieNode = mb["trie_node"]
     packed_input_ids: torch.Tensor = mb["input_ids"]
     padded_size = packed_input_ids.size(-1)
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
 
-    tree_attn_kwargs = build_tree_attn_kwargs(trie, padded_size, device=dev)
+    # Build the AttnRanges tile representation. Kept as Python lists; the
+    # _magi_backend.tree_attn_scope context manager converts them to
+    # magi_attention.api.AttnRanges objects at use site (so this module stays
+    # CPU-importable without magi_attention installed).
+    q_ranges, k_ranges, attn_type_map = build_attn_ranges_from_trie([trie])
 
     # Ensure position_ids has shape [1, T] for HF model compatibility. tree.py's
     # get_packed_tree_position_ids returns 1-D [T]; HF RotaryEmbedding indexes
@@ -313,13 +326,9 @@ def build_tree_model_inputs(
 
     model_inputs: dict[str, Any] = {
         "input_ids": packed_input_ids,
-        "position_ids": position_ids,
-        "attention_mask": None,  # tree_block_mask supersedes this for flash_attention
-        **tree_attn_kwargs,
     }
-    # Drop position_ids entry if it wasn't in mb (defensive; tree.py always sets it).
-    if model_inputs["position_ids"] is None:
-        del model_inputs["position_ids"]
+    if position_ids is not None:
+        model_inputs["position_ids"] = position_ids
 
     output_args: dict[str, Any] = {
         "trie": trie,
@@ -328,7 +337,18 @@ def build_tree_model_inputs(
     if extra_inputs:
         output_args.update(extra_inputs)
 
-    return model_inputs, output_args
+    scope_args: dict[str, Any] = {
+        "q_ranges_naive": q_ranges,
+        "k_ranges_naive": k_ranges,
+        "attn_type_map_list": attn_type_map,
+        "total_seqlen": padded_size,
+    }
+    # ``device`` is accepted in the signature for forward-compat (some future
+    # adapter variant may need it for early tensor materialization); currently
+    # unused since Magi handles its own device placement.
+    _ = device
+
+    return model_inputs, output_args, scope_args
 
 
 def unpack_tree_logprobs(

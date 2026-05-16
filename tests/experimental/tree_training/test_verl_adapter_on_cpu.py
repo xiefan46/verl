@@ -237,29 +237,51 @@ class TestBuildTreeMbList(unittest.TestCase):
 
 class TestBuildTreeModelInputs(unittest.TestCase):
     def test_keys_and_kwargs_shape(self):
-        if not torch.cuda.is_available():
-            # build_tree_attn_kwargs constructs a flex_attention BlockMask which
-            # is CUDA-only; on CPU this raises. Skip structural test off-CUDA.
-            self.skipTest("build_tree_attn_kwargs requires CUDA")
+        """build_tree_model_inputs returns (model_inputs, output_args, scope_args).
 
+        Magi path: ``model_inputs`` no longer carries the attention mask; the
+        mask flows via ``_magi_backend.tree_attn_scope`` instead. ``scope_args``
+        carries the AttnRanges tile representation (q/k_ranges + attn_type_map +
+        total_seqlen) ready to feed the scope.
+
+        CPU-runnable: build_tree_model_inputs is now pure Python data shaping
+        (no kernel calls), so no CUDA skip needed.
+        """
         seqs = [[1, 2, 3, 4, 5], [1, 2, 3, 6, 7]]
         td = _make_td(seqs, response_lens=[2, 2])
         mbs, _ = build_tree_mb_list(td, max_tokens_per_mb=128)
         mb = mbs[0]
-        device = torch.device("cuda")
-        # Move tensors to device since build_tree_attn_kwargs / BlockMask need device-local.
-        mb_on_dev = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in mb.items()}
-        model_inputs, output_args = build_tree_model_inputs(mb_on_dev, device)
+        device = torch.device("cpu")
+        model_inputs, output_args, scope_args = build_tree_model_inputs(mb, device)
 
+        # model_inputs: just input_ids + position_ids (no attention_mask, no kwargs).
         self.assertIn("input_ids", model_inputs)
         self.assertIn("position_ids", model_inputs)
-        # attention_mask explicitly None to defer to tree_block_mask via patched flash_attn.
-        self.assertIsNone(model_inputs["attention_mask"])
-        # Either tree_block_mask (flex path) or tree_triton_data (triton path) present.
-        self.assertTrue("tree_block_mask" in model_inputs or "tree_triton_data" in model_inputs)
+        self.assertNotIn("attention_mask", model_inputs)
+        self.assertNotIn("tree_block_mask", model_inputs)
 
+        # output_args: trie + packed_input_ids (unchanged contract).
         self.assertIn("trie", output_args)
         self.assertIn("packed_input_ids", output_args)
+
+        # scope_args: q/k_ranges + attn_type_map + total_seqlen.
+        self.assertIn("q_ranges_naive", scope_args)
+        self.assertIn("k_ranges_naive", scope_args)
+        self.assertIn("attn_type_map_list", scope_args)
+        self.assertIn("total_seqlen", scope_args)
+        # Shape contract: each entry is list[tuple[int, int]] or list[int].
+        self.assertIsInstance(scope_args["q_ranges_naive"], list)
+        self.assertIsInstance(scope_args["k_ranges_naive"], list)
+        self.assertIsInstance(scope_args["attn_type_map_list"], list)
+        self.assertEqual(
+            len(scope_args["q_ranges_naive"]),
+            len(scope_args["k_ranges_naive"]),
+        )
+        self.assertEqual(
+            len(scope_args["q_ranges_naive"]),
+            len(scope_args["attn_type_map_list"]),
+        )
+        self.assertEqual(scope_args["total_seqlen"], model_inputs["input_ids"].size(-1))
 
 
 if __name__ == "__main__":

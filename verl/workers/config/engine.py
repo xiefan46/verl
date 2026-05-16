@@ -249,6 +249,7 @@ class FSDPEngineConfig(EngineConfig):
         "ulysses_sequence_parallel_size",
         "use_tree_training",
         "tree_training_max_tokens_per_mb",
+        "tree_cp_size",
     }
 
     # fsdp specific flags
@@ -271,6 +272,8 @@ class FSDPEngineConfig(EngineConfig):
     # See verl/experimental/tree_training/ and Phase 2 design doc.
     use_tree_training: bool = False
     tree_training_max_tokens_per_mb: int = 4096
+    # MagiAttention CP size; V1 locks to 1 (V3 enables cp>1 via verl FSDP2 2D mesh).
+    tree_cp_size: int = 1
 
     def __post_init__(self):
         super().__post_init__()

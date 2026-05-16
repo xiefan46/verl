@@ -40,17 +40,10 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.nn.attention.flex_attention import BlockMask
 
 from verl.experimental.tree_training._areal_data import MicroBatchList, MicroBatchSpec
 from verl.experimental.tree_training._compat import stats_tracker, trace_perf, trace_scope
-from verl.experimental.tree_training.constants import BLOCK_SIZE, USE_TRITON_TREE_ATTN
-from verl.experimental.tree_training.module_fsdp import create_block_mask_from_dense
-from verl.experimental.tree_training.triton_kernel import (
-    TRITON_AVAILABLE,
-    TreeAttentionData,
-    precompute_tree_attention_data,
-)
+from verl.experimental.tree_training.constants import BLOCK_SIZE
 
 logger = logging.getLogger("TreeAttentionCore")
 
@@ -248,42 +241,6 @@ def _compress_trie(root: _BuildNode) -> TrieNode:
             trie_root.children[token] = _compress_chain(child, [])
 
     return trie_root
-
-
-def trie_to_parent_array(trie: TrieNode, max_tokens: int) -> torch.Tensor:
-    """Build a parent array from TrieNode structure.
-
-    The parent array `fa` is a 1D tensor where `fa[i]` is the index of the
-    parent token of token `i`. For root tokens, the parent index is -1.
-    In this tree structure, all tokens within a compressed trie node
-    share the same parent, which is the last token of the parent node.
-
-    Args:
-        trie: The root TrieNode.
-        max_tokens: Maximum number of tokens (length of the output tensor).
-
-    Returns:
-        torch.Tensor: Parent array of shape (1, max_tokens) with dtype int32.
-    """
-    fa = torch.full((1, max_tokens), -1, dtype=torch.int32)
-
-    if not trie.nodes:  # Empty/dummy trie
-        return fa
-
-    for node in trie.nodes:
-        parent_end_pos = -1
-        if node.ancestors:  # Has parent
-            parent_node = node.ancestors[-1]  # Last ancestor is parent
-            parent_end_pos = parent_node.end_idx
-
-        # First token in node attends to parent; internal tokens attend to previous token
-        if node.start_idx >= 0 and node.start_idx < max_tokens:
-            fa[0, node.start_idx] = parent_end_pos
-        for pos in range(node.start_idx + 1, node.end_idx + 1):
-            if pos < max_tokens:
-                fa[0, pos] = pos - 1
-
-    return fa
 
 
 # =============================================================================
@@ -729,164 +686,16 @@ def get_packed_tree_position_ids(
     return position_ids.unsqueeze(0)
 
 
-@trace_perf("tree_attn.build_block_mask_from_trie")
-def build_block_mask_from_trie(
-    trie: TrieNode,
-    padded_size: int,
-    device: torch.device,
-) -> BlockMask:
-    """Lazily build a block mask from a trie node.
-
-    This function builds the dense attention mask from the trie structure and
-    converts it to a block mask for use with flex attention. It should be called
-    just before the forward pass to minimize memory usage.
-
-    Parameters
-    ----------
-    trie : TrieNode
-        The root trie node containing the tree structure.
-    padded_size : int
-        The padded sequence length.
-    device : torch.device
-        Device to create the block mask on.
-
-    Returns
-    -------
-    BlockMask
-        The created block mask for use with flex_attention.
-    """
-    # Handle dummy trie (empty tree for DP synchronization)
-    if not trie.all_sequence_ids:
-        # Create a minimal valid block mask for empty trees
-        dummy_mask = torch.zeros((padded_size, padded_size), dtype=torch.bool, device=device)
-        return create_block_mask_from_dense(dummy_mask, padded_size, device)
-
-    with trace_scope("tree_attn.build_attention_mask"):
-        attention_mask = _build_attention_mask(trie, padded_size, device)
-
-    with trace_scope("tree_attn.create_block_mask"):
-        block_mask = create_block_mask_from_dense(attention_mask, padded_size, device)
-
-    # Release dense attention mask memory
-    del attention_mask
-
-    return block_mask
-
-
-@trace_perf("tree_attn.build_attention_mask_from_trie")
-def build_attention_mask_from_trie(
-    trie: TrieNode,
-    padded_size: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Build a dense attention mask tensor from a trie node.
-
-    This function builds the dense attention mask from the trie structure.
-    Unlike build_block_mask_from_trie, this returns a torch.Tensor that can
-    be saved by gradient checkpointing mechanisms.
-
-    This is useful for Megatron engine where gradient checkpointing requires
-    all forward arguments to be tensors (BlockMask cannot be saved by
-    save_for_backward). The BlockMask can be created inside the attention
-    module from this dense tensor.
-
-    Parameters
-    ----------
-    trie : TrieNode
-        The root trie node containing the tree structure.
-    padded_size : int
-        The padded sequence length.
-    device : torch.device
-        Device to create the attention mask on.
-
-    Returns
-    -------
-    torch.Tensor
-        Dense attention mask of shape (padded_size, padded_size) with dtype bool.
-    """
-    # Handle dummy trie (empty tree for DP synchronization)
-    if not trie.all_sequence_ids:
-        return torch.zeros((padded_size, padded_size), dtype=torch.bool, device=device)
-
-    with trace_scope("tree_attn.build_attention_mask"):
-        attention_mask = _build_attention_mask(trie, padded_size, device)
-
-    return attention_mask
-
-
-@trace_perf("tree_attn.build_triton_attn_data_from_trie")
-def build_triton_attn_data_from_trie(
-    trie: TrieNode,
-    padded_size: int,
-) -> TreeAttentionData:
-    """Lazily build Triton tree attention data from a trie node.
-
-    This function builds the parent array from the trie structure and
-    precomputes packed masks and sparse block indices for Triton kernels.
-
-    Parameters
-    ----------
-    trie : TrieNode
-        The root trie node containing the tree structure.
-    padded_size : int
-        The padded sequence length.
-
-    Returns
-    -------
-    TreeAttentionData
-        The precomputed Triton attention data.
-    """
-    # Handle dummy trie (empty tree for DP synchronization)
-    if not trie.all_sequence_ids:
-        num_words = (padded_size + 63) >> 6
-        num_q_blocks = (padded_size + 128 - 1) // 128
-        num_kv_blocks = num_words
-        packed_mask = torch.zeros((1, padded_size, num_words), dtype=torch.int64)
-        kv_indices = torch.zeros((0,), dtype=torch.int32)
-        kv_offsets = torch.zeros((1, num_q_blocks + 1), dtype=torch.int32)
-        q_indices = torch.zeros((0,), dtype=torch.int32)
-        q_offsets = torch.zeros((1, num_kv_blocks + 1), dtype=torch.int32)
-        return TreeAttentionData(
-            packed_mask=packed_mask,
-            kv_indices=kv_indices,
-            kv_offsets=kv_offsets,
-            q_indices=q_indices,
-            q_offsets=q_offsets,
-        )
-
-    with trace_scope("tree_attn.precompute_triton_data"):
-        fa = trie_to_parent_array(trie, padded_size)
-        triton_attn_data = precompute_tree_attention_data(fa)
-    return triton_attn_data
-
-
-def build_tree_attn_kwargs(
-    trie: TrieNode,
-    padded_size: int,
-    device: torch.device,
-    *,
-    dense_mask: bool = False,
-) -> dict[str, Any]:
-    """Build tree attention kwargs dict for HF model forwarding.
-
-    Selects Triton or flex attention backend automatically.
-    Returns a dict to be merged into model ``**kwargs``.
-
-    Parameters
-    ----------
-    trie : TrieNode
-        The root trie node.
-    padded_size : int
-        Padded sequence length.
-    device : torch.device
-        Device for mask tensors.
-    dense_mask : bool, default=False
-        If True, the non-Triton path returns a dense ``attention_mask`` tensor
-        (for Megatron, which needs tensors for gradient checkpointing).
-        If False, returns a ``tree_block_mask`` BlockMask (for FSDP).
-    """
-    if USE_TRITON_TREE_ATTN and TRITON_AVAILABLE and not dense_mask:
-        return {"tree_triton_data": build_triton_attn_data_from_trie(trie, padded_size)}
-    if dense_mask:
-        return {"attention_mask": build_attention_mask_from_trie(trie, padded_size, device)}
-    return {"tree_block_mask": build_block_mask_from_trie(trie, padded_size, device)}
+# =============================================================================
+# Removed in 2026-05-16 MagiAttention migration:
+#   - build_block_mask_from_trie (flex_attention BlockMask path)
+#   - build_attention_mask_from_trie (dense path used by Megatron)
+#   - build_triton_attn_data_from_trie (Triton kernel path)
+#   - build_tree_attn_kwargs (backend dispatcher)
+#
+# The Magi replacement lives in _magi_kernel.py:
+#   - build_attn_ranges_from_trie: trie -> (q_ranges, k_ranges, attn_type_map)
+#   - build_attn_ranges_tensors: tensor wrapper for direct flex_flash_attn_func use
+#
+# Legacy flex_attention code is preserved for reference at _areal_legacy/.
+# =============================================================================
