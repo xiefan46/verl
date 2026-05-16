@@ -107,6 +107,8 @@ def _tree_logits_via_magi(model, batch: dict[str, torch.Tensor], config, max_tok
     Returns a dict ``{seq_id: logits[T, V]}`` aligned with ``batch["input_ids"]``
     row order (so caller can compare directly to per-seq dense outputs).
     """
+    import torch.distributed as dist
+
     from verl.experimental.tree_training._areal_data import MicroBatchSpec
     from verl.experimental.tree_training._magi_backend import (
         TreeCPContext,
@@ -115,6 +117,16 @@ def _tree_logits_via_magi(model, batch: dict[str, torch.Tensor], config, max_tok
     )
     from verl.experimental.tree_training._verl_adapter import build_tree_model_inputs
     from verl.experimental.tree_training.tree import build_packed_tree_batch
+
+    # TreeCPContext returns cp_group=None when torch.distributed isn't
+    # initialized, but Magi requires a real ProcessGroup. Init a single-rank
+    # NCCL group for the test (mirrors phase_h_gpu_smoke.py H.T6 pattern).
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        os.environ.setdefault("WORLD_SIZE", "1")
+        os.environ.setdefault("RANK", "0")
+        dist.init_process_group(backend="nccl", init_method="env://")
 
     register_tree_attention()
     tree_ctx = TreeCPContext(cp_size=1)
