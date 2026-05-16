@@ -189,6 +189,103 @@ def _per_token_entropy(logits: torch.Tensor, temperature: float = 1.0) -> torch.
     return -(probs * log_probs).sum(dim=-1)  # [T]
 
 
+def _distribution_metrics(tree_logits: torch.Tensor, dense_logits: torch.Tensor) -> dict[str, float]:
+    """4-axis comparison of two logit tensors of shape [T, V].
+
+    Raw logit max diff is a catastrophic-divergence smoke check only — bf16
+    accumulation noise on sharp instruct logits routinely hits ~0.4 without
+    indicating kernel error. log_softmax max diff and KL(dense || tree) are
+    the RL-relevant signals: PPO/GRPO computes log-ratio = log_softmax(new) -
+    log_softmax(old), so what matters is how close the two log_softmaxes are.
+    Top-1 agreement protects sampling correctness.
+    """
+    assert tree_logits.shape == dense_logits.shape
+    tree_f = tree_logits.float()
+    dense_f = dense_logits.float()
+
+    raw_diff = (tree_f - dense_f).abs().max().item()
+
+    tree_lsm = torch.log_softmax(tree_f, dim=-1)
+    dense_lsm = torch.log_softmax(dense_f, dim=-1)
+    log_softmax_max = (tree_lsm - dense_lsm).abs().max().item()
+
+    # KL(dense || tree): how much the tree path's distribution mis-represents
+    # the dense reference. Symmetric in spirit (tree-correctness check) and
+    # finite even when tree assigns very small probabilities.
+    dense_probs = dense_lsm.exp()
+    kl_per_pos = (dense_probs * (dense_lsm - tree_lsm)).sum(dim=-1)
+    kl_mean = kl_per_pos.mean().item()
+    kl_max = kl_per_pos.max().item()
+
+    top1_match = (tree_f.argmax(dim=-1) == dense_f.argmax(dim=-1)).float().mean().item()
+
+    return {
+        "raw_logit_max": raw_diff,
+        "log_softmax_max": log_softmax_max,
+        "kl_mean": kl_mean,
+        "kl_max": kl_max,
+        "top1_agreement": top1_match,
+    }
+
+
+def _assert_distribution_equivalence(
+    tree_logits_per_seq,
+    dense_logits_per_seq,
+    label: str,
+    *,
+    max_raw_logit: float,
+    max_log_softmax: float,
+    max_kl_mean: float,
+    max_kl_max: float,
+    min_top1_agreement: float,
+    response_mask: torch.Tensor | None = None,
+) -> None:
+    """Apply _distribution_metrics to each seq and assert all 4 thresholds.
+
+    If ``response_mask`` is provided, metrics are restricted to positions where
+    the mask is 1 (i.e., response tokens only — the positions RL actually
+    updates on). When None, all positions are compared.
+    """
+    B = len(tree_logits_per_seq)
+    per_seq = []
+    for seq_id in range(B):
+        tree = tree_logits_per_seq[seq_id]
+        dense = dense_logits_per_seq[seq_id]
+        if response_mask is not None:
+            mask = response_mask[seq_id].bool()
+            tree = tree[mask]
+            dense = dense[mask]
+        per_seq.append(_distribution_metrics(tree, dense))
+
+    raw = max(m["raw_logit_max"] for m in per_seq)
+    lsm = max(m["log_softmax_max"] for m in per_seq)
+    kl_mean = max(m["kl_mean"] for m in per_seq)
+    kl_max = max(m["kl_max"] for m in per_seq)
+    top1 = min(m["top1_agreement"] for m in per_seq)
+
+    print(
+        f"\n[{label}] across {B} seqs (worst-case across seqs):\n"
+        f"  raw_logit_max:    {raw:.4f}      (target < {max_raw_logit})\n"
+        f"  log_softmax_max:  {lsm:.4f}      (target < {max_log_softmax})\n"
+        f"  KL(dense||tree):  mean={kl_mean:.6f}, max={kl_max:.6f}  (mean<{max_kl_mean}, max<{max_kl_max})\n"
+        f"  top-1 agreement:  {top1:.4f}      (target >= {min_top1_agreement})"
+    )
+
+    failures = []
+    if raw >= max_raw_logit:
+        failures.append(f"raw_logit_max={raw:.4f} >= {max_raw_logit}")
+    if lsm >= max_log_softmax:
+        failures.append(f"log_softmax_max={lsm:.4f} >= {max_log_softmax}")
+    if kl_mean >= max_kl_mean:
+        failures.append(f"KL_mean={kl_mean:.6f} >= {max_kl_mean}")
+    if kl_max >= max_kl_max:
+        failures.append(f"KL_max={kl_max:.6f} >= {max_kl_max}")
+    if top1 < min_top1_agreement:
+        failures.append(f"top-1 agreement={top1:.4f} < {min_top1_agreement}")
+
+    assert not failures, f"[{label}] {len(failures)} threshold(s) breached: " + "; ".join(failures)
+
+
 # =============================================================================
 # I.T1 — tiny Llama equivalence across POR levels
 # =============================================================================
@@ -203,7 +300,11 @@ def _per_token_entropy(logits: torch.Tensor, temperature: float = 1.0) -> torch.
     ],
 )
 def test_i_t1_tiny_llama_forward_equivalence(prompt_len, response_len, max_tokens_per_mb):
-    """Tree path logits match per-sequence dense within atol/rtol 0.01 across POR."""
+    """Tree path distributions match per-sequence dense across 4 metrics.
+
+    Random-init weights so logits are smooth (no sharp peaks). Thresholds are
+    accordingly tight — any kernel-level error larger than bf16 ULP shows up.
+    """
     _maybe_skip_magi_import()
     from tests.experimental.tree_training.synthetic import make_prompt_sharing_batch
 
@@ -218,28 +319,19 @@ def test_i_t1_tiny_llama_forward_equivalence(prompt_len, response_len, max_token
     )
 
     model, config = _build_tiny_llama()
-
-    # Dense reference: each seq through standard FA2 (registered Magi forward
-    # falls back to FA2 when cp_group is unset — equivalent path).
-    # We construct a separate model instance to avoid the cp_group setup from
-    # the tree path; both share the same RNG-determined weights via seeded init.
     dense_logits_per_seq = _dense_per_seq_logits(model, batch["input_ids"])
-
-    # Tree path through Magi.
     tree_logits_per_seq = _tree_logits_via_magi(model, batch, config, max_tokens_per_mb)
 
-    B = batch["input_ids"].size(0)
-    max_diffs = []
-    for seq_id in range(B):
-        tree = tree_logits_per_seq[seq_id]
-        dense = dense_logits_per_seq[seq_id]
-        # Shapes should match exactly (same total token length).
-        assert tree.shape == dense.shape, f"shape mismatch for seq {seq_id}: tree {tree.shape} vs dense {dense.shape}"
-        max_diffs.append((tree - dense).abs().max().item())
-
-    overall_max = max(max_diffs)
-    assert overall_max < 0.05, (
-        f"forward equivalence FAILED: max |tree - dense| = {overall_max:.4f} > 0.05; per-seq max_diffs = {max_diffs}"
+    _assert_distribution_equivalence(
+        tree_logits_per_seq,
+        dense_logits_per_seq,
+        label=f"I.T1 POR={response_len / (prompt_len + response_len):.2f}",
+        # Random-init, soft distributions:
+        max_raw_logit=0.05,
+        max_log_softmax=0.02,
+        max_kl_mean=1e-4,
+        max_kl_max=5e-4,
+        min_top1_agreement=0.99,
     )
 
 
@@ -281,10 +373,11 @@ def _build_qwen_instruct(model_path: str):
 def test_i_t2_qwen_instruct_forward_equivalence():
     """Production-sanity forward equivalence on Qwen2.5-0.5B-Instruct, POR=0.5.
 
-    Tighter than I.T1 because we're on a real instruct-tuned model where
-    sharp distributions amplify any kernel-level drift. The threshold is
-    intentionally loose (max_abs_diff < 0.1) for the first pass; tighten after
-    Phase J validates e2e training stability.
+    Real instruct-tuned model with sharp distributions. 4-axis comparison
+    across all token positions. Raw logit threshold is loose (smoke check
+    only) because bf16 vs fp32 accumulation on |logit|~30+ peaks routinely
+    differs by ~0.4 ULP. The actual RL-relevant gates are ``log_softmax_max``
+    and ``KL`` — those must be tight.
     """
     _maybe_skip_magi_import()
     model_path = _resolve_qwen_path()
@@ -311,17 +404,31 @@ def test_i_t2_qwen_instruct_forward_equivalence():
     dense_logits_per_seq = _dense_per_seq_logits(model, batch["input_ids"])
     tree_logits_per_seq = _tree_logits_via_magi(model, batch, config, max_tokens_per_mb=1024)
 
-    B = batch["input_ids"].size(0)
-    max_diffs = [(tree_logits_per_seq[i] - dense_logits_per_seq[i]).abs().max().item() for i in range(B)]
-    overall = max(max_diffs)
-    # Threshold 0.5: instruct-tuned models produce sharp logits (some positions
-    # hit |logit| ~30+) where bf16's 7-bit mantissa gives ULP ~0.25. FFA (bf16
-    # accumulation) vs FA2 (fp32 accumulation) routinely diverges by ~0.4 on
-    # such peaks. The actual kernel-correctness gate is T3 (entropy ratio) —
-    # if T3 passes at ~1.0, logit drift here is pure numeric noise and won't
-    # impact RL signal.
-    assert overall < 0.5, (
-        f"Qwen forward equivalence FAILED: max |tree - dense| = {overall:.4f} > 0.5; per-seq = {max_diffs}"
+    # I.T2a — all token positions
+    _assert_distribution_equivalence(
+        tree_logits_per_seq,
+        dense_logits_per_seq,
+        label="I.T2a Qwen all-tokens",
+        max_raw_logit=0.5,
+        max_log_softmax=0.1,
+        max_kl_mean=1e-3,
+        max_kl_max=5e-3,
+        min_top1_agreement=0.98,
+    )
+
+    # I.T2b — response tokens only (where RL gradients actually fire).
+    # RL log-ratio is computed exactly on these positions in the PPO/GRPO
+    # update, so accuracy here is the operationally-relevant precision.
+    _assert_distribution_equivalence(
+        tree_logits_per_seq,
+        dense_logits_per_seq,
+        label="I.T2b Qwen response-only",
+        max_raw_logit=0.5,
+        max_log_softmax=0.1,
+        max_kl_mean=1e-3,
+        max_kl_max=5e-3,
+        min_top1_agreement=0.98,
+        response_mask=batch["response_mask"],
     )
 
 
