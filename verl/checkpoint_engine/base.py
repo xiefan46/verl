@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
@@ -28,6 +30,12 @@ from verl.utils.ray_utils import auto_await
 from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
 from verl.workers.rollout import BaseRollout, RolloutReplica, get_rollout_class
 from verl.workers.rollout.utils import ensure_async_iterator
+
+logger = logging.getLogger(__name__)
+# verl/__init__.py pins the root logger at WARNING via set_basic_config; opt
+# this module into VERL_LOGGING_LEVEL so NCCL suspend/resume summary logs
+# surface when users request INFO. Mirrors verl/utils/memory_utils.py.
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 @dataclass
@@ -361,8 +369,6 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.trainer = trainer
         self.replicas = replicas
-        # Off-by-default gate for NCCL communicator suspend/resume. See
-        # CheckpointEngineConfig.suspend_nccl_comms and RFC verl-project/verl#6266.
         self.suspend_nccl_comms_enabled: bool = bool(getattr(config, "suspend_nccl_comms", False))
 
     def _suspend_training_nccl_comms(self) -> None:
@@ -370,21 +376,69 @@ class CheckpointEngineManager:
 
         The RPC is registered with default ``blocking=True``, so the worker
         group's wrapper already calls ``ray.get`` internally and returns a
-        list of :class:`SuspendResult` (one per worker). We ignore the list
-        here; per-comm telemetry is in each worker's logs.
+        list of :class:`SuspendResult` (one per rank). We aggregate the list
+        into a single INFO summary line at this controller; per-rank detail
+        remains in each worker's log.
         """
         if not self.suspend_nccl_comms_enabled:
             return
-        self.trainer.suspend_training_nccl_comms()
+        results = self.trainer.suspend_training_nccl_comms()
+        self._log_nccl_summary("suspend", results, size_attr="freed_mb", size_verb="freed")
 
     def _resume_training_nccl_comms(self) -> None:
         """Fan out a resume RPC to every training worker (no-op if disabled).
 
-        See :meth:`_suspend_training_nccl_comms` for the dispatch contract.
+        See :meth:`_suspend_training_nccl_comms` for the dispatch contract
+        and aggregation behavior.
         """
         if not self.suspend_nccl_comms_enabled:
             return
-        self.trainer.resume_training_nccl_comms()
+        results = self.trainer.resume_training_nccl_comms()
+        self._log_nccl_summary("resume", results, size_attr="reclaimed_mb", size_verb="reclaimed")
+
+    @staticmethod
+    def _log_nccl_summary(action: str, results, *, size_attr: str, size_verb: str) -> None:
+        """Aggregate per-rank ``SuspendResult`` / ``ResumeResult`` into INFO logs.
+
+        Splits the per-rank list into "skipped" (``skipped_reason`` set, e.g.
+        ``nccl_too_old`` / ``already_suspended`` / ``no_warm_comms``) and
+        "actual" (a real ncclCommSuspend/Resume call was attempted). Emits one
+        log line per non-empty group with avg / min / max across ranks for
+        memory delta and total duration. ``None`` entries (e.g. ref-only
+        workers that have no ``self.actor``) are dropped.
+        """
+        valid = [r for r in (results or []) if r is not None]
+        if not valid:
+            return
+        skipped = [r for r in valid if r.skipped_reason]
+        if skipped:
+            reasons = sorted({r.skipped_reason for r in skipped})
+            logger.info(
+                "NCCL %s skipped on %d/%d ranks: %s",
+                action,
+                len(skipped),
+                len(valid),
+                ", ".join(reasons),
+            )
+        actual = [r for r in valid if not r.skipped_reason]
+        if not actual:
+            return
+        sizes = [getattr(r, size_attr) for r in actual]
+        durations = [r.total_ms for r in actual]
+        n_ok = sum(1 for r in actual if r.success)
+        logger.info(
+            "NCCL %s: %d/%d ranks succeeded, %s %.0f MB avg (range %.0f-%.0f), %.0f ms avg (range %.0f-%.0f)",
+            action,
+            n_ok,
+            len(actual),
+            size_verb,
+            sum(sizes) / len(sizes),
+            min(sizes),
+            max(sizes),
+            sum(durations) / len(durations),
+            min(durations),
+            max(durations),
+        )
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""
