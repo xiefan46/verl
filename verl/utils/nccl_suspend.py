@@ -242,3 +242,61 @@ def resume_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool = Fal
         reclaimed_mb,
     )
     return ResumeResult(success=n_ok > 0, reclaimed_mb=reclaimed_mb, total_ms=total_ms, comms=comms_stats)
+
+
+def log_aggregate_summary(action: str, results, *, size_attr: str, size_verb: str) -> None:
+    """Aggregate per-rank ``SuspendResult`` / ``ResumeResult`` into INFO logs.
+
+    Used by controller-side orchestrators (e.g. ``CheckpointEngineManager``)
+    to collapse the per-rank dispatch return value of a ``Dispatch.ONE_TO_ALL``
+    RPC into a single summary line, keeping per-rank detail in each worker's
+    log for outlier debugging.
+
+    Splits the list into "skipped" (``skipped_reason`` set, e.g.
+    ``nccl_too_old`` / ``already_suspended`` / ``no_warm_comms``) and "actual"
+    (a real ``ncclCommSuspend`` / ``Resume`` call was attempted). Emits one log
+    line per non-empty group with avg / min / max across ranks for memory
+    delta and total duration. ``None`` entries (e.g. ref-only workers that
+    have no actor engine) are dropped.
+
+    Args:
+        action: "suspend" or "resume" — label in the log message.
+        results: List of ``SuspendResult`` / ``ResumeResult`` / ``None``, one
+            per rank.
+        size_attr: Dataclass field to aggregate as memory delta.
+            ``"freed_mb"`` for suspend, ``"reclaimed_mb"`` for resume.
+        size_verb: Verb for the memory delta in the log message. ``"freed"``
+            for suspend, ``"reclaimed"`` for resume.
+    """
+    valid = [r for r in (results or []) if r is not None]
+    if not valid:
+        return
+    skipped = [r for r in valid if r.skipped_reason]
+    if skipped:
+        reasons = sorted({r.skipped_reason for r in skipped})
+        logger.info(
+            "NCCL %s skipped on %d/%d ranks: %s",
+            action,
+            len(skipped),
+            len(valid),
+            ", ".join(reasons),
+        )
+    actual = [r for r in valid if not r.skipped_reason]
+    if not actual:
+        return
+    sizes = [getattr(r, size_attr) for r in actual]
+    durations = [r.total_ms for r in actual]
+    n_ok = sum(1 for r in actual if r.success)
+    logger.info(
+        "NCCL %s: %d/%d ranks succeeded, %s %.0f MB avg (range %.0f-%.0f), %.0f ms avg (range %.0f-%.0f)",
+        action,
+        n_ok,
+        len(actual),
+        size_verb,
+        sum(sizes) / len(sizes),
+        min(sizes),
+        max(sizes),
+        sum(durations) / len(durations),
+        min(durations),
+        max(durations),
+    )
