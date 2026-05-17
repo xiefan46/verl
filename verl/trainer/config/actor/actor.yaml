@@ -123,6 +123,10 @@ tree_training:
   # Chunk size for gather_packed_tree_logprobs (memory-efficient processing).
   chunk_size: 1024
 
+  # MagiAttention context-parallel size. V1 locked to 1 (single-rank cp group).
+  # V3 will enable cp_size > 1 once verl FSDP gains 2D (dp, cp) mesh support.
+  tree_cp_size: 1
+
 # Whether to use torch.compile()
 # oc.select: the default val for ref.use_torch_compile
 use_torch_compile: true
