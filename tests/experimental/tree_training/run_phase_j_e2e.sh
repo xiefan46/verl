@@ -76,7 +76,10 @@ else
   exit 1
 fi
 
-if grep -qE "loss[: ]*nan|inf" -i "$LOG"; then
+# Match only "loss: nan" / "loss=nan" / "loss: inf" patterns, not bare "inf"
+# substrings like INFO / flashinfer / infrastructure. Case-insensitive on the
+# nan|inf token but anchored to the loss field.
+if grep -qiE "loss[ :=]+(-?nan|-?inf|[+]?inf)\b" "$LOG"; then
   echo "FAIL: NaN/Inf loss detected"
   exit 1
 fi
