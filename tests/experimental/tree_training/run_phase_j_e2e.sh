@@ -24,6 +24,8 @@ if [[ ! -d "$MODEL_PATH" ]]; then
 fi
 
 # Conservative single-step shapes — Magi smoke, not convergence run.
+# Upstream run_qwen3_4b_fsdp.sh expects DEVICE (gpu/npu) to be set; we're on H100/H200.
+export DEVICE=gpu
 export NGPUS_PER_NODE=1
 export ROLLOUT_TP=1
 export TRAIN_BATCH_SIZE=8
