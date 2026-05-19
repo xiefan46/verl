@@ -231,7 +231,7 @@ class BaseEngine:
         return SuspendResult(success=False, skipped_reason="not_implemented")
 
     def resume_nccl_comms(self) -> ResumeResult:
-        """Reverse of :meth:`suspend_nccl_comms`. Default no-op."""
+        """Reverse of ``suspend_nccl_comms``. Default no-op."""
         return ResumeResult(success=False, skipped_reason="not_implemented")
 
 

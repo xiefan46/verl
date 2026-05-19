@@ -753,7 +753,7 @@ class MegatronEngine(BaseEngine):
         return suspend_via_parallel_state(measure_per_comm=measure_per_comm)
 
     def resume_nccl_comms(self, *, measure_per_comm: bool = False):
-        """Resume comms suspended by :meth:`suspend_nccl_comms`. Idempotent."""
+        """Resume comms suspended by ``suspend_nccl_comms``. Idempotent."""
         from verl.workers.engine.megatron.utils import resume_via_parallel_state
 
         return resume_via_parallel_state(measure_per_comm=measure_per_comm)

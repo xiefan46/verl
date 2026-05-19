@@ -395,7 +395,7 @@ class CheckpointEngineManager:
         log_aggregate_summary("suspend", results, size_attr="freed_mb", size_verb="freed")
 
     def _resume_training_nccl_comms(self) -> None:
-        """Reverse of :meth:`_suspend_training_nccl_comms`."""
+        """Reverse of ``_suspend_training_nccl_comms``."""
         if not self.suspend_nccl_comms_enabled:
             return
         results = self.trainer.resume_training_nccl_comms()

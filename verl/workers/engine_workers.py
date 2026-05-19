@@ -744,14 +744,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def suspend_training_nccl_comms(self):
-        """RPC entry: forward to :meth:`BaseEngine.suspend_nccl_comms`."""
+        """RPC entry: forward to ``BaseEngine.suspend_nccl_comms``."""
         if self.actor is None:
             return None
         return self.actor.engine.suspend_nccl_comms()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def resume_training_nccl_comms(self):
-        """RPC entry: forward to :meth:`BaseEngine.resume_nccl_comms`."""
+        """RPC entry: forward to ``BaseEngine.resume_nccl_comms``."""
         if self.actor is None:
             return None
         return self.actor.engine.resume_nccl_comms()

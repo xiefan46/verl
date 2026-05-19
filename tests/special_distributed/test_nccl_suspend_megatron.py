@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""E2E test for Megatron :func:`suspend_via_parallel_state` / :func:`resume_via_parallel_state`.
+"""E2E test for Megatron ``suspend_via_parallel_state`` / ``resume_via_parallel_state``.
 
 Initializes Megatron parallel_state, warms each group with a representative
 collective, then verifies: discovery is non-empty, suspend frees driver

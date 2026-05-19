@@ -164,7 +164,7 @@ def suspend_via_parallel_state(*, measure_per_comm: bool = False) -> SuspendResu
 
 
 def resume_via_parallel_state(*, measure_per_comm: bool = False) -> ResumeResult:
-    """Resume Megatron NCCL comms suspended by :func:`suspend_via_parallel_state`.
+    """Resume Megatron NCCL comms suspended by ``suspend_via_parallel_state``.
 
     Idempotent: returns a no-op result if not suspended.
     """

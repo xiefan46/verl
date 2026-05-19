@@ -14,8 +14,8 @@
 """NCCL communicator suspend/resume primitives (NCCL >= 2.29.7).
 
 Ctypes shim over ``ncclCommSuspend`` / ``ncclCommResume`` plus batch helpers.
-Callers supply ``[(name, handle)]`` to :func:`suspend_batch` /
-:func:`resume_batch`. Older NCCL: no-op via :func:`is_supported`.
+Callers supply ``[(name, handle)]`` to ``suspend_batch`` / ``resume_batch``.
+Older NCCL: no-op via ``is_supported``.
 
 RFC: https://github.com/verl-project/verl/issues/6266
 """
