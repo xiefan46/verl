@@ -152,8 +152,9 @@ def _resume_one(handle: int) -> bool:
 def suspend_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool = False) -> SuspendResult:
     """Suspend a batch of ``(name, handle)`` NCCL communicators.
 
-    ``measure_per_comm=True`` attributes freed memory per communicator (adds
-    ~5-10 ms per comm; intended for tests).
+    ``measure_per_comm=True`` attributes freed memory per communicator
+    (intended for tests). The reported ``freed_mb`` is a lower bound — PyTorch's
+    caching allocator may absorb some of the freed memory before measurement.
     """
 
     if not handles:
@@ -171,16 +172,11 @@ def suspend_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool = Fa
 
         delta_mb = 0.0
         if measure_per_comm:
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
             delta_mb = before_mb - _gpu_used_mb()
 
         comms_stats.append(CommStat(name=name, handle=handle, duration_ms=elapsed_ms, delta_mb=delta_mb, success=ok))
 
     total_ms = (time.perf_counter() - total_start) * 1000
-    if not measure_per_comm:
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
     freed_mb = total_before - _gpu_used_mb()
 
     n_ok = sum(1 for c in comms_stats if c.success)
