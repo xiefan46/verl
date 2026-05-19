@@ -121,11 +121,7 @@ def is_supported() -> bool:
 
 
 def _gpu_used_mb() -> float:
-    """Driver-level GPU memory used (MB).
-
-    Uses ``cuMemGetInfo`` via ``torch.cuda.mem_get_info`` so we capture NCCL's
-    ``cudaMalloc`` allocations, which the CUDA caching allocator does not see.
-    """
+    """Driver-level GPU memory used (MB)."""
     torch.cuda.synchronize()
     free, total = torch.cuda.mem_get_info()
     return (total - free) / 1024**2
