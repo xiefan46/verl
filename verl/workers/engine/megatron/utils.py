@@ -59,36 +59,29 @@ _megatron_suspended_handles: list[tuple[str, int]] = []
 
 
 def _collect_megatron_comms() -> list[tuple[str, int]]:
-    """Reflect over ``megatron.core.parallel_state``'s named globals to collect
-    every warm NCCL ``ncclComm_t`` handle.
+    """Collect warm NCCL handles from ``megatron.core.parallel_state`` globals.
 
-    Walks module-level attributes matching ``_*GROUP*`` and skips ``_*GLOO*``
-    (CPU-only). Handles three container shapes Megatron uses for its group
-    globals:
+    Walks ``_*GROUP*`` attrs (skipping ``_*GLOO*``), supports singleton / list /
+    dict container shapes, and dedups by ``ncclComm_t`` handle since PyTorch
+    may share one communicator across multiple ``ProcessGroup`` objects.
 
-      * Singleton ``ProcessGroup`` (most groups, e.g. ``_TENSOR_MODEL_PARALLEL_GROUP``)
-      * List of groups (``_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS``)
-      * Dict of groups (``_HYBRID_DP_CP_GROUPS``)
-
-    Deduplicates by ``ncclComm_t`` handle: PyTorch may share an underlying
-    communicator across multiple ``ProcessGroup`` objects with the same rank
-    set, and ``ncclCommSuspend`` errors when called twice on the same handle.
-
-    Returns ``[(display_name, handle_int), ...]``. Empty list if Megatron is
-    unavailable or model parallel is not yet initialized.
+    Raises ``RuntimeError`` if Megatron is not importable. Returns ``[]``
+    (with ERROR log) if model parallel is not yet initialized.
     """
     try:
         from megatron.core import parallel_state as ps
-    except ImportError:
-        logger.warning("megatron.core.parallel_state not importable; skipping comm collection.")
-        return []
+    except ImportError as e:
+        raise RuntimeError(
+            "suspend_nccl_comms=True requires Megatron, but megatron.core is not "
+            "importable. Install Megatron or set suspend_nccl_comms=False."
+        ) from e
 
     try:
         if not ps.model_parallel_is_initialized():
-            logger.warning("Megatron model parallel not initialized; skipping comm collection.")
+            logger.error("Megatron model parallel not initialized; skipping comm collection.")
             return []
     except Exception as e:
-        logger.warning("Megatron model_parallel_is_initialized check failed: %s", e)
+        logger.error("Megatron model_parallel_is_initialized check failed: %s", e)
         return []
 
     handles: list[tuple[str, int]] = []
