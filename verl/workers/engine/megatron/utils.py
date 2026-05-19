@@ -80,15 +80,15 @@ def _collect_megatron_comms() -> list[tuple[str, int]]:
     try:
         from megatron.core import parallel_state as ps
     except ImportError:
-        logger.debug("megatron.core.parallel_state not importable; skipping comm collection.")
+        logger.warning("megatron.core.parallel_state not importable; skipping comm collection.")
         return []
 
     try:
         if not ps.model_parallel_is_initialized():
-            logger.debug("Megatron model parallel not initialized; skipping comm collection.")
+            logger.warning("Megatron model parallel not initialized; skipping comm collection.")
             return []
     except Exception as e:
-        logger.debug("Megatron model_parallel_is_initialized check failed: %s", e)
+        logger.warning("Megatron model_parallel_is_initialized check failed: %s", e)
         return []
 
     handles: list[tuple[str, int]] = []
