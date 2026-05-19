@@ -32,10 +32,6 @@ from typing import Optional
 import torch
 
 logger = logging.getLogger(__name__)
-# verl/__init__.py pins the root logger at WARNING via set_basic_config, so
-# module loggers do not inherit INFO by default. Mirror the pattern used in
-# verl/utils/memory_utils.py: opt this module into VERL_LOGGING_LEVEL so the
-# suspend/resume telemetry surfaces when users (or e2e scripts) request INFO.
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 # Bitmask passed to ncclCommSuspend: release dynamic GPU memory allocations

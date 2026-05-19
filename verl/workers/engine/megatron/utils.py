@@ -27,10 +27,6 @@ from verl.utils.nccl_suspend import (
 )
 
 logger = logging.getLogger(__name__)
-# verl/__init__.py pins the root logger at WARNING via set_basic_config, so
-# module loggers do not inherit INFO by default. Opt this module into
-# VERL_LOGGING_LEVEL so suspend/resume telemetry surfaces when users (or e2e
-# scripts) request INFO. Mirrors verl/utils/memory_utils.py.
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
