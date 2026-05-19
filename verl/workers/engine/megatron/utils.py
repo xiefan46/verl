@@ -53,22 +53,10 @@ def set_random_seed(seed):
     # os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
 
-# ---------------------------------------------------------------------------
-# NCCL communicator suspend/resume — Megatron Method A enumeration
-#
-# Generic ctypes primitives + batch helpers live in
-# ``verl/utils/nccl_suspend.py``. This section supplies the Megatron-specific
-# strategy: a reflective walk of ``megatron.core.parallel_state``'s named
-# group globals to collect every warm ``ncclComm_t`` handle.
-#
-# State is process-level (module-level globals, not instance attributes)
-# because ``megatron.core.parallel_state`` is itself a process-global module
-# — multiple ``MegatronEngine`` instances in one process would share the same
-# NCCL communicators, so per-instance suspended-or-not bookkeeping would be
-# incorrect.
-#
-# See RFC verl-project/verl#6266.
-# ---------------------------------------------------------------------------
+# Megatron NCCL communicator suspend/resume. Reflective walk of
+# ``megatron.core.parallel_state`` named group globals; generic primitives in
+# ``verl/utils/nccl_suspend.py``. State is module-level (process-scoped) since
+# ``parallel_state`` itself is a process-global module.
 
 _megatron_suspended: bool = False
 _megatron_suspended_handles: list[tuple[str, int]] = []
@@ -143,7 +131,7 @@ def _collect_megatron_comms() -> list[tuple[str, int]]:
             handles.append((label, int(ptr)))
 
     logger.info(
-        "Method A discovered %d warm Megatron NCCL comm(s): %s",
+        "Discovered %d warm Megatron NCCL comm(s): %s",
         len(handles),
         [name for name, _ in handles],
     )
@@ -153,11 +141,7 @@ def _collect_megatron_comms() -> list[tuple[str, int]]:
 def suspend_via_parallel_state(*, measure_per_comm: bool = False) -> SuspendResult:
     """Suspend all warm NCCL comms reachable via ``megatron.core.parallel_state``.
 
-    Idempotent: if already suspended, returns a no-op result.
-
-    Args:
-        measure_per_comm: When True, attribute freed memory per communicator.
-            Adds ~5-10 ms per comm; intended for tests, off in production.
+    Idempotent: returns a no-op result if already suspended.
     """
     global _megatron_suspended, _megatron_suspended_handles
 
@@ -180,10 +164,9 @@ def suspend_via_parallel_state(*, measure_per_comm: bool = False) -> SuspendResu
 
 
 def resume_via_parallel_state(*, measure_per_comm: bool = False) -> ResumeResult:
-    """Resume the Megatron NCCL comms suspended by the last
-    :func:`suspend_via_parallel_state` call.
+    """Resume Megatron NCCL comms suspended by :func:`suspend_via_parallel_state`.
 
-    Idempotent: if not suspended, returns a no-op result.
+    Idempotent: returns a no-op result if not suspended.
     """
     global _megatron_suspended
 

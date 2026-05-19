@@ -348,6 +348,8 @@ class CheckpointEngineManager:
         config: The checkpoint engine config.
         trainer: The trainer worker group.
         replicas: The list of rollout replicas.
+        suspend_nccl_comms: If True, release idle training NCCL comms at phase
+            boundaries (requires HYBRID/COLOCATED rollout).
     """
 
     def __init__(
@@ -355,6 +357,7 @@ class CheckpointEngineManager:
         config: CheckpointEngineConfig,
         trainer: RayWorkerGroup,
         replicas: list[RolloutReplica],
+        suspend_nccl_comms: bool = False,
     ) -> None:
         self.config = config
         self.backend = config.backend
@@ -362,29 +365,37 @@ class CheckpointEngineManager:
         self.backend_cls = CheckpointEngineRegistry.get(config.backend)
         self.trainer = trainer
         self.replicas = replicas
-        self.suspend_nccl_comms_enabled: bool = bool(getattr(config, "suspend_nccl_comms", False))
+        self.suspend_nccl_comms_enabled: bool = suspend_nccl_comms
+        if self.suspend_nccl_comms_enabled:
+            self._validate_suspend_mode_compat()
+
+    def _validate_suspend_mode_compat(self) -> None:
+        """Raise if suspend_nccl_comms is requested but rollout is STANDALONE.
+
+        The feature only frees memory when trainer and rollout share GPUs
+        (HYBRID / COLOCATED). All replicas share one mode, so checking the
+        first one is enough.
+        """
+        if not self.replicas:
+            return
+        from verl.workers.rollout.replica import RolloutMode
+
+        if self.replicas[0].rollout_mode is RolloutMode.STANDALONE:
+            raise ValueError(
+                "suspend_nccl_comms=True is not supported with STANDALONE rollout: "
+                "nothing on trainer GPUs consumes the freed memory. "
+                "Use HYBRID/COLOCATED rollout or set the flag to False."
+            )
 
     def _suspend_training_nccl_comms(self) -> None:
-        """Fan out a suspend RPC to every training worker (no-op if disabled).
-
-        The RPC is registered with default ``blocking=True``, so the worker
-        group's wrapper already calls ``ray.get`` internally and returns a
-        list of :class:`SuspendResult` (one per rank). We aggregate the list
-        into a single INFO summary line at this controller via
-        :func:`verl.utils.nccl_suspend.log_aggregate_summary`; per-rank detail
-        remains in each worker's log.
-        """
+        """Fan out a suspend RPC to every training worker, aggregate to one INFO line."""
         if not self.suspend_nccl_comms_enabled:
             return
         results = self.trainer.suspend_training_nccl_comms()
         log_aggregate_summary("suspend", results, size_attr="freed_mb", size_verb="freed")
 
     def _resume_training_nccl_comms(self) -> None:
-        """Fan out a resume RPC to every training worker (no-op if disabled).
-
-        See :meth:`_suspend_training_nccl_comms` for the dispatch contract
-        and aggregation behavior.
-        """
+        """Reverse of :meth:`_suspend_training_nccl_comms`."""
         if not self.suspend_nccl_comms_enabled:
             return
         results = self.trainer.resume_training_nccl_comms()
@@ -438,9 +449,7 @@ class CheckpointEngineManager:
     async def sleep_replicas(self):
         """Sleep all rollout replicas: free weight and kv_cache device memory.
 
-        Also resumes training-side NCCL communicators (if previously suspended)
-        since the training phase begins next. No-op when suspend_nccl_comms is
-        disabled.
+        Also resumes training-side NCCL comms if ``suspend_nccl_comms`` is on.
         """
         await asyncio.gather(*[r.sleep() for r in self.replicas])
         self._resume_training_nccl_comms()
@@ -482,9 +491,8 @@ class CheckpointEngineManager:
     async def update_weights(self, global_steps: int = None):
         """Update weights from trainer to rollout replicas.
 
-        On exit, suspends training-side NCCL communicators (if enabled) since
-        the rollout phase begins next and the training NCCL channel buffers
-        are idle until the next training step.
+        Also suspends training-side NCCL comms on exit if ``suspend_nccl_comms``
+        is on (rollout phase begins next).
 
         Args:
             global_steps: The global steps of the trainer.

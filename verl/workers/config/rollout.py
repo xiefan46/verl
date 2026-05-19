@@ -155,11 +155,6 @@ class CheckpointEngineConfig(BaseConfig):
     # backend is instantiated, allowing custom backends to register themselves
     # in CheckpointEngineRegistry.
     custom_backend_module: Optional[str] = None
-    # Release idle training NCCL communicators between rollout/training phases
-    # to free GPU memory for KV cache and activations. Requires NCCL >= 2.29.7
-    # and the Megatron backend; gracefully no-ops on older NCCL or other engines.
-    # See RFC: https://github.com/verl-project/verl/issues/6266
-    suspend_nccl_comms: bool = False
 
 
 @dataclass

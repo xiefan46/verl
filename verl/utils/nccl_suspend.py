@@ -11,24 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""NCCL communicator suspend/resume primitives.
+"""NCCL communicator suspend/resume primitives (NCCL >= 2.29.7).
 
-Provides a ctypes shim over NCCL 2.29.7+'s native ``ncclCommSuspend`` /
-``ncclCommResume`` API (loaded from ``libnccl.so.2``) plus batch helpers for
-releasing the GPU memory held by idle communicators. Backend engines supply
-their own enumeration of warm ``ncclComm_t`` handles and pass the resulting
-``[(name, handle)]`` list to :func:`suspend_batch` / :func:`resume_batch`.
-The Megatron enumeration (Method A: reflective scan of
-``megatron.core.parallel_state``'s named group globals) lives in
-``verl/workers/engine/megatron/utils.py``.
+Ctypes shim over ``ncclCommSuspend`` / ``ncclCommResume`` plus batch helpers.
+Callers supply ``[(name, handle)]`` to :func:`suspend_batch` /
+:func:`resume_batch`. Older NCCL: no-op via :func:`is_supported`.
 
-On older NCCL the public entry points gracefully no-op (``is_supported()``
-returns ``False``) so callers can enable the feature unconditionally.
-
-References:
-  * RFC: https://github.com/verl-project/verl/issues/6266
-  * NCCL 2.29.7 release notes: https://github.com/NVIDIA/nccl/releases/tag/v2.29.7-1
-  * Suspend/Resume API: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/api/comms.html
+RFC: https://github.com/verl-project/verl/issues/6266
 """
 
 from __future__ import annotations
@@ -167,14 +156,10 @@ def _resume_one(handle: int) -> bool:
 def suspend_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool = False) -> SuspendResult:
     """Suspend a batch of ``(name, handle)`` NCCL communicators.
 
-    Engine-specific helpers (e.g. Method A reflection over Megatron's
-    ``parallel_state``) collect warm ``ncclComm_t`` handles and pass them here.
-
-    When ``measure_per_comm`` is True, inserts ``empty_cache + synchronize``
-    between each suspend so the freed memory can be attributed to individual
-    comms. This adds roughly 5-10 ms per comm and is intended for tests; the
-    production hot path leaves it off.
+    ``measure_per_comm=True`` attributes freed memory per communicator (adds
+    ~5-10 ms per comm; intended for tests).
     """
+
     if not handles:
         return SuspendResult(success=False, skipped_reason="no_warm_comms")
 
@@ -245,28 +230,13 @@ def resume_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool = Fal
 
 
 def log_aggregate_summary(action: str, results, *, size_attr: str, size_verb: str) -> None:
-    """Aggregate per-rank ``SuspendResult`` / ``ResumeResult`` into INFO logs.
-
-    Used by controller-side orchestrators (e.g. ``CheckpointEngineManager``)
-    to collapse the per-rank dispatch return value of a ``Dispatch.ONE_TO_ALL``
-    RPC into a single summary line, keeping per-rank detail in each worker's
-    log for outlier debugging.
-
-    Splits the list into "skipped" (``skipped_reason`` set, e.g.
-    ``nccl_too_old`` / ``already_suspended`` / ``no_warm_comms``) and "actual"
-    (a real ``ncclCommSuspend`` / ``Resume`` call was attempted). Emits one log
-    line per non-empty group with avg / min / max across ranks for memory
-    delta and total duration. ``None`` entries (e.g. ref-only workers that
-    have no actor engine) are dropped.
+    """Aggregate per-rank Suspend/ResumeResult into one INFO line.
 
     Args:
-        action: "suspend" or "resume" — label in the log message.
-        results: List of ``SuspendResult`` / ``ResumeResult`` / ``None``, one
-            per rank.
-        size_attr: Dataclass field to aggregate as memory delta.
-            ``"freed_mb"`` for suspend, ``"reclaimed_mb"`` for resume.
-        size_verb: Verb for the memory delta in the log message. ``"freed"``
-            for suspend, ``"reclaimed"`` for resume.
+        action: "suspend" or "resume", used as the log message label.
+        results: One result per rank; ``None`` entries are dropped.
+        size_attr: ``"freed_mb"`` for suspend, ``"reclaimed_mb"`` for resume.
+        size_verb: ``"freed"`` for suspend, ``"reclaimed"`` for resume.
     """
     valid = [r for r in (results or []) if r is not None]
     if not valid:

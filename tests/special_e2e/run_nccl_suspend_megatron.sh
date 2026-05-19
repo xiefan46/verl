@@ -13,33 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# E2E test for NCCL communicator suspend/resume during colocated GRPO training
-# with Megatron-LM as the training engine.
-#
-# Validates the short-term Method A path (see RFC verl-project/verl#6266):
-#   1. Method A reflection over megatron.core.parallel_state correctly enumerates
-#      every warm NCCL communicator at sleep/wake boundaries.
-#   2. The suspend/resume cycle frees and reclaims driver-level GPU memory.
-#   3. Training proceeds without NCCL errors across multiple sleep/wake cycles.
-#
-# GPU requirement: 8 GPUs (TP=2 PP=2 DP=2 standard 3D parallel).
-# Defaults match tests/special_e2e/run_ppo_trainer_megatron.sh so an A/B
-# convergence comparison with that baseline stays apples-to-apples.
+# E2E test for NCCL suspend/resume during colocated GRPO with Megatron.
+# Defaults match tests/special_e2e/run_ppo_trainer_megatron.sh for A/B
+# comparison. Requires 8 GPUs (TP=2 PP=2 DP=2).
 #
 # Usage:
-#   # Default (suspend ON, 3-step smoke):
-#   bash tests/special_e2e/run_nccl_suspend_megatron.sh
+#   bash tests/special_e2e/run_nccl_suspend_megatron.sh             # default: suspend ON, 3-step
+#   SUSPEND_NCCL_COMMS=false TOTAL_STEPS=100 bash ...               # A/B baseline arm
+#   MEGATRON_EP=2 MEGATRON_ETP=2 bash ...                           # MoE variant
 #
-#   # A/B convergence comparison (100 steps each, suspend OFF vs ON):
-#   SUSPEND_NCCL_COMMS=false TOTAL_STEPS=100 \
-#     bash tests/special_e2e/run_nccl_suspend_megatron.sh \
-#       trainer.experiment_name=nccl-ab-baseline
-#   SUSPEND_NCCL_COMMS=true TOTAL_STEPS=100 \
-#     bash tests/special_e2e/run_nccl_suspend_megatron.sh \
-#       trainer.experiment_name=nccl-ab-with-suspend
-#
-#   # MoE variant (expert parallel):
-#   MEGATRON_EP=2 MEGATRON_ETP=2 bash tests/special_e2e/run_nccl_suspend_megatron.sh
+# See RFC: verl-project/verl#6266.
 
 set -xeuo pipefail
 
@@ -147,7 +130,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${MICRO_BSZ_PER_GPU} \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.checkpoint_engine.backend=naive \
-    +actor_rollout_ref.rollout.checkpoint_engine.suspend_nccl_comms=${SUSPEND_NCCL_COMMS} \
+    actor_rollout_ref.actor.suspend_nccl_comms=${SUSPEND_NCCL_COMMS} \
     trainer.logger='["console"]' \
     trainer.project_name='verl-test-nccl-suspend' \
     trainer.experiment_name="${EXP_NAME}" \

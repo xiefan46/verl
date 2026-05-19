@@ -227,19 +227,11 @@ class BaseEngine:
         return nullcontext()
 
     def suspend_nccl_comms(self) -> SuspendResult:
-        """Release the GPU memory held by this engine's idle NCCL communicators.
-
-        Used in colocated training/rollout setups to free NCCL channel buffers
-        while the engine is idle (e.g. during the rollout phase). Backends
-        override this with their own communicator enumeration; the default
-        implementation is a no-op.
-
-        See RFC: https://github.com/verl-project/verl/issues/6266
-        """
+        """Release GPU memory held by idle NCCL communicators. Backends override; default no-op."""
         return SuspendResult(success=False, skipped_reason="not_implemented")
 
     def resume_nccl_comms(self) -> ResumeResult:
-        """Reverse of :meth:`suspend_nccl_comms`. Default implementation is a no-op."""
+        """Reverse of :meth:`suspend_nccl_comms`. Default no-op."""
         return ResumeResult(success=False, skipped_reason="not_implemented")
 
 

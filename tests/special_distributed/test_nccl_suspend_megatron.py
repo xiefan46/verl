@@ -11,38 +11,24 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""End-to-end test for Method A (megatron.core.parallel_state reflection).
+"""E2E test for Megatron :func:`suspend_via_parallel_state` / :func:`resume_via_parallel_state`.
 
-Initializes Megatron's parallel_state, warms up each parallel group with a
-representative collective, then exercises
-:func:`verl.workers.engine.megatron.utils.suspend_via_parallel_state` /
-:func:`resume_via_parallel_state` and verifies:
+Initializes Megatron parallel_state, warms each group with a representative
+collective, then verifies: discovery is non-empty, suspend frees driver
+memory, suspend is idempotent, resume reclaims within 5%, post-resume
+collectives still work. Skips on NCCL < 2.29.7 or missing megatron-core.
 
-  1. Method A discovers at least one warm communicator.
-  2. Suspend frees driver-level GPU memory (cuMemGetInfo delta).
-  3. Suspend is idempotent (second call returns ``already_suspended``).
-  4. Resume reclaims approximately what suspend freed (within 5%).
-  5. Post-resume collectives on every warmed group still work.
-
-Skips cleanly if NCCL is older than 2.29.7 (``ncclCommSuspend`` missing) or
-if ``megatron-core`` is not importable.
-
-Requirements:
-  * NCCL >= 2.29.7
-  * megatron-core
-  * >= 4 GPUs (default config is TP=2, PP=2). Override via env vars.
+Requires >= 4 GPUs (default TP=2 PP=2). Env vars: TP_SIZE, PP_SIZE, CP_SIZE,
+EP_SIZE, ETP_SIZE.
 
 Usage:
-    # Default (4 GPUs, TP=2 PP=2 DP=1):
     NCCL_NVLS_ENABLE=0 torchrun --nproc-per-node=4 --standalone \\
-        tests/special_distributed/test_nccl_suspend_method_a.py
+        tests/special_distributed/test_nccl_suspend_megatron.py
 
-    # MoE EP=2 ETP=2 (needs >= 8 GPUs):
     EP_SIZE=2 ETP_SIZE=2 NCCL_NVLS_ENABLE=0 torchrun --nproc-per-node=8 --standalone \\
-        tests/special_distributed/test_nccl_suspend_method_a.py
+        tests/special_distributed/test_nccl_suspend_megatron.py
 
-Env vars: TP_SIZE, PP_SIZE, CP_SIZE, EP_SIZE, ETP_SIZE.
-See RFC: https://github.com/verl-project/verl/issues/6266
+RFC: https://github.com/verl-project/verl/issues/6266
 """
 
 import os
@@ -57,7 +43,7 @@ import torch.distributed as dist
 
 def _log(msg: str) -> None:
     if int(os.environ.get("RANK", "0")) == 0:
-        print(f"[test_nccl_suspend_method_a] {msg}", flush=True)
+        print(f"[test_nccl_suspend_megatron] {msg}", flush=True)
 
 
 def _gpu_used_mb() -> float:
@@ -131,10 +117,9 @@ def _run_warmup_op(op: str, group, world: int) -> None:
         out = torch.zeros(chunk * world, dtype=torch.float32, device="cuda")
         dist.all_gather_into_tensor(out, inp, group=group)
     elif op == "p2p":
-        # Two stages: leading broadcast warms the main PG ncclComm_t that
-        # Method A reads; isend/irecv ring exercises the realistic PP path
-        # (whose hidden 2-rank P2P comms are a known coverage gap for both
-        # Method A and B).
+        # Two stages: leading broadcast warms the main PG ncclComm_t that the
+        # reflection picks up; isend/irecv ring exercises the realistic PP
+        # path (hidden 2-rank P2P comms are a known coverage gap).
         x = torch.zeros(256 * 1024, dtype=torch.float32, device="cuda")
         src = dist.get_global_rank(group, 0)
         dist.broadcast(x, src=src, group=group)
@@ -222,11 +207,9 @@ def test_nccl_suspend_resume_via_parallel_state() -> None:
     assert warmed, "no Megatron groups warmed up — invalid parallel config?"
 
     handles = _collect_megatron_comms()
-    _log(f"Method A discovered {len(handles)} unique NCCL comm(s)")
-    assert handles, "Method A must find at least one warm comm"
-    assert len(handles) <= len(warmed), (
-        f"Method A found {len(handles)} comms but only {len(warmed)} groups were warmed up"
-    )
+    _log(f"Discovered {len(handles)} unique NCCL comm(s)")
+    assert handles, "must find at least one warm comm"
+    assert len(handles) <= len(warmed), f"discovered {len(handles)} comms but only {len(warmed)} groups were warmed up"
 
     mem_before = _gpu_used_mb()
     sus = suspend_via_parallel_state(measure_per_comm=True)
