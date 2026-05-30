@@ -829,16 +829,16 @@ class MegatronEngineWithLMHead(MegatronEngine):
         calculate_sum_pi_squared = tu.get_non_tensor_data(batch, key="calculate_sum_pi_squared", default=False)
         distillation_use_topk = tu.get_non_tensor_data(batch, key="distillation_use_topk", default=False)
         use_prefix_tree = tu.get_non_tensor_data(batch, key="use_prefix_tree", default=False)
-        prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="flex")
+        prefix_tree_attention = tu.get_non_tensor_data(batch, key="prefix_tree_attention", default="magi")
         if use_prefix_tree:
             assert self.engine_config.use_remove_padding, (
                 "use_prefix_tree=True requires use_remove_padding=True (THD format). "
                 "Set model.use_remove_padding=True in your config."
             )
-            assert prefix_tree_attention in ("flex", "magi"), (
-                f"prefix_tree_attention must be 'flex' or 'magi', got {prefix_tree_attention!r}"
+            assert prefix_tree_attention == "magi", (
+                f"prefix_tree_attention must be 'magi', got {prefix_tree_attention!r} "
+                "(flex was retired due to the AReaL 8x entropy bug)"
             )
-        prefix_segments_batch = tu.get_non_tensor_data(batch, key="prefix_segments", default=None)
 
         if calculate_sum_pi_squared and use_fused_kernels:
             raise NotImplementedError(
@@ -952,7 +952,6 @@ class MegatronEngineWithLMHead(MegatronEngine):
                 "loss_mask": loss_mask,
                 "use_prefix_tree": use_prefix_tree,
                 "prefix_tree_attention": prefix_tree_attention,
-                "prefix_segments_batch": prefix_segments_batch,
             }
 
             output = forward_fn(

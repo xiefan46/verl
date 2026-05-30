@@ -262,23 +262,10 @@ def gptmodel_forward_model_engine(
                 restore_flat_to_nested,
             )
             loss_mask_nested = (logits_processor_args or {}).get("loss_mask", None)
-            prefix_segments_batch = (logits_processor_args or {}).get("prefix_segments_batch", None)
-            # prefix_segments_batch may be a numpy object array or NonTensorStack; convert to list of lists.
-            if prefix_segments_batch is not None:
-                import numpy as _np
-                if isinstance(prefix_segments_batch, _np.ndarray):
-                    prefix_segments_batch = prefix_segments_batch.tolist()
-                elif hasattr(prefix_segments_batch, '__iter__') and not isinstance(prefix_segments_batch, list):
-                    # NonTensorStack from SFTTensorCollator: each element is NonTensorData with .data
-                    prefix_segments_batch = [
-                        el.data if hasattr(el, 'data') else el
-                        for el in prefix_segments_batch
-                    ]
             from megatron.core import parallel_state as _mpu
             _t0 = _time.perf_counter()
             pt_batch = build_prefix_tree_micro_batch(
                 model, input_ids, loss_mask_nested,
-                prefix_segments_batch=prefix_segments_batch,
                 attention_type=prefix_tree_attention,
                 tp_size=_mpu.get_tensor_model_parallel_world_size(),
                 cp_size=_mpu.get_context_parallel_world_size(),
@@ -296,10 +283,6 @@ def gptmodel_forward_model_engine(
                           f"prefix_sharing={_share_ratio:.1%} "
                           f"attn={prefix_tree_attention}", flush=True)
             if pt_batch is None:
-                if not _dist.is_initialized() or _dist.get_rank() == 0:
-                    # Diagnose why prefix-tree returned None
-                    _bs = input_ids.shape[0] if hasattr(input_ids, 'shape') else len(input_ids)
-                    _segs = prefix_segments_batch[:2] if prefix_segments_batch is not None else None
                 use_prefix_tree = False  # no shared prefix — fall through
 
         # MEM_DUMP: start recording before forward if requested
