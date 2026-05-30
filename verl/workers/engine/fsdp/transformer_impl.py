@@ -218,6 +218,27 @@ class FSDPEngine(BaseEngine):
 
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
+        # Magi context-parallel device mesh + group (orthogonal to FSDP DP).
+        # Used by V1 prefix-tree path with prefix_tree_attention=magi.
+        self.context_parallel_size = getattr(self.engine_config, "context_parallel_size", 1)
+        self.cp_device_mesh = None
+        self.cp_group = None
+        if self.context_parallel_size > 1:
+            assert not self.use_ulysses_sp, (
+                "context_parallel_size > 1 (Magi CP) is mutually exclusive with "
+                "ulysses_sequence_parallel_size > 1; pick one parallelism scheme."
+            )
+            assert dp_size * self.context_parallel_size == world_size, (
+                f"dp_size ({dp_size}) * cp_size ({self.context_parallel_size}) "
+                f"!= world_size ({world_size}); adjust fsdp_size or context_parallel_size"
+            )
+            self.cp_device_mesh = init_device_mesh(
+                device_name,
+                mesh_shape=(dp_size, self.context_parallel_size),
+                mesh_dim_names=["dp", "cp"],
+            )
+            self.cp_group = self.cp_device_mesh["cp"].get_group()
+
     def _build_module(self):
         from verl.utils.model import get_hf_auto_model_class
         from verl.utils.torch_dtypes import PrecisionType
@@ -286,7 +307,44 @@ class FSDPEngine(BaseEngine):
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
                 use_fused_kernels=use_fused_kernels,
                 fused_kernels_backend=fused_kernels_backend,
+                use_prefix_tree_v1=getattr(self.engine_config, "use_prefix_tree_v1", False),
             )
+
+            # V1 prefix-tree + Magi: walk the model and attach `cp_group` to
+            # every attention module, then flip `_attn_implementation` so HF
+            # dispatches every layer through our registered Magi backend.
+            if getattr(self.engine_config, "use_prefix_tree_v1", False):
+                # V1+Magi is only supported on FSDP2. FSDP1 (legacy
+                # FullyShardedDataParallel) was empirically found to produce
+                # numerically-divergent forward outputs between eval and train
+                # modes when combined with Magi attention, manifesting as
+                # ppo_kl ≈ 3-4 at step 1 and intermittent NaN grad_norm.
+                # MagiAttention's official torch_native reference example
+                # (examples/torch_native/main.py) uses FSDP2 (`fully_shard`),
+                # which is the validated combination.
+                assert self.engine_config.strategy == "fsdp2", (
+                    f"use_prefix_tree_v1=True requires engine.strategy='fsdp2'; "
+                    f"got strategy='{self.engine_config.strategy}'. "
+                    "FSDP1 + Magi attention is unsupported (causes EVAL/TRAIN "
+                    "forward divergence). Set: "
+                    "actor_rollout_ref.actor.engine.strategy=fsdp2 "
+                    "actor_rollout_ref.ref.engine.strategy=fsdp2"
+                )
+                attn_backend = getattr(self.engine_config, "prefix_tree_attention", "magi")
+                assert attn_backend == "magi", (
+                    f"prefix_tree_attention='{attn_backend}' is unsupported on FSDP; "
+                    "only 'magi' is supported (flex was retired due to the AReaL 8x entropy bug)."
+                )
+                self._attach_magi_cp_group_to_attention_modules(module)
+                # HF reads _attn_implementation per-config; cover both regular and
+                # composite (e.g. VL) configs.
+                cfgs_to_flip = [module.config]
+                for sub in ("text_config", "vision_config"):
+                    sub_cfg = getattr(module.config, sub, None)
+                    if sub_cfg is not None:
+                        cfgs_to_flip.append(sub_cfg)
+                for cfg in cfgs_to_flip:
+                    cfg._attn_implementation = "Magi_Attention"
 
             # some parameters may not in torch_dtype
             module.to(torch_dtype)
@@ -294,6 +352,29 @@ class FSDPEngine(BaseEngine):
             if self.model_config.enable_gradient_checkpointing:
                 module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         return module
+
+    def _attach_magi_cp_group_to_attention_modules(self, model):
+        """Walk model and attach ``cp_group`` attribute to each attention layer.
+
+        Magi's HF backend reads the group via ``module.cp_group``. We use the
+        CP process group from ``_init_device_mesh``; falls back to the world
+        group when CP is not configured (cp_size=1 single-rank case).
+        """
+        cp_group = self.cp_group
+        if cp_group is None and torch.distributed.is_initialized():
+            cp_group = torch.distributed.group.WORLD
+        attached = 0
+        for name, mod in model.named_modules():
+            cls_name = mod.__class__.__name__.lower()
+            if cls_name.endswith("attention") or cls_name.endswith("self_attn") or cls_name.endswith("selfattention"):
+                mod.cp_group = cp_group
+                attached += 1
+        if (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+            or not torch.distributed.is_initialized()
+        ):
+            print(f"[PrefixTreeV1] Attached cp_group to {attached} attention modules")
 
     def _build_lora_module(self, module):
         module.enable_input_require_grads()
@@ -602,7 +683,9 @@ class FSDPEngine(BaseEngine):
         raise NotImplementedError
 
     def get_context_parallel_group(self):
-        raise NotImplementedError
+        # Magi CP group when context_parallel_size > 1, else fall back to a
+        # single-rank group (None / world).
+        return self.cp_group
 
     def forward_backward_batch(self, data: TensorDict, loss_function: Callable, forward_only=False) -> list[TensorDict]:
         # note that the global_batch_size should include data on all the dp
@@ -1208,6 +1291,15 @@ class FSDPEngineWithLMHead(FSDPEngine):
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
+        # V1 prefix tree opt-in flag (passed via non-tensor data on the micro-batch).
+        use_prefix_tree_v1 = tu.get_non_tensor_data(data=micro_batch, key="use_prefix_tree_v1", default=False)
+        prefix_tree_attention = tu.get_non_tensor_data(data=micro_batch, key="prefix_tree_attention", default="magi")
+        if use_prefix_tree_v1 and prefix_tree_attention != "magi":
+            raise ValueError(
+                f"prefix_tree_attention={prefix_tree_attention!r} is unsupported on FSDP; "
+                "only 'magi' is supported (flex was retired due to the AReaL 8x entropy bug)."
+            )
+
         # Honor mixed_precision.param_dtype resolved during FSDP setup. When dtype is fp32,
         # autocast is a no-op at best and a footgun at worst, so skip it entirely.
         # getattr fallback: some subclasses (e.g. VeOmniEngine) bypass FSDPEngine.__init__
@@ -1219,10 +1311,112 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
-            raw_output = self.module(
-                **model_inputs,
-                use_cache=False,
-            )  # prevent model thinks we are generating
+            pt_batch = None
+            if use_prefix_tree_v1:
+                # Defense-in-depth: _build_module already asserts strategy=fsdp2,
+                # but re-check in forward_step in case a code path constructs the
+                # engine without going through _build_module's V1 setup.
+                assert self.engine_config.strategy == "fsdp2", (
+                    f"use_prefix_tree_v1=True requires engine.strategy='fsdp2'; "
+                    f"got strategy='{self.engine_config.strategy}'. "
+                    "FSDP1 + Magi attention is unsupported."
+                )
+
+                # Build the prefix-tree micro-batch + Magi key. When build returns
+                # None (no shared prefix or multi-forest), we transparently fall
+                # back to the dense path with model_inputs.
+                #
+                # Magi CP is mutually exclusive with Ulysses SP — _init_device_mesh
+                # asserts this. The single-rank case (cp_size=1) still works: Magi's
+                # FFA kernel runs locally without dispatch.
+                assert not self.use_ulysses_sp, (
+                    "use_prefix_tree_v1 + Magi is mutually exclusive with Ulysses SP; "
+                    "set actor.ulysses_sequence_parallel_size=1 and use "
+                    "actor.context_parallel_size for Magi-side CP instead."
+                )
+                from verl.utils.prefix_tree_magi import restore_flat_to_nested
+                from verl.utils.prefix_tree_v1 import build_prefix_tree_micro_batch_v1
+
+                # NOTE: pass loss_mask=None — verl's loss_mask in RL flow may have
+                # a different length than input_ids (response-only mask), and we
+                # don't actually consume pt_batch.flat_loss_mask anywhere in this
+                # forward path (prepare_model_outputs reads loss_mask from the
+                # original micro_batch, not from pt_batch).
+                pt_batch = build_prefix_tree_micro_batch_v1(
+                    self.module,
+                    micro_batch["input_ids"],
+                    loss_mask=None,
+                    position_ids=micro_batch.get("position_ids", None),
+                    attention_type="magi",
+                    tp_size=1,
+                    cp_size=self.context_parallel_size,
+                    cp_group=self.cp_group,
+                )
+
+            if pt_batch is not None:
+                # Magi packed forward.
+                #
+                # The Magi runtime key is attached to each attention module as
+                # ``_verl_magi_attention_key`` via ``set_magi_attention_key``.
+                # See that function's docstring for why we use a module
+                # attribute over kwargs / ContextVar (TL;DR: kwargs crash
+                # FSDP2 mixed-precision casting, ContextVar gets reset before
+                # activation-checkpoint backward recompute).
+                #
+                # For cp_size > 1, dispatch the flat input across CP ranks so
+                # each rank's attention layer sees its slice of Q/K/V. cp_size=1
+                # is a no-op pass-through.
+                from verl.models.transformers.monkey_patch import set_magi_attention_key
+
+                # Magi's dispatch / undispatch operate on a flat (seq,) tensor
+                # along dim=0 (default seq_dim). Same pattern as Magi's own
+                # examples/transformers/magi_trainer.py: squash batch → dispatch
+                # → unsqueeze(0) for the model forward, then the inverse for
+                # logits coming out. Passing a (1, seq) tensor straight to
+                # dispatch makes Magi try to split a size-1 dim and crashes.
+                if self.context_parallel_size > 1:
+                    from magi_attention.api import dispatch
+
+                    local_flat_input_ids = dispatch(
+                        pt_batch.local_flat_input_ids, pt_batch.magi_key
+                    )
+                    local_flat_position_ids = dispatch(
+                        pt_batch.local_flat_position_ids, pt_batch.magi_key
+                    )
+                else:
+                    local_flat_input_ids = pt_batch.local_flat_input_ids
+                    local_flat_position_ids = pt_batch.local_flat_position_ids
+
+                flat_input_ids = local_flat_input_ids.unsqueeze(0)
+                flat_position_ids = local_flat_position_ids.unsqueeze(0)
+
+                set_magi_attention_key(self.module, pt_batch.magi_key)
+                raw_output = self.module(
+                    input_ids=flat_input_ids,
+                    attention_mask=None,
+                    position_ids=flat_position_ids,
+                    use_cache=False,
+                )
+
+                # Per-rank logits (1, local_seq, V) → full flat (full_seq, V).
+                logits = raw_output.logits
+                if self.context_parallel_size > 1:
+                    from magi_attention.api import undispatch
+
+                    logits = undispatch(logits.squeeze(0), pt_batch.magi_key)
+                else:
+                    logits = logits.squeeze(0)
+
+                # Trim prefix-tree padding → restore per-sample → rmpad layout
+                # so prepare_model_outputs sees the standard shape.
+                flat_logits = logits[: pt_batch.real_tokens]
+                nested_logits = restore_flat_to_nested(flat_logits, pt_batch)
+                raw_output.logits = nested_logits.values().unsqueeze(0)
+            else:
+                raw_output = self.module(
+                    **model_inputs,
+                    use_cache=False,
+                )  # prevent model thinks we are generating
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function

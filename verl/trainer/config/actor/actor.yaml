@@ -101,6 +101,17 @@ use_kl_loss: false
 # Whether to enable PrefixGrouper shared-prefix forward
 use_prefix_grouper: false
 
+# Whether to enable V1 dynamic prefix-tree forward (FSDP).
+# When true, FSDP forward_step routes shared-prefix micro-batches through
+# build_prefix_tree_micro_batch_v1; falls back to dense when no shared prefix.
+use_prefix_tree_v1: false
+
+# Attention backend used by the prefix-tree path. Only "magi" is supported on FSDP.
+prefix_tree_attention: magi
+
+# Magi context-parallel world size (orthogonal to FSDP DP). 1 disables CP.
+context_parallel_size: 1
+
 # Whether to use torch.compile()
 # oc.select: the default val for ref.use_torch_compile
 use_torch_compile: true

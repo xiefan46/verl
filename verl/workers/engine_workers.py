@@ -342,6 +342,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             max_token_len_per_gpu=self.engine_config.max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.micro_batch_size_per_gpu,
             use_fused_kernels=self.engine_config.use_fused_kernels,
+            use_prefix_tree_v1=self.engine_config.use_prefix_tree_v1,
+            prefix_tree_attention=self.engine_config.prefix_tree_attention,
         )
 
         for key, val in default_keys.items():
@@ -396,6 +398,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
             max_token_len_per_gpu=self.engine_config.infer_max_token_len_per_gpu,
             micro_batch_size_per_gpu=self.engine_config.infer_micro_batch_size_per_gpu,
             use_fused_kernels=self.engine_config.use_fused_kernels,
+            use_prefix_tree_v1=self.engine_config.use_prefix_tree_v1,
+            prefix_tree_attention=self.engine_config.prefix_tree_attention,
         )
 
         for key, val in default_keys.items():
@@ -530,6 +534,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.ref.ppo_micro_batch_size_per_gpu
             )
             ref_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
+            ref_training_config.engine_config.use_prefix_tree_v1 = self.config.ref.get("use_prefix_tree_v1", False)
+            ref_training_config.engine_config.prefix_tree_attention = self.config.ref.get(
+                "prefix_tree_attention", "magi"
+            )
+            ref_training_config.engine_config.context_parallel_size = self.config.ref.get("context_parallel_size", 1)
 
             self.ref = TrainingWorker(config=ref_training_config)
             self.ref.reset()
@@ -566,6 +575,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.config.actor.ppo_micro_batch_size_per_gpu
             )
             actor_training_config.engine_config.use_remove_padding = model_config.get("use_remove_padding", False)
+            # Propagate V1 prefix-tree flags from actor.* to engine_config so that
+            # FSDP forward_step (which only sees engine_config) can read them.
+            actor_training_config.engine_config.use_prefix_tree_v1 = self.config.actor.get("use_prefix_tree_v1", False)
+            actor_training_config.engine_config.prefix_tree_attention = self.config.actor.get(
+                "prefix_tree_attention", "magi"
+            )
+            actor_training_config.engine_config.context_parallel_size = self.config.actor.get(
+                "context_parallel_size", 1
+            )
 
             if self.config.actor.use_dynamic_bsz:
                 assert self.config.rollout.log_prob_max_token_len_per_gpu is not None

@@ -83,6 +83,9 @@ class EngineConfig(BaseConfig):
         "infer_micro_batch_size_per_gpu",
         "use_fused_kernels",
         "use_remove_padding",
+        "use_prefix_tree_v1",
+        "prefix_tree_attention",
+        "context_parallel_size",
         "forward_only",
         "param_offload",
     }
@@ -110,6 +113,18 @@ class EngineConfig(BaseConfig):
     use_fused_kernels: bool = False
     # TODO (this may conflict with the one in model config)
     use_remove_padding: bool = True
+    # Enable V1 dynamic prefix-tree forward (FSDP only for now).
+    # When true, FSDP forward_step routes shared-prefix batches through
+    # build_prefix_tree_micro_batch_v1; falls back to dense when no shared prefix.
+    use_prefix_tree_v1: bool = False
+    # Attention backend used by V1 prefix tree path. ONLY "magi" is supported on
+    # FSDP — flex_attention has been retired due to the AReaL 8x entropy bug.
+    prefix_tree_attention: str = "magi"
+    # Magi context-parallel world size (FSDP only). 1 disables CP.
+    # When > 1, FSDP engine builds a CP process group via the device mesh and
+    # plumbs it to each attention module so Magi's distributed FFA can dispatch
+    # work across CP ranks.
+    context_parallel_size: int = 1
 
     seed: int = 42
 

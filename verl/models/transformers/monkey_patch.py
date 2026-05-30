@@ -72,6 +72,155 @@ def apply_prefix_grouper_patch():
     print(f"[PrefixGrouper] Patched: {patched}")
 
 
+# ---------------------------------------------------------------------------
+# Prefix-tree V1 + Magi backend
+#
+# Strategy: register a new attention backend ``"Magi_Attention"`` into
+# transformers ``ALL_ATTENTION_FUNCTIONS``. When V1 prefix-tree path runs on
+# FSDP, we set ``model.config._attn_implementation = "Magi_Attention"`` so HF
+# dispatches every attention layer through this backend. The backend retrieves
+# the Magi flex-attention key from the per-cp_group global cache and calls
+# Magi's distributed FFA kernel.
+#
+# Why not flex_attention: the AReaL flex_attention path has a documented 8×
+# entropy bug (see research/2026-05-08-tree-structured-training-survey.md and
+# memory ``tree-training-magi-migration.md``). Magi is the authoritative path.
+# ---------------------------------------------------------------------------
+
+_MAGI_PREFIX_TREE_V1_REGISTERED = False
+
+
+def _is_attention_module(mod) -> bool:
+    cls_name = mod.__class__.__name__.lower()
+    return cls_name.endswith("attention") or cls_name.endswith("self_attn") or cls_name.endswith("selfattention")
+
+
+def set_magi_attention_key(model, key) -> None:
+    """Attach ``key`` to every attention layer in ``model`` as
+    ``_verl_magi_attention_key``.
+
+    Why a module attribute (not kwargs, not ContextVar):
+
+    - **kwargs**: FSDP2's ``_pre_forward`` mixed-precision casting
+      (``torch.distributed.utils._apply_to_tensors``) recursively calls
+      ``dataclasses.replace`` on every dataclass kwarg. ``DistAttnRuntimeKey``
+      nests ``OverlapConfig`` which has ``_no_overlap: field(init=False)`` —
+      ``replace()`` can't reconstruct ``init=False`` fields, so the kwargs
+      path crashes the pre-hook before any attention func runs.
+
+    - **ContextVar**: ``with ctx.set(key): model(...)`` works for the forward,
+      but verl's caller runs ``loss.backward()`` *after* the ``with`` block
+      returns. Activation checkpointing then re-runs the forward inside the
+      backward pass with the ContextVar already reset, so the attention func
+      sees ``None``.
+
+    - **Module attribute**: persists through both the forward and the
+      checkpoint-recompute forward inside backward. The next ``forward_step``
+      overwrites it, so there's no stale state across micro-batches. Same
+      pattern verl already uses for ``cp_group``
+      (see ``_attach_magi_cp_group_to_attention_modules``).
+
+    Callers (``FSDPEngine.forward_step``, ``prefix_tree_v1_forward``) call
+    this right before invoking ``model(...)``. No explicit cleanup needed.
+    """
+    for _, mod in model.named_modules():
+        if _is_attention_module(mod):
+            mod._verl_magi_attention_key = key
+
+
+def _magi_prefix_tree_attention_forward(
+    module,
+    query,
+    key,
+    value,
+    attention_mask,
+    scaling=None,
+    dropout: float = 0.0,
+    **kwargs,
+):
+    """HF-compatible attention forward backed by MagiAttention's FFA kernel.
+
+    Reads the Magi runtime key from ``module._verl_magi_attention_key``, which
+    the caller (``FSDPEngine.forward_step``, ``prefix_tree_v1_forward``) sets
+    via ``set_magi_attention_key(model, pt_batch.magi_key)`` right before
+    invoking ``model(...)``. See ``set_magi_attention_key`` for the trade-off
+    rationale (vs ``get_most_recent_key`` LRU side-channel, kwargs, or
+    ContextVar — all rejected for reasons documented there).
+
+    Expected shapes (HF convention):
+        query / key / value: (bsz, num_heads, seq_len, head_dim)
+        bsz MUST be 1 — V1 prefix tree packs all samples into a single batch.
+
+    Patterned 1:1 after MagiAttention's official reference:
+        https://github.com/SandAI-org/MagiAttention/blob/main/examples/transformers/magi_attention_func.py
+    Sync this with upstream when upgrading magi_attention.
+    """
+    from einops import rearrange
+    from magi_attention.api import calc_attn
+
+    magi_key = getattr(module, "_verl_magi_attention_key", None)
+    assert magi_key is not None, (
+        "Magi_Attention backend requires `_verl_magi_attention_key` to be set "
+        "on each attention module before model(...) is called. Verl's "
+        "FSDPEngine.forward_step and prefix_tree_v1_forward do this via "
+        "set_magi_attention_key(model, pt_batch.magi_key); if you're seeing "
+        "this from another caller, call set_magi_attention_key before forward."
+    )
+
+    cp_group = getattr(module, "cp_group", None)
+    assert cp_group is not None or torch.distributed.is_initialized() is False, (
+        "Magi_Attention backend requires the attention module to carry a `cp_group` "
+        "attribute (attach it via FSDPEngine._build_module when "
+        "use_prefix_tree_v1=True). Did apply_magi_prefix_tree_v1_backend run?"
+    )
+
+    # The MagiAttention reference example hardcodes batch_size=1 in its
+    # rearrange patterns. V1 prefix tree always packs samples into a single
+    # batch, so this is the only supported layout. Fail fast on any other
+    # batch size rather than producing silently-wrong outputs.
+    bsz = query.shape[0]
+    assert bsz == 1, (
+        f"Magi_Attention backend requires batch_size=1 (V1 prefix tree packs "
+        f"all samples into one batched sequence), got batch_size={bsz}. "
+        "Check the call site — input_ids should be flat_input_ids.unsqueeze(0)."
+    )
+
+    dtype = query.dtype
+    # (1, num_heads, seq_len, head_dim) -> (1*seq_len, num_heads, head_dim).
+    # FFA only supports fp16/bf16; cast to bf16 inside, then cast back.
+    q, k, v = [
+        rearrange(e, "1 nh s hd -> (1 s) nh hd").to(torch.bfloat16)
+        for e in (query, key, value)
+    ]
+
+    o = calc_attn(q, k, v, magi_key)[0]
+
+    o = rearrange(o, "(1 s) nh hd -> 1 s (nh hd)").to(dtype)
+    return o, None
+
+
+def apply_magi_prefix_tree_v1_backend():
+    """Idempotently register ``"Magi_Attention"`` into ALL_ATTENTION_FUNCTIONS.
+
+    Callers that want to actually USE this backend must additionally:
+      1. Set ``model.config._attn_implementation = "Magi_Attention"`` on each
+         HF model whose attention layers should dispatch here.
+      2. Attach ``cp_group`` attribute to every attention module (the
+         FSDPEngine does this when ``use_prefix_tree_v1=True``).
+      3. Call ``magi_attn_flex_key(..., cp_group_or_mesh=cp_group, ...)`` so
+         the per-cp_group key is in the global store before forward.
+    """
+    global _MAGI_PREFIX_TREE_V1_REGISTERED
+    if _MAGI_PREFIX_TREE_V1_REGISTERED:
+        return
+
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    ALL_ATTENTION_FUNCTIONS.register("Magi_Attention", _magi_prefix_tree_attention_forward)
+    _MAGI_PREFIX_TREE_V1_REGISTERED = True
+    print("[PrefixTreeV1] Registered Magi_Attention backend in ALL_ATTENTION_FUNCTIONS")
+
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=2, repeats=n_rep). The hidden states go from (batch,
@@ -295,6 +444,7 @@ def apply_monkey_patch(
     use_fused_kernels: bool = False,
     fused_kernels_backend: str = None,
     use_prefix_grouper: bool = False,
+    use_prefix_tree_v1: bool = False,
     use_tiled_mlp: bool = False,
     tiled_mlp_shards: int = 4,
 ):
@@ -323,6 +473,12 @@ def apply_monkey_patch(
     # Apply PrefixGrouper patch if enabled
     if use_prefix_grouper:
         apply_prefix_grouper_patch()
+
+    # Apply PrefixTreeV1 backend (Magi) if enabled — registers Magi_Attention.
+    # Caller (FSDPEngine._build_module) still has to walk the model, attach
+    # `cp_group` to each attention module, and flip `_attn_implementation`.
+    if use_prefix_tree_v1:
+        apply_magi_prefix_tree_v1_backend()
 
     """Replace _flash_attention_forward to _ulysses_flash_attention_forward"""
     module = sys.modules[model.__module__]

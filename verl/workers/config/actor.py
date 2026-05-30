@@ -170,6 +170,15 @@ class ActorConfig(BaseConfig):
     use_kl_loss: bool = False
     # Whether to enable PrefixGrouper-based shared-prefix forward
     use_prefix_grouper: bool = False
+    # Whether to enable V1 dynamic prefix-tree forward (FSDP).
+    # When true, forward_step routes shared-prefix micro-batches through
+    # build_prefix_tree_micro_batch_v1 + restore_flat_to_nested. Falls back to
+    # the dense path when no shared prefix is detected.
+    use_prefix_tree_v1: bool = False
+    # Attention backend for the prefix-tree path. Only "magi" is supported on FSDP.
+    prefix_tree_attention: str = "magi"
+    # Magi context-parallel world size (orthogonal to FSDP DP). 1 disables CP.
+    context_parallel_size: int = 1
     use_torch_compile: bool = True
     kl_loss_coef: float = 0.001
     kl_loss_type: str = "low_var_kl"

@@ -80,6 +80,9 @@ actor_rollout_ref:
     calculate_sum_pi_squared: false
     use_kl_loss: false
     use_prefix_grouper: false
+    use_prefix_tree_v1: false
+    prefix_tree_attention: magi
+    context_parallel_size: 1
     use_torch_compile: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
@@ -146,6 +149,9 @@ actor_rollout_ref:
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
     strategy: veomni
     use_torch_compile: ${oc.select:actor_rollout_ref.actor.use_torch_compile,true}
+    use_prefix_tree_v1: ${oc.select:actor_rollout_ref.actor.use_prefix_tree_v1,false}
+    prefix_tree_attention: ${oc.select:actor_rollout_ref.actor.prefix_tree_attention,magi}
+    context_parallel_size: ${oc.select:actor_rollout_ref.actor.context_parallel_size,1}
     log_prob_micro_batch_size: null
     log_prob_micro_batch_size_per_gpu: null
     log_prob_use_dynamic_bsz: ${oc.select:actor_rollout_ref.actor.use_dynamic_bsz,false}
