@@ -158,10 +158,18 @@ def _loss(per_sample, samples):
 
 
 def _grad_norm(model):
-    total_sq = torch.zeros(1, device="cuda")
+    """Global L2 grad norm. Handles FSDP2 DTensor grads (convert to local, then
+    all-reduce sum-of-squares across ranks)."""
+    total_sq = torch.zeros((), device="cuda")  # scalar (shape ()), not (1,) — avoids DTensor wrap
     for p in model.parameters():
         if p.grad is not None:
-            total_sq += p.grad.detach().float().pow(2).sum()
+            g = p.grad.detach()
+            # FSDP2 wraps p.grad as DTensor; unwrap to local shard before computation.
+            if hasattr(g, "to_local"):
+                g = g.to_local()
+            total_sq = total_sq + g.float().pow(2).sum()
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        dist.all_reduce(total_sq, op=dist.ReduceOp.SUM)
     return total_sq.sqrt().item()
 
 
