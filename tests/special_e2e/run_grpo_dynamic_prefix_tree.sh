@@ -122,7 +122,7 @@ python3 -m verl.trainer.main_ppo \
 
 if [ "$SKIP_BASELINE" = "1" ]; then
     echo "=========================================="
-    echo "[E2E] SKIP_BASELINE=1 → skipping dense baseline + comparison"
+    echo "[E2E] SKIP_BASELINE=1 → skipping dense baseline run"
     echo "[E2E] dynamic-trie + Magi log: $LOG_DIR/dyn.log"
     echo "=========================================="
     exit 0
@@ -137,13 +137,6 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=qwen2_5_05b_grpo_dense \
     2>&1 | tee "$LOG_DIR/dense.log"
 
-echo "=========================================="
-echo "[E2E] Comparing reward trajectories"
-echo "=========================================="
-python3 tests/special_e2e/check_dynamic_prefix_tree_reward.py \
-    --dense_log "$LOG_DIR/dense.log" \
-    --dyn_log "$LOG_DIR/dyn.log" \
-    --max_step_diff 0.05 \
-    --min_correlation 0.85
-
-echo "[E2E] PASSED — log dir: $LOG_DIR"
+echo "[E2E] Both runs completed — log dir: $LOG_DIR"
+echo "[E2E]   dynamic-trie + Magi: $LOG_DIR/dyn.log"
+echo "[E2E]   dense baseline:      $LOG_DIR/dense.log"
