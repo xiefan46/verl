@@ -20,6 +20,9 @@
 #   bash tests/special_e2e/run_e2e_convergence.sh
 #   STEPS=10 bash tests/special_e2e/run_e2e_convergence.sh   # smoke
 #   SKIP_R3=1 bash tests/special_e2e/run_e2e_convergence.sh  # skip CP run
+#   USE_WANDB=1 bash tests/special_e2e/run_e2e_convergence.sh # also log to wandb
+#       (requires `wandb login` or WANDB_API_KEY env; wandb project name
+#        = $WANDB_PROJECT, default 'tree_training_convergence_e2e')
 #
 set -ex
 
@@ -27,6 +30,15 @@ MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-3B-Instruct}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 DATA_DIR=${DATA_DIR:-${HOME}/data/gsm8k}
 LOG_DIR=${LOG_DIR:-$(mktemp -d /tmp/convergence_e2e.XXXXXX)}
+
+USE_WANDB=${USE_WANDB:-0}
+WANDB_PROJECT=${WANDB_PROJECT:-tree_training_convergence_e2e}
+if [ "$USE_WANDB" = "1" ]; then
+    # console kept so compare_training_metrics.py can still parse step lines
+    LOGGER_ARG=("trainer.logger=[console,wandb]")
+else
+    LOGGER_ARG=("trainer.logger=console")
+fi
 
 STEPS=${STEPS:-150}
 ROLLOUT_N=${ROLLOUT_N:-8}
@@ -88,8 +100,8 @@ COMMON_ARGS=(
     actor_rollout_ref.rollout.n=$ROLLOUT_N
     algorithm.kl_ctrl.kl_coef=0.001
     trainer.critic_warmup=0
-    trainer.logger=console
-    trainer.project_name=tree_training_convergence_e2e
+    "${LOGGER_ARG[@]}"
+    trainer.project_name=$WANDB_PROJECT
     trainer.n_gpus_per_node=$N_GPUS
     trainer.nnodes=1
     trainer.save_freq=-1
