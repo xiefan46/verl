@@ -9,14 +9,14 @@
 
 Test surface:
   * TestDynBuildBasic         — dynamic build correctness on depth-3 inputs
-                               (parallels test_prefix_tree_magi.TestBuildPrefixTreeLayout)
+                               (parallels test_prefix_tree.TestBuildPrefixTreeLayout)
   * TestDynArbitraryDepth     — Dynamic build reaches depth 4-5 where hash-based path caps at 3
   * TestDynRestoreRoundTrip   — restore_flat_to_nested round-trip via _leaf_ancestor_ranges
   * TestApplyDynPatch         — monkey-patch idempotency + kwarg handling (needs transformers)
   * TestPrefixTreeDynForward  — mini Qwen2 forward through dynamic path == dense baseline
                                (needs transformers + flex_attention)
 
-Reuse pattern from test_prefix_tree_magi.py: imports inside test bodies so pytest
+Reuse pattern from test_prefix_tree.py: imports inside test bodies so pytest
 collection works in environments missing optional deps.
 """
 
@@ -70,10 +70,10 @@ class TestDynBuildBasic:
 
     def test_depth3_two_groups_per_sample_reconstruction(self):
         from verl.utils.prefix_tree_dynamic import (
-            build_arbitrary_depth_params,
             convert_trie_to_tree_node,
             greedy_build_tries,
         )
+        from verl.utils.prefix_tree_utils import build_layout_from_tree_node
 
         # 4 samples in 2 groups of 2: [1,2,3] root → [100,200] mid → [101,102]/[201,202] leaves
         # and another group: [300,400] mid → [301,302]/[401,402] leaves
@@ -89,10 +89,10 @@ class TestDynBuildBasic:
 
         converted = convert_trie_to_tree_node(tries[0])
         assert converted is not None
-        root_tn, node_info, leaves = converted
-        assert len(leaves) == 4
+        root_tn, leaf_to_sample = converted
+        assert len(leaf_to_sample) == 4
 
-        params = build_arbitrary_depth_params(sample_tensors, root_tn, node_info, leaves)
+        params = build_layout_from_tree_node(sample_tensors, root_tn, leaf_to_sample)
         # flat layout: root + group1_mid + leaf1 + leaf2 + group2_mid + leaf3 + leaf4
         expected_flat = torch.tensor([1, 2, 3, 100, 200, 101, 102, 201, 202, 300, 400, 301, 302, 401, 402])
         assert torch.equal(params.flat_tokens, expected_flat)
@@ -171,10 +171,10 @@ class TestDynArbitraryDepth:
     def test_depth4_balanced(self):
         """8 samples, real depth-4 (branch_factor=2 binary tree)."""
         from verl.utils.prefix_tree_dynamic import (
-            build_arbitrary_depth_params,
             convert_trie_to_tree_node,
             greedy_build_tries,
         )
+        from verl.utils.prefix_tree_utils import build_layout_from_tree_node
 
         # Build 8 samples that form a depth-4 binary tree:
         # root [1,2,3] → 2 chains → 2 sub-chains → 8 leaves
@@ -194,15 +194,15 @@ class TestDynArbitraryDepth:
         tries, _ = greedy_build_tries(samples, max_tokens_per_tree=10_000)
         converted = convert_trie_to_tree_node(tries[0])
         assert converted is not None
-        root_tn, node_info, leaves = converted
+        root_tn, leaf_to_sample = converted
 
         def _max_depth(n):
             return 1 if not n.children else 1 + max(_max_depth(c) for c in n.children)
 
         assert _max_depth(root_tn) == 4, f"expected real depth-4, got {_max_depth(root_tn)}"
-        assert len(leaves) == 8
+        assert len(leaf_to_sample) == 8
 
-        params = build_arbitrary_depth_params(sample_tensors, root_tn, node_info, leaves)
+        params = build_layout_from_tree_node(sample_tensors, root_tn, leaf_to_sample)
         # Each leaf should have 3 ancestors (root, depth-2 seg, depth-3 seg)
         for a in params._leaf_ancestor_ranges:
             assert len(a) == 3
@@ -224,7 +224,7 @@ class TestDynRestoreRoundTrip:
     def test_restore_depth3(self):
         pytest.importorskip("transformers")
         from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
-        from verl.utils.prefix_tree_magi import restore_flat_to_nested
+        from verl.utils.prefix_tree import restore_flat_to_nested
 
         samples = [
             [10, 20, 30, 41, 42, 43],
@@ -293,7 +293,7 @@ class TestPrefixTreeDynForward:
 
         from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_backend
         from verl.utils.prefix_tree_dynamic import prefix_tree_dynamic_forward
-        from verl.utils.prefix_tree_magi import restore_flat_to_nested
+        from verl.utils.prefix_tree import restore_flat_to_nested
 
         # Register Magi_Attention BEFORE constructing the model — HF's
         # Qwen2ForCausalLM.__init__ validates _attn_implementation against

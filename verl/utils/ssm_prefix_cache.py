@@ -24,7 +24,7 @@ Rolling hash scheme (matches vLLM block hashing):
     h[i]  = hash(tokens[i*K : (i+1)*K]  ||  h[i-1])
 
 Reference:
-    _hash_prefix():  verl/utils/prefix_tree_magi.py:314
+    _hash_prefix():  verl/utils/prefix_tree.py:314
     vLLM prefix caching:  vllm/core/block/prefix_caching_block.py
 
 Usage:
@@ -49,7 +49,7 @@ import torch
 from torch import Tensor
 
 # ---------------------------------------------------------------------------
-# Link to existing hash primitive from prefix_tree_magi.py
+# Link to existing hash primitive from prefix_tree.py
 # ---------------------------------------------------------------------------
 
 def _import_hash_fn():
@@ -58,7 +58,7 @@ def _import_hash_fn():
     if _verl_dir not in sys.path:
         sys.path.insert(0, _verl_dir)
     try:
-        from verl.utils.prefix_tree_magi import _hash_prefix
+        from verl.utils.prefix_tree import _hash_prefix
         return _hash_prefix
     except ImportError:
         pass

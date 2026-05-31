@@ -52,10 +52,10 @@ def _load_verl_module(rel_path: str, mod_name: str):
     return mod
 
 
-# Load in dependency order (prefix_tree_dynamic imports from prefix_tree_magi)
+# Load in dependency order (prefix_tree_dynamic imports from prefix_tree)
 _load_verl_module("verl/utils/prefix_tree_params.py", "verl.utils.prefix_tree_params")
 _load_verl_module("verl/utils/prefix_tree_utils.py", "verl.utils.prefix_tree_utils")
-_load_verl_module("verl/utils/prefix_tree_magi.py", "verl.utils.prefix_tree_magi")
+_load_verl_module("verl/utils/prefix_tree.py", "verl.utils.prefix_tree")
 _dyn = _load_verl_module("verl/utils/prefix_tree_dynamic.py", "verl.utils.prefix_tree_dynamic")
 
 build_dynamic = _dyn.build_prefix_tree_micro_batch_dynamic

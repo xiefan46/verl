@@ -12,7 +12,7 @@
 Token-by-token trie insertion that supports **arbitrary tree depth** —
 detects the shared-prefix tree directly from the input tokens, no
 rollout-side metadata required. Invoked by the unified
-:func:`verl.utils.prefix_tree_magi.build_prefix_tree_micro_batch` entry
+:func:`verl.utils.prefix_tree.build_prefix_tree_micro_batch` entry
 point when ``dynamic_trie=True``.
 
 REQUIREMENTS (enforced by ``FSDPEngine._build_module`` assertion):
@@ -42,23 +42,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-import torch
 from torch import Tensor
-from torch.nested._internal.nested_tensor import NestedTensor
 
-from verl.utils.prefix_tree_magi import PrefixTreeMagiBatch, _build_magi_key
-from verl.utils.prefix_tree_params import PrefixTreeParams
-from verl.utils.prefix_tree_utils import TreeNode, build_multilevel_flex_spec
+from verl.utils.prefix_tree import PrefixTreeMagiBatch
+from verl.utils.prefix_tree_utils import TreeNode
 
 __all__ = [
+    "build_tree_dynamic",
     "build_prefix_tree_micro_batch_dynamic",
     "prefix_tree_dynamic_forward",
     # Lower-level helpers exposed for testing / benchmarking
     "TrieNode",
     "greedy_build_tries",
     "convert_trie_to_tree_node",
-    "build_arbitrary_depth_params",
-    "unpack_nested_to_list",
 ]
 
 
@@ -217,9 +213,9 @@ def greedy_build_tries(
 
 def convert_trie_to_tree_node(
     trie: TrieNode,
-) -> Optional[tuple[TreeNode, dict[int, tuple[int, int, int]], list[TreeNode]]]:
-    """Convert a compressed trie to a ``TreeNode`` consumed by
-    ``build_multilevel_flex_spec``.
+) -> Optional[tuple[TreeNode, list[int]]]:
+    """Convert a compressed trie to ``(TreeNode, leaf_to_sample)`` consumed by
+    :func:`verl.utils.prefix_tree_utils.build_layout_from_tree_node`.
 
     The trie root is a virtual placeholder with no tokens. We promote the
     trie's only child as the TreeNode root so the downstream flex-spec
@@ -228,181 +224,63 @@ def convert_trie_to_tree_node(
     Returns ``None`` when there's no real sharing (single sample, no children,
     or multi-forest case).
 
-    Returns ``(root, node_info, leaves_in_dfs)`` where:
-      - ``root``: ``TreeNode`` root for downstream packing
-      - ``node_info[id(node)] = (owner_sample_idx, range_start, range_end)``:
-        for each non-root node, an owning sample + token range in that sample's
-        original sequence. Needed for ``build_arbitrary_depth_params`` to emit
-        flat tokens from the correct sample.
-      - ``leaves_in_dfs``: leaf TreeNodes in DFS pre-order, matching the order
-        ``build_multilevel_flex_spec`` walks the tree.
+    Returns ``(root, leaf_to_sample)`` where ``leaf_to_sample[i]`` is the
+    original sample index for the i-th leaf in DFS pre-order — matches the
+    contract expected by ``build_layout_from_tree_node``.
     """
     if not trie.children:
         return None
     if len(trie.children) > 1:
-        # Multi-forest — no single shared root prefix
         return None
 
-    node_info: dict[int, tuple[int, int, int]] = {}
-    leaves_in_dfs: list[TreeNode] = []
+    leaf_to_sample: list[int] = []
 
-    def _convert(trie_node: TrieNode, offset_in_owner: int) -> TreeNode:
+    def _convert(trie_node: TrieNode) -> TreeNode:
         segment_len = len(trie_node.tokens)
-        end_in_owner = offset_in_owner + segment_len
-
-        children: list[TreeNode] = []
-        for _tok, child in sorted(trie_node.children.items()):
-            children.append(_convert(child, end_in_owner))
-
+        children: list[TreeNode] = [_convert(child) for _tok, child in sorted(trie_node.children.items())]
         node = TreeNode(segment_len=segment_len, children=children)
-
         if not children:
             assert len(trie_node.sequence_ids) == 1, (
                 f"Trie leaf should belong to exactly 1 sample, got {trie_node.sequence_ids}"
             )
-            owner = trie_node.sequence_ids[0]
-            node_info[id(node)] = (owner, offset_in_owner, end_in_owner)
-            leaves_in_dfs.append(node)
-        else:
-            first_child_owner = node_info[id(children[0])][0]
-            node_info[id(node)] = (first_child_owner, offset_in_owner, end_in_owner)
+            leaf_to_sample.append(trie_node.sequence_ids[0])
         return node
 
     only_child = next(iter(trie.children.values()))
-    root = _convert(only_child, 0)
+    root = _convert(only_child)
     if not root.children:
         return None
-    return root, node_info, leaves_in_dfs
+    return root, leaf_to_sample
 
 
 # ============================================================================
-# Arbitrary-depth params builder (generalises the hash-path depth-2 limit)
+# Detection entry: build_tree_dynamic
 # ============================================================================
 
 
-def build_arbitrary_depth_params(
-    tokens_by_sample: list[Tensor],
-    tree_root: TreeNode,
-    node_info: dict[int, tuple[int, int, int]],
-    leaves_in_dfs: list[TreeNode],
-    loss_masks_by_sample: Optional[list[Tensor]] = None,
-    position_ids_by_sample: Optional[list[Tensor]] = None,
-) -> PrefixTreeParams:
-    """Build PrefixTreeParams for arbitrary-depth tree.
+def build_tree_dynamic(samples: list[Tensor]) -> Optional[tuple[TreeNode, list[int]]]:
+    """Token-by-token trie detection. Returns ``(TreeNode, leaf_to_sample)`` or None.
 
-    Uses ``build_multilevel_flex_spec`` for q/k_ranges (already supports any
-    depth) and walks DFS pre-order to emit flat tokens from each node's owning
-    sample.
+    Builds a compressed trie of the input samples, then converts it to the
+    canonical ``TreeNode`` representation consumed by
+    :func:`verl.utils.prefix_tree_utils.build_layout_from_tree_node`.
 
-    Side effect: sets ``params._leaf_ancestor_ranges`` so ``restore_flat_to_nested``
-    can reconstruct each sample by concatenating its ancestor segments + leaf.
+    ``leaf_to_sample[i]`` gives the original sample index for the i-th leaf in
+    DFS pre-order. Returns ``None`` when there's no shared prefix (empty input,
+    single sample, or multi-forest case).
     """
-    q_ranges, k_ranges, mask_types = build_multilevel_flex_spec(tree_root)
-
-    device = tokens_by_sample[0].device
-    flat_pieces: list[Tensor] = []
-    flat_lm_pieces: Optional[list[Tensor]] = [] if loss_masks_by_sample is not None else None
-    flat_pid_pieces: Optional[list[Tensor]] = [] if position_ids_by_sample is not None else None
-    default_pid_pieces: list[Tensor] = []  # used when position_ids_by_sample is None
-
-    # Track per-leaf ancestor chain (root → ... → parent) for restore.
-    parent_of: dict[int, TreeNode] = {}  # id(child) → parent_node
-
-    def _emit(node: TreeNode):
-        if node.segment_len > 0:
-            owner_idx, range_s, range_e = node_info[id(node)]
-            flat_pieces.append(tokens_by_sample[owner_idx][range_s:range_e])
-            if flat_lm_pieces is not None:
-                flat_lm_pieces.append(loss_masks_by_sample[owner_idx][range_s:range_e])
-            if flat_pid_pieces is not None:
-                flat_pid_pieces.append(position_ids_by_sample[owner_idx][range_s:range_e])
-            else:
-                default_pid_pieces.append(torch.arange(range_s, range_e, device=device, dtype=torch.long))
-        for child in node.children:
-            parent_of[id(child)] = node
-            _emit(child)
-
-    _emit(tree_root)
-
-    flat_tokens = (
-        torch.cat(flat_pieces) if flat_pieces else torch.empty(0, dtype=tokens_by_sample[0].dtype, device=device)
-    )
-    flat_loss_mask = torch.cat(flat_lm_pieces) if flat_lm_pieces is not None else None
-    if flat_pid_pieces is not None:
-        flat_position_ids = torch.cat(flat_pid_pieces)
-    else:
-        flat_position_ids = (
-            torch.cat(default_pid_pieces) if default_pid_pieces else torch.empty(0, dtype=torch.long, device=device)
-        )
-
-    # leaf_ranges from side-effect assignment by build_multilevel_flex_spec
-    leaf_ranges = [(leaf._flat_start, leaf._flat_end) for leaf in leaves_in_dfs]  # type: ignore[attr-defined]
-    leaf_to_sample = [node_info[id(leaf)][0] for leaf in leaves_in_dfs]
-
-    prefix_range = (tree_root._flat_start, tree_root._flat_end)  # type: ignore[attr-defined]
-    sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample, leaf_ranges, strict=False)}
-
-    # Per-leaf ancestor flat ranges (root → parent), needed by restore_flat_to_nested
-    leaf_ancestor_ranges: list[list[tuple[int, int]]] = []
-    for leaf in leaves_in_dfs:
-        chain: list[tuple[int, int]] = []
-        cur = parent_of.get(id(leaf))
-        while cur is not None:
-            chain.append((cur._flat_start, cur._flat_end))  # type: ignore[attr-defined]
-            cur = parent_of.get(id(cur))
-        chain.reverse()  # root first
-        leaf_ancestor_ranges.append(chain)
-
-    params = PrefixTreeParams(
-        prefix_range=prefix_range,
-        prefix_segments=[prefix_range],
-        leaf_ranges=leaf_ranges,
-        leaf_segments=list(leaf_ranges),
-        leaf_to_sample=list(leaf_to_sample),
-        sample_to_leaf_range=sample_to_leaf_range,
-        q_ranges=q_ranges,
-        k_ranges=k_ranges,
-        mask_types=mask_types,
-        total_seqlen_q=flat_tokens.numel(),
-        total_seqlen_k=flat_tokens.numel(),
-        flat_tokens=flat_tokens,
-        flat_labels=None,
-        flat_loss_mask=flat_loss_mask,
-        flat_position_ids=flat_position_ids,
-        multilevel=True,
-    )
-    params._leaf_ancestor_ranges = leaf_ancestor_ranges  # type: ignore[attr-defined]
-    return params
-
-
-# ============================================================================
-# NestedTensor / list-of-Tensors unpacking
-# ============================================================================
-
-
-def unpack_nested_to_list(x) -> Optional[list[Tensor]]:
-    """Unpack NestedTensor (or pass-through list of Tensors) → list of 1-D tensors.
-
-    Accepts the same input shapes as ``prefix_tree_magi.build_prefix_tree_micro_batch``.
-    Returns ``None`` when ``x is None``.
-    """
-    if x is None:
+    if not samples:
         return None
-    if isinstance(x, NestedTensor) or hasattr(x, "offsets"):
-        offsets = x.offsets()
-        lengths = offsets.diff().tolist()
-        flat_vals = x.values()
-        out: list[Tensor] = []
-        pos = 0
-        for length in lengths:
-            out.append(flat_vals[pos : pos + int(length)])
-            pos += int(length)
-        return out
-    return list(x)
+    sequences = [t.tolist() for t in samples]
+    max_tokens_per_tree = sum(len(s) for s in sequences) * 10  # one forest
+    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
+    if not tries or len(tries) > 1:
+        return None
+    return convert_trie_to_tree_node(tries[0])
 
 
 # ============================================================================
-# Public entry: build_prefix_tree_micro_batch_dynamic
+# Backwards-compat wrapper — delegates to the unified entry with dynamic_trie=True
 # ============================================================================
 
 
@@ -417,104 +295,32 @@ def build_prefix_tree_micro_batch_dynamic(
     cp_size: int = 1,
     cp_group=None,
 ) -> Optional[PrefixTreeMagiBatch]:
-    """Dynamic-trie implementation of ``build_prefix_tree_micro_batch``.
+    """Dynamic-only entry — thin wrapper around the unified
+    :func:`verl.utils.prefix_tree.build_prefix_tree_micro_batch` with
+    ``dynamic_trie=True``.
 
-    Invoked by :func:`verl.utils.prefix_tree_magi.build_prefix_tree_micro_batch`
-    when ``dynamic_trie=True``. Detects the shared-prefix tree by token-by-token
-    trie insertion, supporting arbitrary depth.
-
-    Args / returns: same contract as the hash-based path. ``prefix_segments_batch``
-    is accepted for signature parity but **ignored** — the trie path infers the
-    tree structure directly from the token sequences.
-
-    Only ``attention_type="magi"`` is supported. The flex backend was retired
-    due to the AReaL 8× entropy bug. Pass ``cp_group`` explicitly for the FSDP
-    path so Magi's CP dispatch operates on the correct subgroup.
-
-    Returns ``None`` when there's no shared prefix (single sample, multi-forest
-    case, or empty input).
+    Kept as a stable handle for existing callers (FSDP engine + sanity tests +
+    benchmark) that pre-date the unified dispatcher. New code should call
+    ``build_prefix_tree_micro_batch(..., dynamic_trie=True)`` instead.
     """
     if attention_type != "magi":
         raise ValueError(
             f"attention_type={attention_type!r} is not supported. Only 'magi' is "
             "supported on FSDP (flex was retired due to the AReaL 8× entropy bug)."
         )
-    tokens_by_sample = unpack_nested_to_list(input_ids)
-    if not tokens_by_sample:
-        return None
-    loss_masks_by_sample = unpack_nested_to_list(loss_mask)
-    position_ids_by_sample = unpack_nested_to_list(position_ids)
+    from verl.utils.prefix_tree import build_prefix_tree_micro_batch
 
-    # Trie insertion expects per-sample int lists (use tolist for the algorithm — Python int dict lookups)
-    sequences = [t.tolist() for t in tokens_by_sample]
-    max_tokens_per_tree = sum(len(s) for s in sequences) * 10  # one forest
-    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
-    if not tries or len(tries) > 1:
-        return None
-
-    converted = convert_trie_to_tree_node(tries[0])
-    if converted is None:
-        return None
-    tree_root, node_info, leaves_in_dfs = converted
-
-    params = build_arbitrary_depth_params(
-        tokens_by_sample,
-        tree_root,
-        node_info,
-        leaves_in_dfs,
-        loss_masks_by_sample=loss_masks_by_sample,
-        position_ids_by_sample=position_ids_by_sample,
-    )
-
-    # TP/CP padding (mirror of prefix_tree_magi.build_prefix_tree_micro_batch)
-    real_tokens = params.flat_tokens.shape[0]
-    if tp_size > 1:
-        align_size = (tp_size * cp_size * 2) if cp_size > 1 else tp_size
-        pad_len = (align_size - real_tokens % align_size) % align_size
-        if pad_len > 0:
-            params.flat_tokens = torch.cat([params.flat_tokens, params.flat_tokens.new_zeros(pad_len)])
-            params.flat_position_ids = torch.cat(
-                [params.flat_position_ids, params.flat_position_ids.new_zeros(pad_len)]
-            )
-            if params.flat_loss_mask is not None:
-                params.flat_loss_mask = torch.cat([params.flat_loss_mask, params.flat_loss_mask.new_zeros(pad_len)])
-            params.total_seqlen_q += pad_len
-            params.total_seqlen_k += pad_len
-
-    # Build Magi attention key. magi_attn_flex_key returns the key (and registers
-    # the corresponding runtime mgr inside Magi's per-cp_group LRU). Callers thread
-    # this key explicitly to the attention func via the ``magi_attention_key``
-    # kwarg on ``model(...)``; the LRU is only an internal Magi cache, never
-    # observed from the verl side.
-    #
-    # When ``model is None`` (CPU-only algorithm tests / benchmarks), skip key
-    # construction and return a PrefixTreeMagiBatch whose magi_key is None.
-    # Production callers always pass a real model.
-    if model is None:
-        magi_key = None
-    else:
-        magi_key = _build_magi_key(model, params, cp_group=cp_group)
-    flex_key = None
-
-    local_flat_tokens = params.flat_tokens
-    local_flat_position_ids = params.flat_position_ids
-    local_flat_loss_mask = params.flat_loss_mask
-
-    return PrefixTreeMagiBatch(
-        flat_input_ids=params.flat_tokens,
-        flat_position_ids=params.flat_position_ids,
-        flat_loss_mask=params.flat_loss_mask,
-        magi_key=magi_key,
-        flex_key=flex_key,
-        leaf_to_sample=params.leaf_to_sample,
-        leaf_ranges=params.leaf_ranges,
-        prefix_range=params.prefix_range,
-        original_batch_size=len(tokens_by_sample),
-        real_tokens=real_tokens,
-        leaf_ancestor_ranges=getattr(params, "_leaf_ancestor_ranges", None),
-        local_flat_input_ids=local_flat_tokens,
-        local_flat_position_ids=local_flat_position_ids,
-        local_flat_loss_mask=local_flat_loss_mask,
+    return build_prefix_tree_micro_batch(
+        model,
+        input_ids,
+        loss_mask=loss_mask,
+        position_ids=position_ids,
+        prefix_segments_batch=prefix_segments_batch,  # ignored when dynamic_trie=True
+        attention_type=attention_type,
+        tp_size=tp_size,
+        cp_size=cp_size,
+        dynamic_trie=True,
+        cp_group=cp_group,
     )
 
 

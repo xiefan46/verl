@@ -256,7 +256,7 @@ def gptmodel_forward_model_engine(
         prefix_tree_attention = (logits_processor_args or {}).get("prefix_tree_attention", "flex")
         pt_batch = None
         if use_prefix_tree and not vision_model and not mtp_enable_train:
-            from verl.utils.prefix_tree_magi import (
+            from verl.utils.prefix_tree import (
                 PrefixTreeMagiBatch,
                 build_prefix_tree_micro_batch,
                 restore_flat_to_nested,

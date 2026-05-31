@@ -1335,7 +1335,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     "actor.context_parallel_size for Magi-side CP instead."
                 )
                 from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
-                from verl.utils.prefix_tree_magi import restore_flat_to_nested
+                from verl.utils.prefix_tree import restore_flat_to_nested
 
                 # NOTE: pass loss_mask=None — verl's loss_mask in RL flow may have
                 # a different length than input_ids (response-only mask), and we

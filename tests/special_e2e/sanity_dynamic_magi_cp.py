@@ -62,7 +62,7 @@ def _dyn_magi_cp_forward(model, nested, cp_group):
     """
     from verl.models.transformers.monkey_patch import set_magi_attention_key
     from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
-    from verl.utils.prefix_tree_magi import restore_flat_to_nested
+    from verl.utils.prefix_tree import restore_flat_to_nested
 
     pt_batch = build_prefix_tree_micro_batch_dynamic(
         model,
