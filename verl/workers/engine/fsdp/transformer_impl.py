@@ -1324,6 +1324,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
         )
         with autocast_ctx:
             pt_batch = None
+            tree_metrics: dict[str, float] = {}
             if use_prefix_tree_dynamic:
                 # Defense-in-depth: _build_module already asserts strategy=fsdp2,
                 # but re-check in forward_step in case a code path constructs the
@@ -1364,6 +1365,24 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     cp_size=self.context_parallel_size,
                     cp_group=self.cp_group,
                 )
+
+                # Emit tree-dedup visibility metrics. Original = sum of per-sample
+                # lengths (no sharing); packed = real_tokens after prefix tree
+                # packing. Ratio < 1 means tree saved tokens; ratio == 1 means no
+                # sharing was found and we fell back to dense.
+                _nested = micro_batch["input_ids"]
+                if hasattr(_nested, "values"):
+                    _orig = int(_nested.values().shape[0])
+                else:
+                    _orig = int(sum(int(s.shape[0]) for s in _nested))
+                _packed = int(pt_batch.real_tokens) if pt_batch is not None else _orig
+                tree_metrics = {
+                    "prefix_tree/original_tokens": float(_orig),
+                    "prefix_tree/packed_tokens": float(_packed),
+                    "prefix_tree/token_ratio": float(_packed) / max(float(_orig), 1.0),
+                    "prefix_tree/tokens_saved": float(_orig - _packed),
+                    "prefix_tree/fell_back_to_dense": 1.0 if pt_batch is None else 0.0,
+                }
 
             if pt_batch is not None:
                 # Magi packed forward.
@@ -1438,6 +1457,11 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 assert forward_only, "forward_only must be True when loss_function is None"
                 loss = torch.tensor(1.0, device=device_name)
                 metrics = {}
+
+            # Merge in tree-dedup visibility metrics so they roll up alongside
+            # actor/* and perf/* in the per-step training log + wandb.
+            if tree_metrics:
+                metrics.update(tree_metrics)
 
             output = {
                 "model_output": model_output,
