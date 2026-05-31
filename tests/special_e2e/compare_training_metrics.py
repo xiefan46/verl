@@ -39,14 +39,19 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 
 
+# Ray prefixes step lines with "(TaskRunner pid=NNN) " when logged through Ray.
+_RAY_PREFIX_RE = re.compile(r"^\([\w]+\s+pid=\d+\)\s+")
 # step:NN - key:value - key:value - ...
 _STEP_LINE_RE = re.compile(r"^step:(\d+)\s+-\s+(.*)$")
-# key:value pair — value may be int / float / scientific notation / 'nan' / 'inf'
-_KV_RE = re.compile(r"([\w./_-]+):([^\s-][^\s]*(?:\s-\s|$))")
+# verl wraps metric values in np.<type>(...) (e.g. np.float64(0.18), np.int32(2)).
+_NP_WRAP_RE = re.compile(r"^np\.\w+\((.*)\)$")
 
 
 def _parse_value(s: str) -> Optional[float]:
     s = s.strip().rstrip("-").strip()
+    m = _NP_WRAP_RE.match(s)
+    if m:
+        s = m.group(1).strip()
     try:
         return float(s)
     except ValueError:
@@ -58,7 +63,12 @@ def parse_log(path: str) -> dict[int, dict[str, float]]:
     out: dict[int, dict[str, float]] = {}
     with open(path) as f:
         for line in f:
-            m = _STEP_LINE_RE.match(line.strip())
+            line = line.strip()
+            # Strip optional "(TaskRunner pid=NNN) " Ray prefix
+            ray_m = _RAY_PREFIX_RE.match(line)
+            if ray_m:
+                line = line[ray_m.end():]
+            m = _STEP_LINE_RE.match(line)
             if not m:
                 continue
             step = int(m.group(1))
