@@ -7,36 +7,34 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
-"""V1 dynamic-trie prefix-tree builder for FSDP2 + Magi model integration.
+"""Dynamic-trie prefix-tree builder for FSDP2 + Magi model integration.
 
-Drop-in alternative to ``verl.utils.prefix_tree_magi.build_prefix_tree_micro_batch``
-that uses token-by-token trie insertion (AReaL-style) instead of hash-based
-detection. Supports **arbitrary tree depth** (Meituan's hash path is hardcoded
-to depth-3).
+Token-by-token trie insertion that supports **arbitrary tree depth** —
+detects the shared-prefix tree directly from the input tokens, no
+rollout-side metadata required. Invoked by the unified
+:func:`verl.utils.prefix_tree_magi.build_prefix_tree_micro_batch` entry
+point when ``dynamic_trie=True``.
 
 REQUIREMENTS (enforced by ``FSDPEngine._build_module`` assertion):
   * ``engine.strategy='fsdp2'`` — FSDP1 produces EVAL/TRAIN forward divergence
     when combined with Magi attention (ppo_kl ≈ 3-4 + intermittent NaN grad).
     MagiAttention's torch_native reference example uses FSDP2; that is the
     only validated combination.
-  * ``prefix_tree_attention='magi'`` — flex_attention path retired due to
-    the AReaL 8x entropy bug.
+  * ``prefix_tree_attention='magi'`` — the flex_attention path was retired
+    due to the AReaL 8× entropy bug.
   * ``ulysses_sequence_parallel_size=1`` — Magi CP and Ulysses SP are
     mutually exclusive seq-parallel schemes.
 
-Same I/O contract as the magi path:
-  ``build_prefix_tree_micro_batch_v1(model, input_ids, ...) -> Optional[PrefixTreeMagiBatch]``
-
-Trade-offs vs hash path (from benchmark in
+Trade-offs vs the hash-based static path (from benchmark in
 ``tests/benchmark/trie_construction/``):
-  - V1 is 10-300x slower at trie *detection* (Python token-by-token insert).
+  - 10–300× slower at trie *detection* (Python token-by-token insert).
   - For typical RL workloads (<1M total tokens), absolute overhead is
-    <250 ms (~2-3% of a 10 s step).
-  - V1 supports arbitrary depth — required for MCTS-based RL (rStar-Math,
-    DeepSearch) where Meituan's depth-3 cap loses key sharing structure.
+    <250 ms (~2–3% of a 10 s step).
+  - Arbitrary depth — required for MCTS-based RL (rStar-Math, DeepSearch)
+    where the hash path's depth-2 cap loses key sharing structure.
 
-Algorithm derived from ``xiefan46/verl@local-bench-prep:verl/experimental/tree_training/tree.py``
-(originally from AReaL https://github.com/inclusionAI/AReaL).
+Algorithm originally derived from AReaL
+(https://github.com/inclusionAI/AReaL).
 """
 
 from __future__ import annotations
@@ -53,29 +51,29 @@ from verl.utils.prefix_tree_params import PrefixTreeParams
 from verl.utils.prefix_tree_utils import TreeNode, build_multilevel_flex_spec
 
 __all__ = [
-    "build_prefix_tree_micro_batch_v1",
-    "prefix_tree_v1_forward",
+    "build_prefix_tree_micro_batch_dynamic",
+    "prefix_tree_dynamic_forward",
     # Lower-level helpers exposed for testing / benchmarking
-    "V1TrieNode",
-    "v1_greedy_build_tries",
-    "convert_v1_trie_to_meituan",
+    "TrieNode",
+    "greedy_build_tries",
+    "convert_trie_to_tree_node",
     "build_arbitrary_depth_params",
     "unpack_nested_to_list",
 ]
 
 
 # ============================================================================
-# V1 trie construction (AReaL-style token-by-token insertion)
+# Trie construction (token-by-token insertion)
 # ============================================================================
 
 
 @dataclass
-class V1TrieNode:
+class TrieNode:
     """Compressed-trie node (after `_compress` pass).
 
     Each non-root node represents a contiguous run of tokens shared by the same
     set of sequences. Root has ``start_idx == end_idx == -1`` and stores no
-    tokens — children are accessed via ``.children: dict[first_token, V1TrieNode]``.
+    tokens — children are accessed via ``.children: dict[first_token, TrieNode]``.
     """
 
     tree_id: int
@@ -83,9 +81,9 @@ class V1TrieNode:
     end_idx: int = -1
     tokens: list[int] = field(default_factory=list)
     sequence_ids: list[int] = field(default_factory=list)
-    children: dict[int, V1TrieNode] = field(default_factory=dict)
-    ancestors: list[V1TrieNode] = field(default_factory=list)
-    nodes: list[V1TrieNode] = field(default_factory=list)
+    children: dict[int, TrieNode] = field(default_factory=dict)
+    ancestors: list[TrieNode] = field(default_factory=list)
+    nodes: list[TrieNode] = field(default_factory=list)
 
     @property
     def is_root(self) -> bool:
@@ -134,10 +132,10 @@ def _insert_sequence(
     current.is_end = True
 
 
-def _compress_trie(root: _BuildNode) -> V1TrieNode:
-    trie_root = V1TrieNode(tree_id=root.tree_id)
+def _compress_trie(root: _BuildNode) -> TrieNode:
+    trie_root = TrieNode(tree_id=root.tree_id)
 
-    def _compress_chain(node: _BuildNode, ancestors: list[V1TrieNode]) -> V1TrieNode:
+    def _compress_chain(node: _BuildNode, ancestors: list[TrieNode]) -> TrieNode:
         tokens: list[int] = []
         current = node
         start_id = node.node_id
@@ -152,7 +150,7 @@ def _compress_trie(root: _BuildNode) -> V1TrieNode:
                 raise ValueError("Node IDs not consecutive along chain")
             current = next_child
 
-        trie_node = V1TrieNode(
+        trie_node = TrieNode(
             tree_id=root.tree_id,
             start_idx=start_id,
             end_idx=current.node_id,
@@ -172,10 +170,10 @@ def _compress_trie(root: _BuildNode) -> V1TrieNode:
     return trie_root
 
 
-def v1_greedy_build_tries(
+def greedy_build_tries(
     sequences: list[list[int]],
     max_tokens_per_tree: int,
-) -> tuple[list[V1TrieNode], list[int]]:
+) -> tuple[list[TrieNode], list[int]]:
     """Token-by-token greedy trie packing across samples.
 
     Args:
@@ -184,7 +182,7 @@ def v1_greedy_build_tries(
             a huge value when you want a single forest).
 
     Returns:
-        (tries, num_tokens_list) — list of compressed V1TrieNode roots + total
+        (tries, num_tokens_list) — list of compressed TrieNode roots + total
         uncompressed nodes per tree.
     """
     forests: list[dict[str, Any]] = []
@@ -213,23 +211,25 @@ def v1_greedy_build_tries(
 
 
 # ============================================================================
-# V1 → Meituan TreeNode conversion (arbitrary depth preserved)
+# Trie → TreeNode conversion (arbitrary depth preserved)
 # ============================================================================
 
 
-def convert_v1_trie_to_meituan(
-    v1_trie: V1TrieNode,
+def convert_trie_to_tree_node(
+    trie: TrieNode,
 ) -> Optional[tuple[TreeNode, dict[int, tuple[int, int, int]], list[TreeNode]]]:
-    """Convert V1 compressed trie → Meituan TreeNode (segment_len + children).
+    """Convert a compressed trie to a ``TreeNode`` consumed by
+    ``build_multilevel_flex_spec``.
 
-    V1 root is a virtual placeholder with no tokens. We promote V1's only child
-    as the Meituan root so ``build_multilevel_flex_spec`` sees a non-zero root.
+    The trie root is a virtual placeholder with no tokens. We promote the
+    trie's only child as the TreeNode root so the downstream flex-spec
+    builder sees a non-zero root segment.
 
     Returns ``None`` when there's no real sharing (single sample, no children,
     or multi-forest case).
 
-    Returns ``(meituan_root, node_info, leaves_in_dfs)`` where:
-      - ``meituan_root``: TreeNode root for downstream packing
+    Returns ``(root, node_info, leaves_in_dfs)`` where:
+      - ``root``: ``TreeNode`` root for downstream packing
       - ``node_info[id(node)] = (owner_sample_idx, range_start, range_end)``:
         for each non-root node, an owning sample + token range in that sample's
         original sequence. Needed for ``build_arbitrary_depth_params`` to emit
@@ -237,30 +237,30 @@ def convert_v1_trie_to_meituan(
       - ``leaves_in_dfs``: leaf TreeNodes in DFS pre-order, matching the order
         ``build_multilevel_flex_spec`` walks the tree.
     """
-    if not v1_trie.children:
+    if not trie.children:
         return None
-    if len(v1_trie.children) > 1:
+    if len(trie.children) > 1:
         # Multi-forest — no single shared root prefix
         return None
 
     node_info: dict[int, tuple[int, int, int]] = {}
     leaves_in_dfs: list[TreeNode] = []
 
-    def _convert(v1_node: V1TrieNode, offset_in_owner: int) -> TreeNode:
-        segment_len = len(v1_node.tokens)
+    def _convert(trie_node: TrieNode, offset_in_owner: int) -> TreeNode:
+        segment_len = len(trie_node.tokens)
         end_in_owner = offset_in_owner + segment_len
 
         children: list[TreeNode] = []
-        for _tok, child in sorted(v1_node.children.items()):
+        for _tok, child in sorted(trie_node.children.items()):
             children.append(_convert(child, end_in_owner))
 
         node = TreeNode(segment_len=segment_len, children=children)
 
         if not children:
-            assert len(v1_node.sequence_ids) == 1, (
-                f"V1 leaf should belong to exactly 1 sample, got {v1_node.sequence_ids}"
+            assert len(trie_node.sequence_ids) == 1, (
+                f"Trie leaf should belong to exactly 1 sample, got {trie_node.sequence_ids}"
             )
-            owner = v1_node.sequence_ids[0]
+            owner = trie_node.sequence_ids[0]
             node_info[id(node)] = (owner, offset_in_owner, end_in_owner)
             leaves_in_dfs.append(node)
         else:
@@ -268,21 +268,21 @@ def convert_v1_trie_to_meituan(
             node_info[id(node)] = (first_child_owner, offset_in_owner, end_in_owner)
         return node
 
-    only_child = next(iter(v1_trie.children.values()))
-    meituan_root = _convert(only_child, 0)
-    if not meituan_root.children:
+    only_child = next(iter(trie.children.values()))
+    root = _convert(only_child, 0)
+    if not root.children:
         return None
-    return meituan_root, node_info, leaves_in_dfs
+    return root, node_info, leaves_in_dfs
 
 
 # ============================================================================
-# Arbitrary-depth params builder (generalises Meituan's depth-3 path)
+# Arbitrary-depth params builder (generalises the hash-path depth-2 limit)
 # ============================================================================
 
 
 def build_arbitrary_depth_params(
     tokens_by_sample: list[Tensor],
-    meituan_root: TreeNode,
+    tree_root: TreeNode,
     node_info: dict[int, tuple[int, int, int]],
     leaves_in_dfs: list[TreeNode],
     loss_masks_by_sample: Optional[list[Tensor]] = None,
@@ -297,7 +297,7 @@ def build_arbitrary_depth_params(
     Side effect: sets ``params._leaf_ancestor_ranges`` so ``restore_flat_to_nested``
     can reconstruct each sample by concatenating its ancestor segments + leaf.
     """
-    q_ranges, k_ranges, mask_types = build_multilevel_flex_spec(meituan_root)
+    q_ranges, k_ranges, mask_types = build_multilevel_flex_spec(tree_root)
 
     device = tokens_by_sample[0].device
     flat_pieces: list[Tensor] = []
@@ -322,7 +322,7 @@ def build_arbitrary_depth_params(
             parent_of[id(child)] = node
             _emit(child)
 
-    _emit(meituan_root)
+    _emit(tree_root)
 
     flat_tokens = (
         torch.cat(flat_pieces) if flat_pieces else torch.empty(0, dtype=tokens_by_sample[0].dtype, device=device)
@@ -339,7 +339,7 @@ def build_arbitrary_depth_params(
     leaf_ranges = [(leaf._flat_start, leaf._flat_end) for leaf in leaves_in_dfs]  # type: ignore[attr-defined]
     leaf_to_sample = [node_info[id(leaf)][0] for leaf in leaves_in_dfs]
 
-    prefix_range = (meituan_root._flat_start, meituan_root._flat_end)  # type: ignore[attr-defined]
+    prefix_range = (tree_root._flat_start, tree_root._flat_end)  # type: ignore[attr-defined]
     sample_to_leaf_range = {s: r for s, r in zip(leaf_to_sample, leaf_ranges, strict=False)}
 
     # Per-leaf ancestor flat ranges (root → parent), needed by restore_flat_to_nested
@@ -402,11 +402,11 @@ def unpack_nested_to_list(x) -> Optional[list[Tensor]]:
 
 
 # ============================================================================
-# Public entry: build_prefix_tree_micro_batch_v1
+# Public entry: build_prefix_tree_micro_batch_dynamic
 # ============================================================================
 
 
-def build_prefix_tree_micro_batch_v1(
+def build_prefix_tree_micro_batch_dynamic(
     model,
     input_ids,
     loss_mask=None,
@@ -417,14 +417,18 @@ def build_prefix_tree_micro_batch_v1(
     cp_size: int = 1,
     cp_group=None,
 ) -> Optional[PrefixTreeMagiBatch]:
-    """Drop-in for ``build_prefix_tree_micro_batch`` using V1 dynamic trie.
+    """Dynamic-trie implementation of ``build_prefix_tree_micro_batch``.
 
-    Args / returns: same contract as the magi path. ``prefix_segments_batch``
-    is accepted for signature parity but **ignored** — V1 detects prefixes
-    by token-by-token trie insertion.
+    Invoked by :func:`verl.utils.prefix_tree_magi.build_prefix_tree_micro_batch`
+    when ``dynamic_trie=True``. Detects the shared-prefix tree by token-by-token
+    trie insertion, supporting arbitrary depth.
+
+    Args / returns: same contract as the hash-based path. ``prefix_segments_batch``
+    is accepted for signature parity but **ignored** — the trie path infers the
+    tree structure directly from the token sequences.
 
     Only ``attention_type="magi"`` is supported. The flex backend was retired
-    due to the AReaL 8x entropy bug. Pass ``cp_group`` explicitly for the FSDP
+    due to the AReaL 8× entropy bug. Pass ``cp_group`` explicitly for the FSDP
     path so Magi's CP dispatch operates on the correct subgroup.
 
     Returns ``None`` when there's no shared prefix (single sample, multi-forest
@@ -433,7 +437,7 @@ def build_prefix_tree_micro_batch_v1(
     if attention_type != "magi":
         raise ValueError(
             f"attention_type={attention_type!r} is not supported. Only 'magi' is "
-            "supported on FSDP (flex was retired due to the AReaL 8x entropy bug)."
+            "supported on FSDP (flex was retired due to the AReaL 8× entropy bug)."
         )
     tokens_by_sample = unpack_nested_to_list(input_ids)
     if not tokens_by_sample:
@@ -441,21 +445,21 @@ def build_prefix_tree_micro_batch_v1(
     loss_masks_by_sample = unpack_nested_to_list(loss_mask)
     position_ids_by_sample = unpack_nested_to_list(position_ids)
 
-    # V1 trie expects per-sample int lists (use tolist for the algorithm — Python int dict lookups)
+    # Trie insertion expects per-sample int lists (use tolist for the algorithm — Python int dict lookups)
     sequences = [t.tolist() for t in tokens_by_sample]
     max_tokens_per_tree = sum(len(s) for s in sequences) * 10  # one forest
-    tries, _ = v1_greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
+    tries, _ = greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
     if not tries or len(tries) > 1:
         return None
 
-    converted = convert_v1_trie_to_meituan(tries[0])
+    converted = convert_trie_to_tree_node(tries[0])
     if converted is None:
         return None
-    meituan_root, node_info, leaves_in_dfs = converted
+    tree_root, node_info, leaves_in_dfs = converted
 
     params = build_arbitrary_depth_params(
         tokens_by_sample,
-        meituan_root,
+        tree_root,
         node_info,
         leaves_in_dfs,
         loss_masks_by_sample=loss_masks_by_sample,
@@ -519,7 +523,7 @@ def build_prefix_tree_micro_batch_v1(
 # ============================================================================
 
 
-def prefix_tree_v1_forward(
+def prefix_tree_dynamic_forward(
     model,
     input_ids,
     loss_mask=None,
@@ -529,7 +533,7 @@ def prefix_tree_v1_forward(
     cp_group=None,
     **model_kwargs,
 ):
-    """End-to-end forward through an HF model using V1 + Magi attention.
+    """End-to-end forward through an HF model using dynamic-trie + Magi attention.
 
     Pipeline:
       1. Build PrefixTreeMagiBatch (also registers the Magi runtime key in
@@ -545,7 +549,7 @@ def prefix_tree_v1_forward(
     """
     from verl.models.transformers.monkey_patch import set_magi_attention_key
 
-    pt_batch = build_prefix_tree_micro_batch_v1(
+    pt_batch = build_prefix_tree_micro_batch_dynamic(
         model,
         input_ids,
         loss_mask=loss_mask,

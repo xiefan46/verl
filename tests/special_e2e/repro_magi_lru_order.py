@@ -44,7 +44,7 @@ calls ``dispatch(x, key)`` between build and forward, which invokes
 ``dist_attn_runtime_dict_mgr.get(key)`` and re-orders. So the official
 pattern works.
 
-Verl's V1+Magi path SKIPS ``dispatch`` at ``cp_size=1`` (see
+Verl's dynamic-trie + Magi path SKIPS ``dispatch`` at ``cp_size=1`` (see
 ``verl/workers/engine/fsdp/transformer_impl.py`` around the
 ``if self.context_parallel_size > 1`` block). So on single-GPU runs:
 
@@ -57,7 +57,7 @@ Verl's V1+Magi path SKIPS ``dispatch`` at ``cp_size=1`` (see
      for every micro-batch in the new phase. ✗ WRONG MGR.
 
 That explains why ``cache_size=1`` masks the bug (every build is a miss
-→ insert → most-recent = current), and why ``V1_FIX_CLEAR_CACHE`` also
+→ insert → most-recent = current), and why ``MAGI_FIX_CLEAR_CACHE`` also
 worked (clears the dict → forced miss).
 
 How this repro proves it

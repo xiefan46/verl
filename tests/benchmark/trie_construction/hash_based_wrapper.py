@@ -1,10 +1,10 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
-# Benchmark-only thin wrapper around Meituan's build_prefix_tree_micro_batch.
+# Benchmark-only thin wrapper around hash-based's build_prefix_tree_micro_batch.
 # Reimplements the data-path with the same helpers from verl/utils/prefix_tree_*
 # but instruments 3-layer timing and skips GPU/MAGI key construction.
 
-"""Meituan hash-based detection wrapper matching the same API contract."""
+"""Hash-based static-detection wrapper matching the same API contract."""
 
 from __future__ import annotations
 
@@ -39,8 +39,8 @@ build_multilevel_flex_spec = _ptu_mod.build_multilevel_flex_spec
 longest_common_prefix_length = _ptu_mod.longest_common_prefix_length
 
 
-# Reuse our V1 wrapper's PrefixTreeMagiBatch since both wrappers should produce same type
-from v1_wrapper import PrefixTreeMagiBatch  # noqa: E402
+# Reuse our dynamic-trie wrapper's PrefixTreeMagiBatch since both wrappers should produce same type
+from dynamic_trie_wrapper import PrefixTreeMagiBatch  # noqa: E402
 
 # ============================================================================
 # Helpers cloned/adapted from prefix_tree_magi.py (so we don't need to import magi)
@@ -117,7 +117,7 @@ def _build_multilevel_prefix_tree_params(
     loss_masks_by_sample: Optional[list[Tensor]] = None,
     position_ids_by_sample: Optional[list[Tensor]] = None,
 ) -> PrefixTreeParams:
-    """Port of Meituan's depth-3 multi-level params builder.
+    """Port of hash-based's depth-3 multi-level params builder.
 
     Tree structure: virtual_root → root_segment (shared by all, root_len tokens) →
     children_info: list of (group_sample_idxs, group_TreeNode). Each group_TreeNode has
@@ -126,7 +126,7 @@ def _build_multilevel_prefix_tree_params(
     Produces: flat_tokens = [root_tokens, group1_mid, group1_leaf0, group1_leaf1, ...,
                             group2_mid, group2_leaf0, ...].
     """
-    # Build the Meituan TreeNode root for build_multilevel_flex_spec
+    # Build the TreeNode root for build_multilevel_flex_spec
     # Root segment_len = root_len, children = list of group nodes
     group_nodes: list[TreeNode] = []
     for _idxs, child_node in children_info:
@@ -241,11 +241,11 @@ def _unpack(x):
 
 
 # ============================================================================
-# Public API: build_prefix_tree_micro_batch_meituan
+# Public API: build_prefix_tree_micro_batch_hash_based
 # ============================================================================
 
 
-def build_prefix_tree_micro_batch_meituan(
+def build_prefix_tree_micro_batch_hash_based(
     model,
     input_ids,
     loss_mask=None,
@@ -255,7 +255,7 @@ def build_prefix_tree_micro_batch_meituan(
     tp_size: int = 1,
     cp_size: int = 1,
 ) -> Optional[PrefixTreeMagiBatch]:
-    """Meituan hash-based wrapper matching V1 wrapper's API.
+    """Hash-based static wrapper matching dynamic-trie wrapper's API.
 
     Mirrors verl/utils/prefix_tree_magi.py:build_prefix_tree_micro_batch.
     Returns None when no shared prefix found.
@@ -333,7 +333,7 @@ def build_prefix_tree_micro_batch_meituan(
 # ============================================================================
 
 
-def build_prefix_tree_micro_batch_meituan_full(
+def build_prefix_tree_micro_batch_hash_based_full(
     model,
     input_ids,
     loss_mask=None,
@@ -345,7 +345,7 @@ def build_prefix_tree_micro_batch_meituan_full(
 ) -> tuple[Optional[PrefixTreeMagiBatch], Optional[PrefixTreeParams], dict]:
     """Variant returning (batch, params, timings) for sanity check + benchmarking.
 
-    Timings dict keys (mirrors V1 wrapper):
+    Timings dict keys (mirrors dynamic-trie wrapper):
       - unpack_ms
       - tree_detect_ms (hash-based detection: _resolve_prefix_len + _resolve_multilevel_tree)
       - pack_ms (build_..._prefix_tree_params + flat tensor packing)

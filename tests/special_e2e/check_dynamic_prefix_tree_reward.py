@@ -5,14 +5,14 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Compare reward trajectories between two GRPO runs (dense vs V1 prefix tree).
+"""Compare reward trajectories between two GRPO runs (dense vs dynamic prefix tree).
 
 Parses console logs from ``verl.trainer.main_ppo``. Assertion fails when:
   - Either run has fewer than 2 reward points (training didn't proceed).
   - The two trajectories have wildly different shapes (corr < min_correlation).
   - Per-step reward differs more than max_step_diff (absolute) at any step.
 
-Used by ``tests/special_e2e/run_grpo_v1_prefix_tree.sh``.
+Used by ``tests/special_e2e/run_grpo_dynamic_prefix_tree.sh``.
 """
 
 from __future__ import annotations
@@ -22,7 +22,6 @@ import re
 import sys
 
 import numpy as np
-
 
 REWARD_KEYS = (
     "critic/rewards/mean",
@@ -84,51 +83,46 @@ def _align_runs(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dense_log", required=True)
-    parser.add_argument("--v1_log", required=True)
-    parser.add_argument("--max_step_diff", type=float, default=0.05,
-                        help="max allowed per-step abs reward diff")
-    parser.add_argument("--min_correlation", type=float, default=0.85,
-                        help="Pearson correlation lower bound between trajectories")
+    parser.add_argument("--dyn_log", required=True)
+    parser.add_argument("--max_step_diff", type=float, default=0.05, help="max allowed per-step abs reward diff")
+    parser.add_argument(
+        "--min_correlation", type=float, default=0.85, help="Pearson correlation lower bound between trajectories"
+    )
     args = parser.parse_args()
 
     dense = _extract_step_rewards(args.dense_log)
-    v1 = _extract_step_rewards(args.v1_log)
+    dyn = _extract_step_rewards(args.dyn_log)
 
-    print(f"[CHECK] dense steps: {len(dense)}, V1 steps: {len(v1)}")
-    if len(dense) < 2 or len(v1) < 2:
-        print(f"[CHECK] FAIL — too few reward points "
-              f"(dense={len(dense)}, v1={len(v1)})")
+    print(f"[CHECK] dense steps: {len(dense)}, dynamic-trie steps: {len(dyn)}")
+    if len(dense) < 2 or len(dyn) < 2:
+        print(f"[CHECK] FAIL — too few reward points (dense={len(dense)}, dyn={len(dyn)})")
         return 1
 
-    dense_arr, v1_arr = _align_runs(dense, v1)
+    dense_arr, dyn_arr = _align_runs(dense, dyn)
     if dense_arr.size < 2:
         print("[CHECK] FAIL — fewer than 2 overlapping steps between runs")
         return 1
 
-    diff = np.abs(dense_arr - v1_arr)
+    diff = np.abs(dense_arr - dyn_arr)
     max_diff = float(diff.max())
     mean_diff = float(diff.mean())
     final_diff = float(diff[-1])
 
-    if dense_arr.std() < 1e-6 or v1_arr.std() < 1e-6:
+    if dense_arr.std() < 1e-6 or dyn_arr.std() < 1e-6:
         # Constant trajectory — correlation undefined, only inspect magnitude
         corr = float("nan")
     else:
-        corr = float(np.corrcoef(dense_arr, v1_arr)[0, 1])
+        corr = float(np.corrcoef(dense_arr, dyn_arr)[0, 1])
 
-    print(f"[CHECK] reward.mean dense={dense_arr.mean():.4f} v1={v1_arr.mean():.4f}")
+    print(f"[CHECK] reward.mean dense={dense_arr.mean():.4f} dyn={dyn_arr.mean():.4f}")
     print(f"[CHECK] per-step abs diff: max={max_diff:.4f} mean={mean_diff:.4f} final={final_diff:.4f}")
     print(f"[CHECK] correlation = {corr:.4f}  (min required {args.min_correlation:.2f})")
 
     failed: list[str] = []
     if max_diff > args.max_step_diff:
-        failed.append(
-            f"max per-step abs diff {max_diff:.4f} > tolerance {args.max_step_diff:.4f}"
-        )
+        failed.append(f"max per-step abs diff {max_diff:.4f} > tolerance {args.max_step_diff:.4f}")
     if not np.isnan(corr) and corr < args.min_correlation:
-        failed.append(
-            f"correlation {corr:.4f} < min {args.min_correlation:.2f}"
-        )
+        failed.append(f"correlation {corr:.4f} < min {args.min_correlation:.2f}")
 
     if failed:
         print("[CHECK] FAIL:")
@@ -136,7 +130,7 @@ def main() -> int:
             print(f"  - {msg}")
         return 1
 
-    print("[CHECK] PASS — V1 reward trajectory matches dense baseline within tolerance")
+    print("[CHECK] PASS — Dynamic prefix-tree reward trajectory matches dense baseline within tolerance")
     return 0
 
 

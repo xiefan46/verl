@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
-# E2E correctness test for V1 dynamic prefix-tree + Magi attention on FSDP.
+# E2E correctness test for dynamic prefix-tree + Magi attention on FSDP.
 # Stack: Qwen2.5-0.5B-Instruct + GSM8K + GRPO + FSDP + Magi FFA + vLLM.
 #
 # Strategy: two short training runs (~10 steps each), identical seed and config,
-# one with use_prefix_tree_v1=true and one without. Compare reward trajectories
-# — V1+Magi should track the dense baseline within tolerance.
+# one with use_prefix_tree_dynamic=true and one without. Compare reward trajectories
+# — dynamic-trie + Magi should track the dense baseline within tolerance.
 #
 # Hardware:
 #   - CP_SIZE=1 → 1× H100, ~10-15 min (single-rank Magi, no dispatch)
 #   - CP_SIZE=2 → 2× H100, ~10-15 min (real Magi CP dispatch)
 #
 # Usage:
-#   bash tests/special_e2e/run_grpo_v1_prefix_tree.sh                       # cp=1
-#   CP_SIZE=2 N_GPUS=2 bash tests/special_e2e/run_grpo_v1_prefix_tree.sh    # cp=2
-#   TOTAL_STEPS=20 ROLLOUT_N=4 bash tests/special_e2e/run_grpo_v1_prefix_tree.sh
+#   bash tests/special_e2e/run_grpo_dynamic_prefix_tree.sh                       # cp=1
+#   CP_SIZE=2 N_GPUS=2 bash tests/special_e2e/run_grpo_dynamic_prefix_tree.sh    # cp=2
+#   TOTAL_STEPS=20 ROLLOUT_N=4 bash tests/special_e2e/run_grpo_dynamic_prefix_tree.sh
 set -ex
 
 MODEL_ID=${MODEL_ID:-Qwen/Qwen2.5-0.5B-Instruct}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 DATA_DIR=${DATA_DIR:-${HOME}/data/gsm8k}
-LOG_DIR=${LOG_DIR:-$(mktemp -d /tmp/v1_prefix_tree_e2e.XXXXXX)}
+LOG_DIR=${LOG_DIR:-$(mktemp -d /tmp/dynamic_prefix_tree_e2e.XXXXXX)}
 echo "[E2E] Logs → $LOG_DIR"
 
 TOTAL_STEPS=${TOTAL_STEPS:-10}
@@ -37,10 +37,10 @@ ENABLE_GC=${ENABLE_GC:-1}          # 1 = enable gradient checkpointing (default)
 #   - use_dynamic_bsz=False keeps per-step token budget stable, so the two runs
 #     see the same micro-batch shapes (any reward divergence is attributable to
 #     the prefix-tree forward, not batching).
-#   - ulysses_sequence_parallel_size=1 because V1+Magi+CP is mutually exclusive
+#   - ulysses_sequence_parallel_size=1 because dynamic-trie + Magi+CP is mutually exclusive
 #     with Ulysses SP (see FSDPEngine._init_device_mesh assertion).
 #   - rollout.n=$ROLLOUT_N gives each prompt N rollouts that share a prefix,
-#     which is exactly the shape V1 prefix tree accelerates.
+#     which is exactly the shape dynamic prefix tree accelerates.
 COMMON_ARGS=(
     algorithm.adv_estimator=grpo
     data.train_files=$DATA_DIR/train.parquet
@@ -59,7 +59,7 @@ COMMON_ARGS=(
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
     actor_rollout_ref.actor.use_dynamic_bsz=False
     actor_rollout_ref.actor.ulysses_sequence_parallel_size=1
-    # V1+Magi REQUIRES FSDP2 — FSDP1 produces EVAL/TRAIN forward divergence,
+    # dynamic-trie + Magi REQUIRES FSDP2 — FSDP1 produces EVAL/TRAIN forward divergence,
     # see verl/workers/engine/fsdp/transformer_impl.py:_build_module assert.
     # NOTE: must set TOP-LEVEL actor.strategy (not engine.strategy). ActorConfig
     # __post_init__ syncs top-level → engine.strategy, so any "+engine.strategy"
@@ -80,7 +80,7 @@ COMMON_ARGS=(
     algorithm.kl_ctrl.kl_coef=0.001
     trainer.critic_warmup=0
     trainer.logger=console
-    trainer.project_name=v1_prefix_tree_e2e
+    trainer.project_name=dynamic_prefix_tree_e2e
     trainer.n_gpus_per_node=$N_GPUS
     trainer.nnodes=1
     trainer.save_freq=-1
@@ -108,22 +108,22 @@ if [ "$ENABLE_GC" = "0" ]; then
 fi
 
 echo "=========================================="
-echo "[E2E] RUN 1: V1 prefix tree + Magi (cp=${CP_SIZE})"
+echo "[E2E] RUN 1: dynamic prefix tree + Magi (cp=${CP_SIZE})"
 echo "=========================================="
-# ref inherits use_prefix_tree_v1/prefix_tree_attention/context_parallel_size
+# ref inherits use_prefix_tree_dynamic/prefix_tree_attention/context_parallel_size
 # from actor automatically (see verl/trainer/config/ref/ref.yaml).
 python3 -m verl.trainer.main_ppo \
     "${COMMON_ARGS[@]}" \
-    actor_rollout_ref.actor.use_prefix_tree_v1=True \
+    actor_rollout_ref.actor.use_prefix_tree_dynamic=True \
     actor_rollout_ref.actor.prefix_tree_attention=magi \
     actor_rollout_ref.actor.context_parallel_size=$CP_SIZE \
-    trainer.experiment_name=qwen2_5_05b_grpo_v1_magi_cp${CP_SIZE} \
-    2>&1 | tee "$LOG_DIR/v1.log"
+    trainer.experiment_name=qwen2_5_05b_grpo_dynamic_magi_cp${CP_SIZE} \
+    2>&1 | tee "$LOG_DIR/dyn.log"
 
 if [ "$SKIP_BASELINE" = "1" ]; then
     echo "=========================================="
     echo "[E2E] SKIP_BASELINE=1 → skipping dense baseline + comparison"
-    echo "[E2E] V1+Magi log: $LOG_DIR/v1.log"
+    echo "[E2E] dynamic-trie + Magi log: $LOG_DIR/dyn.log"
     echo "=========================================="
     exit 0
 fi
@@ -133,16 +133,16 @@ echo "[E2E] RUN 2: Dense baseline (no prefix tree)"
 echo "=========================================="
 python3 -m verl.trainer.main_ppo \
     "${COMMON_ARGS[@]}" \
-    actor_rollout_ref.actor.use_prefix_tree_v1=False \
+    actor_rollout_ref.actor.use_prefix_tree_dynamic=False \
     trainer.experiment_name=qwen2_5_05b_grpo_dense \
     2>&1 | tee "$LOG_DIR/dense.log"
 
 echo "=========================================="
 echo "[E2E] Comparing reward trajectories"
 echo "=========================================="
-python3 tests/special_e2e/check_v1_prefix_tree_reward.py \
+python3 tests/special_e2e/check_dynamic_prefix_tree_reward.py \
     --dense_log "$LOG_DIR/dense.log" \
-    --v1_log "$LOG_DIR/v1.log" \
+    --dyn_log "$LOG_DIR/dyn.log" \
     --max_step_diff 0.05 \
     --min_correlation 0.85
 

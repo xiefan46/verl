@@ -1,21 +1,21 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
-# Sanity check: validate that V1 and Meituan wrappers produce equivalent
+# Sanity check: validate that dynamic-trie and hash-based wrappers produce equivalent
 # (per-sample) output for the same input. BLOCKING — benchmark won't run
 # if correctness check fails.
 
-"""Output equivalence sanity check between V1 and Meituan wrappers.
+"""Output equivalence sanity check between dynamic-trie and hash-based wrappers.
 
 Equivalence definition:
-  Both wrappers may use different DFS ordering (V1 sorts children by token,
-  Meituan preserves input order). What MUST match:
+  Both wrappers may use different DFS ordering (dynamic-trie sorts children by token,
+  hash-based preserves input order). What MUST match:
     1. Both find shared prefix of same length (prefix_range)
     2. Both produce leaves for the SAME set of sample indices
     3. For each sample i, the reconstructed tokens (prefix + ancestors + leaf)
        MUST equal the original input sample i, bit-by-bit
 
 Allowable difference:
-  - V1 may find DEEPER tree than Meituan (Meituan capped at depth-3). This is
+  - the dynamic-trie path may find a DEEPER tree than the hash-based path (hash-based capped at depth-3). This is
     reported, not a failure.
 """
 
@@ -29,15 +29,15 @@ import torch
 @dataclass
 class SanityResult:
     scenario_name: str
-    v1_passed: bool
-    meituan_passed: bool
-    v1_tree_depth: int  # depth of V1's tree
-    mt_tree_depth: int  # depth of Meituan's tree
+    dyn_passed: bool
+    hash_passed: bool
+    dyn_tree_depth: int  # depth of the dynamic-trie's output
+    mt_tree_depth: int  # depth of hash-based's tree
     notes: list[str]  # human-readable diagnostics
 
     @property
     def both_passed(self) -> bool:
-        return self.v1_passed and self.meituan_passed
+        return self.dyn_passed and self.hash_passed
 
 
 def _reconstruct_per_sample(pt_batch, params) -> dict[int, torch.Tensor]:
@@ -120,58 +120,58 @@ def _check_one(name: str, pt_batch, params, samples: list[torch.Tensor]) -> tupl
     return True, notes
 
 
-def check_scenario(scenario, v1_full, v1_params, mt_full, mt_params) -> SanityResult:
+def check_scenario(scenario, dyn_full, dyn_params, mt_full, mt_params) -> SanityResult:
     """Check both wrapper outputs against the scenario's input samples."""
     notes: list[str] = []
 
-    v1_ok, v1_notes = _check_one("V1", v1_full, v1_params, scenario.samples)
-    notes.extend(v1_notes)
+    dyn_ok, dyn_notes = _check_one("dynamic", dyn_full, dyn_params, scenario.samples)
+    notes.extend(dyn_notes)
 
     mt_ok, mt_notes = _check_one("MT", mt_full, mt_params, scenario.samples)
     notes.extend(mt_notes)
 
-    v1_depth = _tree_depth_from_params(v1_params) if v1_params else 0
+    dyn_depth = _tree_depth_from_params(dyn_params) if dyn_params else 0
     mt_depth = _tree_depth_from_params(mt_params) if mt_params else 0
 
-    if v1_ok and mt_ok and v1_depth > mt_depth:
+    if dyn_ok and mt_ok and dyn_depth > mt_depth:
         notes.append(
-            f"NOTE: V1 found deeper tree (depth={v1_depth}) than Meituan (depth={mt_depth}). "
-            f"Allowable: Meituan capped at depth-3."
+            f"NOTE: dynamic-trie found deeper tree (depth={dyn_depth}) than hash-based (depth={mt_depth}). "
+            f"Allowable: hash-based capped at depth-3."
         )
 
     return SanityResult(
         scenario_name=scenario.name,
-        v1_passed=v1_ok,
-        meituan_passed=mt_ok,
-        v1_tree_depth=v1_depth,
+        dyn_passed=dyn_ok,
+        hash_passed=mt_ok,
+        dyn_tree_depth=dyn_depth,
         mt_tree_depth=mt_depth,
         notes=notes,
     )
 
 
-def check_all(scenarios, v1_runner, mt_runner) -> list[SanityResult]:
+def check_all(scenarios, dyn_runner, mt_runner) -> list[SanityResult]:
     """Run all scenarios through both wrappers and return per-scenario sanity results.
 
-    v1_runner / mt_runner: callables (scenario) → (pt_batch, params, timings)
+    dyn_runner / mt_runner: callables (scenario) → (pt_batch, params, timings)
     """
     results = []
     for s in scenarios:
-        v1_batch, v1_params, _ = v1_runner(s)
+        dyn_batch, dyn_params, _ = dyn_runner(s)
         mt_batch, mt_params, _ = mt_runner(s)
-        results.append(check_scenario(s, v1_batch, v1_params, mt_batch, mt_params))
+        results.append(check_scenario(s, dyn_batch, dyn_params, mt_batch, mt_params))
     return results
 
 
 def print_report(results: list[SanityResult]) -> bool:
     """Print human-readable sanity report. Returns True if all passed."""
     all_passed = True
-    print(f"{'Scenario':<25} {'V1':>5} {'MT':>5} {'V1_d':>5} {'MT_d':>5}  Notes")
+    print(f"{'Scenario':<25} {'dynamic':>5} {'MT':>5} {'Dyn_d':>5} {'MT_d':>5}  Notes")
     print("-" * 100)
     for r in results:
-        v1_s = "PASS" if r.v1_passed else "FAIL"
-        mt_s = "PASS" if r.meituan_passed else "FAIL"
+        dyn_s = "PASS" if r.dyn_passed else "FAIL"
+        mt_s = "PASS" if r.hash_passed else "FAIL"
         marker = "✓" if r.both_passed else "X"
-        print(f"{r.scenario_name:<25} {v1_s:>5} {mt_s:>5} {r.v1_tree_depth:>5} {r.mt_tree_depth:>5}  [{marker}]")
+        print(f"{r.scenario_name:<25} {dyn_s:>5} {mt_s:>5} {r.dyn_tree_depth:>5} {r.mt_tree_depth:>5}  [{marker}]")
         if not r.both_passed:
             all_passed = False
             for n in r.notes:
@@ -191,19 +191,21 @@ def print_report(results: list[SanityResult]) -> bool:
 
 if __name__ == "__main__":
     # Standalone sanity-only run
-    from meituan_wrapper import build_prefix_tree_micro_batch_meituan_full
+    from dynamic_trie_wrapper import build_prefix_tree_micro_batch_dynamic_full
+    from hash_based_wrapper import build_prefix_tree_micro_batch_hash_based_full
     from scenarios import all_scenarios
-    from v1_wrapper import build_prefix_tree_micro_batch_v1_full
 
-    def v1_run(s):
-        return build_prefix_tree_micro_batch_v1_full(None, s.samples, prefix_segments_batch=s.prefix_segments_batch)
-
-    def mt_run(s):
-        return build_prefix_tree_micro_batch_meituan_full(
+    def dyn_run(s):
+        return build_prefix_tree_micro_batch_dynamic_full(
             None, s.samples, prefix_segments_batch=s.prefix_segments_batch
         )
 
-    results = check_all(all_scenarios(), v1_run, mt_run)
+    def mt_run(s):
+        return build_prefix_tree_micro_batch_hash_based_full(
+            None, s.samples, prefix_segments_batch=s.prefix_segments_batch
+        )
+
+    results = check_all(all_scenarios(), dyn_run, mt_run)
     ok = print_report(results)
     import sys
 

@@ -5,15 +5,15 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""CPU-only unit tests for verl/utils/prefix_tree_v1.py.
+"""CPU-only unit tests for verl/utils/prefix_tree_dynamic.py.
 
 Test surface:
-  * TestV1BuildBasic         — V1 build correctness on depth-3 inputs
+  * TestDynBuildBasic         — dynamic build correctness on depth-3 inputs
                                (parallels test_prefix_tree_magi.TestBuildPrefixTreeLayout)
-  * TestV1ArbitraryDepth     — V1 reaches depth 4-5 where Meituan path caps at 3
-  * TestV1RestoreRoundTrip   — restore_flat_to_nested round-trip via _leaf_ancestor_ranges
-  * TestApplyV1Patch         — monkey-patch idempotency + kwarg handling (needs transformers)
-  * TestPrefixTreeV1Forward  — mini Qwen2 forward through V1 path == dense baseline
+  * TestDynArbitraryDepth     — Dynamic build reaches depth 4-5 where hash-based path caps at 3
+  * TestDynRestoreRoundTrip   — restore_flat_to_nested round-trip via _leaf_ancestor_ranges
+  * TestApplyDynPatch         — monkey-patch idempotency + kwarg handling (needs transformers)
+  * TestPrefixTreeDynForward  — mini Qwen2 forward through dynamic path == dense baseline
                                (needs transformers + flex_attention)
 
 Reuse pattern from test_prefix_tree_magi.py: imports inside test bodies so pytest
@@ -65,14 +65,14 @@ def _reconstruct_per_sample(pt_batch, params) -> dict[int, torch.Tensor]:
 # ---------------------------------------------------------------------------
 
 
-class TestV1BuildBasic:
-    """Verify V1 produces correct PrefixTreeMagiBatch on simple depth-3 inputs."""
+class TestDynBuildBasic:
+    """Verify Dynamic build produces correct PrefixTreeMagiBatch on simple depth-3 inputs."""
 
     def test_depth3_two_groups_per_sample_reconstruction(self):
-        from verl.utils.prefix_tree_v1 import (
+        from verl.utils.prefix_tree_dynamic import (
             build_arbitrary_depth_params,
-            convert_v1_trie_to_meituan,
-            v1_greedy_build_tries,
+            convert_trie_to_tree_node,
+            greedy_build_tries,
         )
 
         # 4 samples in 2 groups of 2: [1,2,3] root → [100,200] mid → [101,102]/[201,202] leaves
@@ -84,10 +84,10 @@ class TestV1BuildBasic:
             [1, 2, 3, 300, 400, 401, 402],
         ]
         sample_tensors = [torch.tensor(s, dtype=torch.long) for s in samples]
-        tries, _ = v1_greedy_build_tries(samples, max_tokens_per_tree=10_000)
+        tries, _ = greedy_build_tries(samples, max_tokens_per_tree=10_000)
         assert len(tries) == 1, "All 4 samples share root [1,2,3], expect 1 forest"
 
-        converted = convert_v1_trie_to_meituan(tries[0])
+        converted = convert_trie_to_tree_node(tries[0])
         assert converted is not None
         root_tn, node_info, leaves = converted
         assert len(leaves) == 4
@@ -106,10 +106,10 @@ class TestV1BuildBasic:
         for a in anc:
             assert len(a) == 2, "depth-3 leaf has 2 ancestors (root + mid)"
 
-    def test_full_pipeline_via_micro_batch_v1(self):
-        """End-to-end with build_prefix_tree_micro_batch_v1 on NestedTensor (no model needed for tree build)."""
-        pytest.importorskip("transformers")  # build_prefix_tree_micro_batch_v1 transitively touches HF imports
-        from verl.utils.prefix_tree_v1 import build_prefix_tree_micro_batch_v1
+    def test_full_pipeline_via_micro_batch_dynamic(self):
+        """End-to-end with build_prefix_tree_micro_batch_dynamic on NestedTensor (no model needed for tree build)."""
+        pytest.importorskip("transformers")  # build_prefix_tree_micro_batch_dynamic transitively touches HF imports
+        from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
 
         samples = [
             [10, 20, 30, 41, 42, 43],
@@ -120,7 +120,7 @@ class TestV1BuildBasic:
         # attention_type="flex" attempts BlockMask build — on Mac CPU it works but is slow.
         # Use a tiny example so this is fast.
         pytest.importorskip("magi_attention")
-        pt_batch = build_prefix_tree_micro_batch_v1(model=None, input_ids=nested, attention_type="magi")
+        pt_batch = build_prefix_tree_micro_batch_dynamic(model=None, input_ids=nested, attention_type="magi")
         assert pt_batch is not None
         # flat layout: [10,20,30] + 3 leaves of [4i,4i+1,4i+2]
         assert pt_batch.flat_input_ids.tolist() == [10, 20, 30, 41, 42, 43, 51, 52, 53, 61, 62, 63]
@@ -129,51 +129,51 @@ class TestV1BuildBasic:
         assert pt_batch.original_batch_size == 3
 
     def test_no_shared_prefix_returns_none(self):
-        """No shared root → V1 packs samples as siblings under root; convert detects this and returns None."""
-        from verl.utils.prefix_tree_v1 import (
-            convert_v1_trie_to_meituan,
-            v1_greedy_build_tries,
+        """No shared root → Dynamic build packs samples as siblings under root; convert detects this and returns None."""
+        from verl.utils.prefix_tree_dynamic import (
+            convert_trie_to_tree_node,
+            greedy_build_tries,
         )
 
         samples = [[1, 2, 3], [4, 5, 6]]  # no shared prefix
-        tries, _ = v1_greedy_build_tries(samples, max_tokens_per_tree=10_000)
-        # V1's greedy may pack both into one tree (as siblings) or two forests.
+        tries, _ = greedy_build_tries(samples, max_tokens_per_tree=10_000)
+        # dynamic build's greedy may pack both into one tree (as siblings) or two forests.
         # Either way, no single shared prefix exists.
         if len(tries) == 1:
             assert len(tries[0].children) >= 2, "no-share case should have ≥2 root children"
-            assert convert_v1_trie_to_meituan(tries[0]) is None
+            assert convert_trie_to_tree_node(tries[0]) is None
         else:
             assert len(tries) == 2
 
     def test_single_sample_no_tree(self):
-        from verl.utils.prefix_tree_v1 import (
-            convert_v1_trie_to_meituan,
-            v1_greedy_build_tries,
+        from verl.utils.prefix_tree_dynamic import (
+            convert_trie_to_tree_node,
+            greedy_build_tries,
         )
 
         samples = [[1, 2, 3, 4, 5]]
-        tries, _ = v1_greedy_build_tries(samples, max_tokens_per_tree=10_000)
+        tries, _ = greedy_build_tries(samples, max_tokens_per_tree=10_000)
         # Single sample → single leaf chain, no real sharing
         assert len(tries) == 1
-        converted = convert_v1_trie_to_meituan(tries[0])
+        converted = convert_trie_to_tree_node(tries[0])
         # convert returns None when root has only 1 child that is itself a leaf
         assert converted is None
 
 
 # ---------------------------------------------------------------------------
-# V1 arbitrary-depth coverage (Meituan can't go past depth-3)
+# Dynamic-trie arbitrary-depth coverage (hash-based path caps at depth-3)
 # ---------------------------------------------------------------------------
 
 
-class TestV1ArbitraryDepth:
-    """V1's headline capability: trees of arbitrary depth."""
+class TestDynArbitraryDepth:
+    """Dynamic build's headline capability: trees of arbitrary depth."""
 
     def test_depth4_balanced(self):
         """8 samples, real depth-4 (branch_factor=2 binary tree)."""
-        from verl.utils.prefix_tree_v1 import (
+        from verl.utils.prefix_tree_dynamic import (
             build_arbitrary_depth_params,
-            convert_v1_trie_to_meituan,
-            v1_greedy_build_tries,
+            convert_trie_to_tree_node,
+            greedy_build_tries,
         )
 
         # Build 8 samples that form a depth-4 binary tree:
@@ -191,8 +191,8 @@ class TestV1ArbitraryDepth:
                     )  # leaf
                     samples.append(seq)
         sample_tensors = [torch.tensor(s, dtype=torch.long) for s in samples]
-        tries, _ = v1_greedy_build_tries(samples, max_tokens_per_tree=10_000)
-        converted = convert_v1_trie_to_meituan(tries[0])
+        tries, _ = greedy_build_tries(samples, max_tokens_per_tree=10_000)
+        converted = convert_trie_to_tree_node(tries[0])
         assert converted is not None
         root_tn, node_info, leaves = converted
 
@@ -218,13 +218,13 @@ class TestV1ArbitraryDepth:
 # ---------------------------------------------------------------------------
 
 
-class TestV1RestoreRoundTrip:
-    """V1 build → restore → original NestedTensor."""
+class TestDynRestoreRoundTrip:
+    """Dynamic build → restore → original NestedTensor."""
 
     def test_restore_depth3(self):
         pytest.importorskip("transformers")
+        from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
         from verl.utils.prefix_tree_magi import restore_flat_to_nested
-        from verl.utils.prefix_tree_v1 import build_prefix_tree_micro_batch_v1
 
         samples = [
             [10, 20, 30, 41, 42, 43],
@@ -233,7 +233,7 @@ class TestV1RestoreRoundTrip:
         ]
         nested = _make_nested(samples)
         pytest.importorskip("magi_attention")
-        pt_batch = build_prefix_tree_micro_batch_v1(model=None, input_ids=nested, attention_type="magi")
+        pt_batch = build_prefix_tree_micro_batch_dynamic(model=None, input_ids=nested, attention_type="magi")
         assert pt_batch is not None
 
         # Restore the flat_input_ids tensor itself (acts as identity test)
@@ -248,19 +248,19 @@ class TestV1RestoreRoundTrip:
 
 
 class TestApplyMagiBackend:
-    """apply_magi_prefix_tree_v1_backend should idempotently register Magi_Attention."""
+    """apply_magi_prefix_tree_backend should idempotently register Magi_Attention."""
 
     def test_idempotent_register(self):
         pytest.importorskip("transformers")
         pytest.importorskip("magi_attention")
         from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-        from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_v1_backend
+        from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_backend
 
-        apply_magi_prefix_tree_v1_backend()
+        apply_magi_prefix_tree_backend()
         assert "Magi_Attention" in ALL_ATTENTION_FUNCTIONS
         first_ref = ALL_ATTENTION_FUNCTIONS["Magi_Attention"]
-        apply_magi_prefix_tree_v1_backend()  # idempotent
+        apply_magi_prefix_tree_backend()  # idempotent
         assert ALL_ATTENTION_FUNCTIONS["Magi_Attention"] is first_ref
 
 
@@ -269,10 +269,10 @@ class TestApplyMagiBackend:
 # ---------------------------------------------------------------------------
 
 
-class TestPrefixTreeV1Forward:
-    """Mini Qwen2 forward via V1+Magi path must match dense baseline at sample positions."""
+class TestPrefixTreeDynForward:
+    """Mini Qwen2 forward via dynamic-trie + Magi path must match dense baseline at sample positions."""
 
-    def test_v1_magi_vs_dense_baseline(self):
+    def test_dynamic_magi_vs_dense_baseline(self):
         pytest.importorskip("transformers")
         pytest.importorskip("magi_attention")
         if not torch.cuda.is_available():
@@ -291,14 +291,14 @@ class TestPrefixTreeV1Forward:
 
         from transformers import Qwen2Config, Qwen2ForCausalLM
 
-        from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_v1_backend
+        from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_backend
+        from verl.utils.prefix_tree_dynamic import prefix_tree_dynamic_forward
         from verl.utils.prefix_tree_magi import restore_flat_to_nested
-        from verl.utils.prefix_tree_v1 import prefix_tree_v1_forward
 
         # Register Magi_Attention BEFORE constructing the model — HF's
         # Qwen2ForCausalLM.__init__ validates _attn_implementation against
         # ALL_ATTENTION_FUNCTIONS, so we need the backend registered first.
-        apply_magi_prefix_tree_v1_backend()
+        apply_magi_prefix_tree_backend()
 
         torch.manual_seed(0)
         # head_dim must be 64 or 128 to hit Magi's AOT-prebuilt FFA kernels —
@@ -330,7 +330,7 @@ class TestPrefixTreeV1Forward:
         nested = _make_nested(samples, device="cuda")
 
         with torch.no_grad():
-            output, pt_batch = prefix_tree_v1_forward(model, nested, cp_group=cp_group)
+            output, pt_batch = prefix_tree_dynamic_forward(model, nested, cp_group=cp_group)
         assert output is not None and pt_batch is not None
         flat_logits = output.logits[0]
         nested_logits = restore_flat_to_nested(flat_logits, pt_batch)

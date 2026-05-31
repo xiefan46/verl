@@ -103,8 +103,8 @@ use_prefix_grouper: false
 
 # Whether to enable V1 dynamic prefix-tree forward (FSDP).
 # When true, FSDP forward_step routes shared-prefix micro-batches through
-# build_prefix_tree_micro_batch_v1; falls back to dense when no shared prefix.
-use_prefix_tree_v1: false
+# build_prefix_tree_micro_batch_dynamic; falls back to dense when no shared prefix.
+use_prefix_tree_dynamic: false
 
 # Attention backend used by the prefix-tree path. Only "magi" is supported on FSDP.
 prefix_tree_attention: magi

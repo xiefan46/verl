@@ -101,29 +101,74 @@ def build_prefix_tree_micro_batch(
     attention_type: str = "flex",
     tp_size: int = 1,
     cp_size: int = 1,
+    dynamic_trie: bool = False,
+    cp_group=None,
 ) -> Optional[PrefixTreeMagiBatch]:
     """Build a PrefixTreeMagiBatch from a micro-batch of NestedTensor sequences.
 
-    Returns None when there is no shared prefix (prefix_len == 0), signalling
-    the caller to fall back to the standard attention path.
+    Two detection paths are available, selected by ``dynamic_trie``:
+
+      - ``dynamic_trie=False`` (default): hash-based fast path. Uses
+        ``prefix_segments_batch`` (per-sample turn-level hashes) when
+        provided, otherwise falls back to an O(batch × seqlen) token-level
+        LCP scan. Supports root + depth-2 tree shapes only.
+
+      - ``dynamic_trie=True``: token-by-token trie insertion. Detects
+        arbitrary-depth shared-prefix trees directly from the token
+        sequences. ``prefix_segments_batch`` is ignored on this path.
+
+    Returns None when there is no shared prefix, signalling the caller to
+    fall back to the standard attention path.
 
     Args:
-        model: Megatron model (used to read num_heads / head_dim from config).
+        model: Model (used to read num_heads / head_dim from config). Pass
+            ``None`` for CPU-only algorithm tests (returns a batch with
+            ``magi_key=None`` and ``flex_key=None``).
         input_ids: NestedTensor of shape (batch_size, variable_seqlen).
         loss_mask: Optional NestedTensor matching input_ids shape.
         position_ids: Optional NestedTensor matching input_ids shape.
             When None, default RoPE-compatible position IDs are generated.
-        prefix_segments_batch: Optional per-sample prior knowledge injected by
-            the dataset or trainer.  Each element is a list of
-            ``(hash, cumulative_len)`` pairs (one per sub-turn) produced at
-            data-load time.  When provided, prefix detection skips the O(batch ×
-            seqlen) token comparison and uses the O(batch × turns) hash lookup
-            instead.  Falls back to the scan when None or when no shared entry
-            is found.
+        prefix_segments_batch: Optional per-sample prior knowledge injected
+            by the dataset or trainer (hash-path only). Each element is a
+            list of ``(hash, cumulative_len)`` pairs (one per sub-turn)
+            produced at data-load time. When provided, prefix detection
+            skips the O(batch × seqlen) token comparison and uses an
+            O(batch × turns) hash lookup. Falls back to the scan when
+            None or when no shared entry is found. Ignored when
+            ``dynamic_trie=True``.
+        attention_type: ``"flex"`` or ``"magi"``. Dynamic-trie path only
+            supports ``"magi"``.
+        tp_size / cp_size: Tensor / context parallel world sizes (for
+            SP-divisibility padding).
+        dynamic_trie: when True, dispatch to the token-by-token trie
+            implementation in ``verl.utils.prefix_tree_dynamic``. Defaults
+            to False (hash-based static path) for backwards compatibility.
+        cp_group: optional CP process group, threaded through to the
+            dynamic path's Magi key construction. Hash path reads
+            ``mpu.get_context_parallel_group()`` directly and ignores this.
 
     Returns:
         PrefixTreeMagiBatch or None.
     """
+
+    if dynamic_trie:
+        # Delegate to the dynamic-trie implementation. Imported lazily to
+        # avoid forcing a torch.nested.NestedTensor symbol resolution at
+        # module-import time (and to keep this file's import graph light
+        # for the hash-path-only callers).
+        from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
+
+        return build_prefix_tree_micro_batch_dynamic(
+            model,
+            input_ids,
+            loss_mask=loss_mask,
+            position_ids=position_ids,
+            prefix_segments_batch=prefix_segments_batch,  # ignored by callee
+            attention_type=attention_type,
+            tp_size=tp_size,
+            cp_size=cp_size,
+            cp_group=cp_group,
+        )
 
     from verl.utils.prefix_tree_utils import (
         build_prefix_tree_params,

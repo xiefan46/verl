@@ -5,7 +5,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Tree (V1+Magi) vs dense (sdpa) accuracy + throughput benchmark.
+"""Tree (dynamic-trie + Magi) vs dense (sdpa) accuracy + throughput benchmark.
 
 Compares the two paths on a configurable GRPO-style workload:
 
@@ -36,14 +36,15 @@ Tunables via env:
 Usage
 -----
     torchrun --standalone --nproc_per_node=1 \\
-        tests/special_e2e/bench_v1_magi_vs_dense.py
+        tests/special_e2e/bench_dynamic_magi_vs_dense.py
 
 Or with FSDP2 + larger workload:
 
     USE_FSDP=1 P=1024 R=512 N=16 ITERS=20 \\
         torchrun --standalone --nproc_per_node=1 \\
-        tests/special_e2e/bench_v1_magi_vs_dense.py
+        tests/special_e2e/bench_dynamic_magi_vs_dense.py
 """
+
 from __future__ import annotations
 
 import os
@@ -93,8 +94,9 @@ def _build_fsdp_qwen(model_path):
         cast_forward_inputs=True,
     )
     full_state = model.state_dict()
-    apply_fsdp2(model, {"mesh": mesh, "mp_policy": mp_policy,
-                        "offload_policy": None, "reshard_after_forward": True}, config={})
+    apply_fsdp2(
+        model, {"mesh": mesh, "mp_policy": mp_policy, "offload_policy": None, "reshard_after_forward": True}, config={}
+    )
     fsdp2_load_full_state_dict(model, full_state, mesh, None)
     return model
 
@@ -114,13 +116,17 @@ def _make_grpo_batch(model, p_len, r_len, n_roll):
 
 
 def _tree_forward(model, nested, cp_group):
-    """V1+Magi packed forward; returns flat logits + pt_batch."""
+    """dynamic-trie + Magi packed forward; returns flat logits + pt_batch."""
     from verl.models.transformers.monkey_patch import set_magi_attention_key
+    from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
     from verl.utils.prefix_tree_magi import restore_flat_to_nested
-    from verl.utils.prefix_tree_v1 import build_prefix_tree_micro_batch_v1
 
-    pt_batch = build_prefix_tree_micro_batch_v1(
-        model, nested, attention_type="magi", cp_group=cp_group, cp_size=1,
+    pt_batch = build_prefix_tree_micro_batch_dynamic(
+        model,
+        nested,
+        attention_type="magi",
+        cp_group=cp_group,
+        cp_size=1,
     )
     assert pt_batch is not None
     set_magi_attention_key(model, pt_batch.magi_key)
@@ -149,7 +155,7 @@ def _dense_forward(model, samples):
 def _loss_from_logits(per_sample, samples):
     """Mean negative log-prob over each sample's response tokens."""
     losses = []
-    for logits, s in zip(per_sample, samples):
+    for logits, s in zip(per_sample, samples, strict=False):
         f = logits.float()
         labels = s[1:]
         logp = torch.log_softmax(f[:-1], dim=-1).gather(1, labels.unsqueeze(1)).squeeze(1)
@@ -168,7 +174,7 @@ def _time_iters(label, fn, warmup, iters):
     elapsed = time.perf_counter() - t0
     per_iter = elapsed / iters
     if dist.get_rank() == 0:
-        print(f"[BENCH] {label:30s} avg={per_iter*1000:.2f} ms/iter  total={elapsed:.2f} s ({iters} iter)")
+        print(f"[BENCH] {label:30s} avg={per_iter * 1000:.2f} ms/iter  total={elapsed:.2f} s ({iters} iter)")
     return per_iter
 
 
@@ -177,13 +183,11 @@ def main() -> int:
 
     from transformers import Qwen2ForCausalLM
 
-    from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_v1_backend
+    from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_backend
 
-    apply_magi_prefix_tree_v1_backend()
+    apply_magi_prefix_tree_backend()
 
-    model_path = os.environ.get(
-        "MODEL_PATH", os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B-Instruct")
-    )
+    model_path = os.environ.get("MODEL_PATH", os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B-Instruct"))
     if dist.get_rank() == 0:
         print(f"[BENCH] Config: P={P} R={R} N={N}  USE_FSDP={USE_FSDP}")
         print(f"[BENCH] Loading {model_path}")
@@ -210,13 +214,15 @@ def main() -> int:
     total_tokens = sum(s.shape[0] for s in samples)
     shared_prefix_tokens = P * (N - 1)  # tokens we'd avoid recomputing
     if dist.get_rank() == 0:
-        print(f"[BENCH] Workload: total_tokens_dense={total_tokens}, "
-              f"prefix_shared={shared_prefix_tokens} ({shared_prefix_tokens/total_tokens*100:.1f}% reusable)")
+        print(
+            f"[BENCH] Workload: total_tokens_dense={total_tokens}, "
+            f"prefix_shared={shared_prefix_tokens} ({shared_prefix_tokens / total_tokens * 100:.1f}% reusable)"
+        )
 
     # ── 1) Accuracy check: tree vs dense
     if dist.get_rank() == 0:
         print()
-        print("[BENCH] Accuracy: tree (V1+Magi) vs dense (sdpa)")
+        print("[BENCH] Accuracy: tree (dynamic-trie + Magi) vs dense (sdpa)")
     with torch.no_grad():
         tree_logits, _ = _tree_forward(model, nested, cp_group)
         dense_logits = _dense_forward(model, samples)
@@ -224,13 +230,13 @@ def main() -> int:
     if dist.get_rank() == 0:
         max_diff = 0.0
         mean_diff = 0.0
-        for t, d in zip(tree_logits, dense_logits):
+        for t, d in zip(tree_logits, dense_logits, strict=False):
             diff = (t - d).abs()
             max_diff = max(max_diff, diff.max().item())
             mean_diff += diff.mean().item() / len(tree_logits)
         print(f"[BENCH]   max_diff = {max_diff:.4f}  mean_diff = {mean_diff:.4f}")
         if max_diff < 1.0:
-            print(f"[BENCH]   accuracy: PASS (within bf16 noise floor)")
+            print("[BENCH]   accuracy: PASS (within bf16 noise floor)")
         else:
             print(f"[BENCH]   accuracy: WARN (max_diff={max_diff:.4f} > 1.0)")
 
@@ -255,7 +261,7 @@ def main() -> int:
         loss = _loss_from_logits(per_sample, samples)
         loss.backward()
 
-    tree_t = _time_iters("tree (V1+Magi)  fwd+bwd", _tree_fwd_bwd, WARMUP, ITERS)
+    tree_t = _time_iters("tree (dynamic-trie + Magi)  fwd+bwd", _tree_fwd_bwd, WARMUP, ITERS)
     dense_t = _time_iters("dense (sdpa)    fwd+bwd", _dense_fwd_bwd, WARMUP, ITERS)
 
     if dist.get_rank() == 0:
@@ -263,15 +269,15 @@ def main() -> int:
         tree_tput = total_tokens / tree_t
         dense_tput = total_tokens / dense_t
         print()
-        print(f"[BENCH] Throughput:")
+        print("[BENCH] Throughput:")
         print(f"[BENCH]   tree  : {tree_tput:.0f} tokens/s")
         print(f"[BENCH]   dense : {dense_tput:.0f} tokens/s")
         print(f"[BENCH]   speedup (dense_t / tree_t): {speedup:.2f}x")
         if speedup > 1.0:
-            print(f"[BENCH]   tree training is FASTER by {(speedup-1)*100:.1f}%")
+            print(f"[BENCH]   tree training is FASTER by {(speedup - 1) * 100:.1f}%")
         else:
-            print(f"[BENCH]   tree training is SLOWER by {(1-speedup)*100:.1f}%")
-            print(f"[BENCH]   (small workloads or low prefix-sharing → tree overhead wins)")
+            print(f"[BENCH]   tree training is SLOWER by {(1 - speedup) * 100:.1f}%")
+            print("[BENCH]   (small workloads or low prefix-sharing → tree overhead wins)")
 
     dist.destroy_process_group()
     return 0

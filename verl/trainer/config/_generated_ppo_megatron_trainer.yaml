@@ -107,7 +107,7 @@ actor_rollout_ref:
     calculate_sum_pi_squared: false
     use_kl_loss: false
     use_prefix_grouper: false
-    use_prefix_tree_v1: false
+    use_prefix_tree_dynamic: false
     prefix_tree_attention: magi
     context_parallel_size: 1
     use_torch_compile: true
@@ -177,7 +177,7 @@ actor_rollout_ref:
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
     strategy: megatron
     use_torch_compile: ${oc.select:actor_rollout_ref.actor.use_torch_compile,true}
-    use_prefix_tree_v1: ${oc.select:actor_rollout_ref.actor.use_prefix_tree_v1,false}
+    use_prefix_tree_dynamic: ${oc.select:actor_rollout_ref.actor.use_prefix_tree_dynamic,false}
     prefix_tree_attention: ${oc.select:actor_rollout_ref.actor.prefix_tree_attention,magi}
     context_parallel_size: ${oc.select:actor_rollout_ref.actor.context_parallel_size,1}
     log_prob_micro_batch_size: null
@@ -322,16 +322,17 @@ actor_rollout_ref:
       enable: false
       max_assistant_turns: null
       tool_config_path: null
-      function_tool_path: null
       max_user_turns: null
       max_parallel_calls: 1
       max_tool_response_length: 256
       tool_response_truncate_side: middle
+      interaction_config_path: null
       use_inference_chat_template: false
       tokenization_sanity_check_mode: strict
       format: hermes
       num_repeat_rollouts: null
     calculate_log_probs: false
+    use_prefix_tree: false
     agent:
       _target_: verl.workers.config.AgentLoopConfig
       num_workers: 8
@@ -380,12 +381,6 @@ actor_rollout_ref:
           _target_: verl.utils.profiler.config.TorchProfilerToolConfig
           contents: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.contents,[]}
           discrete: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.torch.discrete,false}
-        precision_debugger:
-          _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
-          config_path: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.config_path,${oc.select:global_profiler.global_tool_config.precision_debugger.config_path,null}}
-          steps: null
-          stages: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.stages,${oc.select:global_profiler.global_tool_config.precision_debugger.stages,null}}
-          strict: ${oc.select:actor_rollout_ref.actor.profiler.tool_config.precision_debugger.strict,${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}}
     prometheus:
       _target_: verl.workers.config.PrometheusConfig
       enable: false
@@ -396,14 +391,6 @@ actor_rollout_ref:
     quantization_config_file: null
     mtp: ${oc.select:actor_rollout_ref.model.mtp, null}
     qat: ${oc.select:actor_rollout_ref.actor.fsdp_config.qat,${oc.select:actor_rollout_ref.actor.megatron.qat,null}}
-    disaggregation:
-      enabled: false
-      prefill_replicas: 1
-      decode_replicas: 1
-      decode_tensor_model_parallel_size: null
-      transfer_backend: nixl
-      bootstrap_port: null
-      ib_device: null
   model:
     _target_: verl.workers.config.HFModelConfig
     path: ~/models/deepseek-llm-7b-chat

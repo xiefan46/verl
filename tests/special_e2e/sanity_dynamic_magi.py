@@ -5,21 +5,21 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""V1+Magi single-GPU sanity: forward / backward equivalence + mode determinism.
+"""dynamic-trie + Magi single-GPU sanity: forward / backward equivalence + mode determinism.
 
 Three checks on a GRPO-style batch (1 prompt × N rollouts) using Qwen2.5-0.5B.
 Works for both plain HF (default) and FSDP2-wrapped models (``USE_FSDP=1``):
 
   Check A — forward equivalence:
-      V1+Magi packed forward vs dense (sdpa) per-sample forward must agree
+      dynamic-trie + Magi packed forward vs dense (sdpa) per-sample forward must agree
       within bf16 noise floor.
 
   Check B — backward equivalence:
-      V1+Magi loss.backward() vs dense loss.backward() must produce the
+      dynamic-trie + Magi loss.backward() vs dense loss.backward() must produce the
       same grad_norm (relative diff within tolerance).
 
   Check C — mode determinism (EVAL/TRAIN/EVAL):
-      V1+Magi forward in {EVAL no_grad, TRAIN grad, EVAL no_grad again}
+      dynamic-trie + Magi forward in {EVAL no_grad, TRAIN grad, EVAL no_grad again}
       must produce identical outputs. Catches state leakage between
       mode switches — originally the symptom that drove the LRU-order
       investigation; now expected to be deterministic.
@@ -31,9 +31,10 @@ Env tunables:
   N, P, R          rollouts / prompt-len / response-len (defaults 4/64/32)
 
 Usage:
-    torchrun --standalone --nproc_per_node=1 tests/special_e2e/sanity_v1_magi.py
-    USE_FSDP=1 torchrun --standalone --nproc_per_node=1 tests/special_e2e/sanity_v1_magi.py
+    torchrun --standalone --nproc_per_node=1 tests/special_e2e/sanity_dynamic_magi.py
+    USE_FSDP=1 torchrun --standalone --nproc_per_node=1 tests/special_e2e/sanity_dynamic_magi.py
 """
+
 from __future__ import annotations
 
 import os
@@ -41,7 +42,6 @@ import sys
 
 import torch
 import torch.distributed as dist
-
 
 N = int(os.environ.get("N", "4"))
 P = int(os.environ.get("P", "64"))
@@ -85,9 +85,9 @@ def _build_fsdp_qwen(model_path):
 def _load_model(model_path, cp_group):
     from transformers import Qwen2ForCausalLM
 
-    from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_v1_backend
+    from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_backend
 
-    apply_magi_prefix_tree_v1_backend()
+    apply_magi_prefix_tree_backend()
 
     if USE_FSDP:
         model = _build_fsdp_qwen(model_path)
@@ -120,15 +120,13 @@ def _build_batch(model):
     return samples, nested
 
 
-def _v1_forward(model, nested, cp_group):
-    """V1+Magi packed forward; returns per-sample logits list."""
+def _dyn_forward(model, nested, cp_group):
+    """dynamic-trie + Magi packed forward; returns per-sample logits list."""
     from verl.models.transformers.monkey_patch import set_magi_attention_key
+    from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
     from verl.utils.prefix_tree_magi import restore_flat_to_nested
-    from verl.utils.prefix_tree_v1 import build_prefix_tree_micro_batch_v1
 
-    pt_batch = build_prefix_tree_micro_batch_v1(
-        model, nested, attention_type="magi", cp_group=cp_group, cp_size=1
-    )
+    pt_batch = build_prefix_tree_micro_batch_dynamic(model, nested, attention_type="magi", cp_group=cp_group, cp_size=1)
     assert pt_batch is not None
     set_magi_attention_key(model, pt_batch.magi_key)
     flat_in = pt_batch.local_flat_input_ids.unsqueeze(0)
@@ -143,10 +141,7 @@ def _dense_forward(model, samples):
     """Per-sample dense (sdpa) forward."""
     model.config._attn_implementation = "sdpa"
     try:
-        return [
-            model(input_ids=s.unsqueeze(0), attention_mask=None, use_cache=False).logits[0]
-            for s in samples
-        ]
+        return [model(input_ids=s.unsqueeze(0), attention_mask=None, use_cache=False).logits[0] for s in samples]
     finally:
         model.config._attn_implementation = "Magi_Attention"
 
@@ -154,7 +149,7 @@ def _dense_forward(model, samples):
 def _loss(per_sample, samples):
     """Mean negative log-prob over each sample's response tokens."""
     losses = []
-    for logits, s in zip(per_sample, samples):
+    for logits, s in zip(per_sample, samples, strict=False):
         f = logits.float()
         labels = s[1:]
         logp = torch.log_softmax(f[:-1], dim=-1).gather(1, labels.unsqueeze(1)).squeeze(1)
@@ -171,16 +166,14 @@ def _grad_norm(model):
 
 
 def _max_diff(a, b):
-    return max((x - y).abs().max().item() for x, y in zip(a, b))
+    return max((x - y).abs().max().item() for x, y in zip(a, b, strict=False))
 
 
 def main() -> int:
     _init_dist()
     cp_group = dist.group.WORLD
 
-    model_path = os.environ.get(
-        "MODEL_PATH", os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B-Instruct")
-    )
+    model_path = os.environ.get("MODEL_PATH", os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B-Instruct"))
     print(f"[SANITY] USE_FSDP={USE_FSDP}  N={N} P={P} R={R}")
     print(f"[SANITY] Loading {model_path}")
     model = _load_model(model_path, cp_group)
@@ -192,14 +185,14 @@ def main() -> int:
     fail = []
 
     # ──────────────────────────────────────────────────────────────
-    # Check A: forward equivalence (V1+Magi vs dense)
+    # Check A: forward equivalence (dynamic-trie + Magi vs dense)
     # ──────────────────────────────────────────────────────────────
     print()
-    print("[SANITY] Check A: forward equivalence (V1+Magi vs dense sdpa)")
+    print("[SANITY] Check A: forward equivalence (dynamic-trie + Magi vs dense sdpa)")
     with torch.no_grad():
-        v1_logits = _v1_forward(model, nested, cp_group)
+        dyn_logits = _dyn_forward(model, nested, cp_group)
         dense_logits = _dense_forward(model, samples)
-    fwd_diff = _max_diff(v1_logits, dense_logits)
+    fwd_diff = _max_diff(dyn_logits, dense_logits)
     fwd_threshold = 1.0  # bf16 noise floor at Qwen2.5-0.5B logit scale
     print(f"[SANITY]   max_diff = {fwd_diff:.4f}  (threshold {fwd_threshold})")
     if fwd_diff < fwd_threshold:
@@ -214,19 +207,21 @@ def main() -> int:
     print()
     print("[SANITY] Check B: backward grad_norm equivalence")
     model.zero_grad(set_to_none=True)
-    v1_logits = _v1_forward(model, nested, cp_group)
-    _loss(v1_logits, samples).backward()
-    norm_v1 = _grad_norm(model)
+    dyn_logits = _dyn_forward(model, nested, cp_group)
+    _loss(dyn_logits, samples).backward()
+    norm_dyn = _grad_norm(model)
 
     model.zero_grad(set_to_none=True)
     dense_logits = _dense_forward(model, samples)
     _loss(dense_logits, samples).backward()
     norm_dense = _grad_norm(model)
 
-    rel_diff = abs(norm_v1 - norm_dense) / max(norm_dense, 1e-9)
+    rel_diff = abs(norm_dyn - norm_dense) / max(norm_dense, 1e-9)
     norm_threshold = 0.1  # 10% rel — bf16 + per-sample-vs-packed path diff
-    print(f"[SANITY]   grad_norm v1={norm_v1:.4f}  dense={norm_dense:.4f}  rel={rel_diff:.4f}  (threshold {norm_threshold})")
-    if rel_diff < norm_threshold and torch.isfinite(torch.tensor(norm_v1)):
+    print(
+        f"[SANITY]   grad_norm dyn={norm_dyn:.4f}  dense={norm_dense:.4f}  rel={rel_diff:.4f}  (threshold {norm_threshold})"
+    )
+    if rel_diff < norm_threshold and torch.isfinite(torch.tensor(norm_dyn)):
         print(f"[SANITY]   {GREEN}check B: PASS{RESET}")
     else:
         print(f"[SANITY]   {RED}check B: FAIL{RESET}")
@@ -241,14 +236,14 @@ def main() -> int:
 
     model.eval()
     with torch.no_grad():
-        out_eval_1 = [t.detach().clone() for t in _v1_forward(model, nested, cp_group)]
+        out_eval_1 = [t.detach().clone() for t in _dyn_forward(model, nested, cp_group)]
 
     model.train()
-    out_train = [t.detach().clone() for t in _v1_forward(model, nested, cp_group)]
+    out_train = [t.detach().clone() for t in _dyn_forward(model, nested, cp_group)]
 
     model.eval()
     with torch.no_grad():
-        out_eval_2 = [t.detach().clone() for t in _v1_forward(model, nested, cp_group)]
+        out_eval_2 = [t.detach().clone() for t in _dyn_forward(model, nested, cp_group)]
 
     eval_train_diff = _max_diff(out_eval_1, out_train)
     eval_eval_diff = _max_diff(out_eval_1, out_eval_2)
@@ -267,8 +262,7 @@ def main() -> int:
     print()
     print("=" * 70)
     if not fail:
-        print(f"  {GREEN}{BOLD}[SANITY PASS] all 3 checks succeeded "
-              f"({'FSDP2' if USE_FSDP else 'plain HF'}).{RESET}")
+        print(f"  {GREEN}{BOLD}[SANITY PASS] all 3 checks succeeded ({'FSDP2' if USE_FSDP else 'plain HF'}).{RESET}")
     else:
         print(f"  {RED}{BOLD}[SANITY FAIL]{RESET}")
         for f in fail:

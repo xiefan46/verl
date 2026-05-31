@@ -5,7 +5,7 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""Sanity test for V1+Magi forward under context-parallel (cp_size > 1).
+"""Sanity test for dynamic-trie + Magi forward under context-parallel (cp_size > 1).
 
 Verifies the module-attribute key-threading fix (commit b6e76b41) on the
 CP dispatch path: cp_size > 1 invokes ``dispatch(...)`` / ``undispatch(...)``
@@ -15,7 +15,7 @@ reads the key from ``module._verl_magi_attention_key``, not from the LRU.
 
 What we test
 ------------
-1. cp_size=2 V1+Magi forward on Qwen2.5-0.5B.
+1. cp_size=2 dynamic-trie + Magi forward on Qwen2.5-0.5B.
 2. Multi-step LRU pollution to stress the wrong-key risk: build several
    shapes in a row, then re-forward an earlier shape. Under the old LRU
    path this would silently use the wrong mgr; under module-attribute
@@ -26,8 +26,9 @@ What we test
 Usage
 -----
     torchrun --standalone --nproc_per_node=2 \\
-        tests/special_e2e/sanity_v1_magi_cp.py
+        tests/special_e2e/sanity_dynamic_magi_cp.py
 """
+
 from __future__ import annotations
 
 import os
@@ -52,18 +53,18 @@ def _make_nested(samples, device):
     )
 
 
-def _v1_magi_cp_forward(model, nested, cp_group):
-    """One CP V1+Magi forward; returns logits as a flat (total_real_tokens, V) tensor.
+def _dyn_magi_cp_forward(model, nested, cp_group):
+    """One CP dynamic-trie + Magi forward; returns logits as a flat (total_real_tokens, V) tensor.
 
     Magi's ``dispatch`` / ``undispatch`` operate on a flat (seq,) tensor along
     dim=0. Mirror the production pattern: dispatch → unsqueeze for model, then
     squeeze → undispatch on the way out.
     """
     from verl.models.transformers.monkey_patch import set_magi_attention_key
+    from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
     from verl.utils.prefix_tree_magi import restore_flat_to_nested
-    from verl.utils.prefix_tree_v1 import build_prefix_tree_micro_batch_v1
 
-    pt_batch = build_prefix_tree_micro_batch_v1(
+    pt_batch = build_prefix_tree_micro_batch_dynamic(
         model,
         nested,
         attention_type="magi",
@@ -75,6 +76,7 @@ def _v1_magi_cp_forward(model, nested, cp_group):
 
     if cp_group.size() > 1:
         from magi_attention.api import dispatch
+
         local_in = dispatch(pt_batch.local_flat_input_ids, pt_batch.magi_key)
         local_pos = dispatch(pt_batch.local_flat_position_ids, pt_batch.magi_key)
     else:
@@ -96,6 +98,7 @@ def _v1_magi_cp_forward(model, nested, cp_group):
     logits = output.logits.squeeze(0)
     if cp_group.size() > 1:
         from magi_attention.api import undispatch
+
         logits = undispatch(logits, pt_batch.magi_key)
 
     flat_logits = logits[: pt_batch.real_tokens]
@@ -123,13 +126,11 @@ def main() -> int:
 
     from transformers import Qwen2ForCausalLM
 
-    from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_v1_backend
+    from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_backend
 
-    apply_magi_prefix_tree_v1_backend()
+    apply_magi_prefix_tree_backend()
 
-    model_path = os.environ.get(
-        "MODEL_PATH", os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B-Instruct")
-    )
+    model_path = os.environ.get("MODEL_PATH", os.path.expanduser("~/models/Qwen/Qwen2.5-0.5B-Instruct"))
     if dist.get_rank() == 0:
         print(f"[CP-SANITY] Loading {model_path}")
     model = Qwen2ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).cuda().eval()
@@ -171,18 +172,17 @@ def main() -> int:
     if dist.get_rank() == 0:
         print("[CP-SANITY] Polluting LRU with distractor builds ...")
     nested_main = _make_nested(samples, device="cuda")
-    out_v1_main = _v1_magi_cp_forward(model, nested_main, cp_group)
+    out_dyn_main = _dyn_magi_cp_forward(model, nested_main, cp_group)
 
     distractor_lengths = [80, 88, 96, 104, 112]
     for dl in distractor_lengths:
         torch.manual_seed(1000 + dl)
-        d_samples = [torch.randint(0, model.config.vocab_size, (dl,), device="cuda").tolist()
-                     for _ in range(N)]
-        _v1_magi_cp_forward(model, _make_nested(d_samples, "cuda"), cp_group)
+        d_samples = [torch.randint(0, model.config.vocab_size, (dl,), device="cuda").tolist() for _ in range(N)]
+        _dyn_magi_cp_forward(model, _make_nested(d_samples, "cuda"), cp_group)
 
     if dist.get_rank() == 0:
         print("[CP-SANITY] Re-running REF after pollution ...")
-    out_v1_main_again = _v1_magi_cp_forward(model, nested_main, cp_group)
+    out_dyn_main_again = _dyn_magi_cp_forward(model, nested_main, cp_group)
 
     # ── Step 2: dense baseline (rank 0 only — sdpa doesn't need CP).
     if dist.get_rank() == 0:
@@ -200,15 +200,15 @@ def main() -> int:
         # reusing the wrong cached mgr like repro 7 demonstrates), the
         # drift would be huge (134%+ in repro 7's FULL-vs-CAUSAL setup).
         within_max = 0.0
-        for a, b in zip(out_v1_main, out_v1_main_again):
+        for a, b in zip(out_dyn_main, out_dyn_main_again, strict=False):
             within_max = max(within_max, (a - b).abs().max().item())
-        print(f"[CP-SANITY] cp v1 first vs re-run after pollution: max_diff={within_max:.6f}")
+        print(f"[CP-SANITY] cp dynamic-trie first vs re-run after pollution: max_diff={within_max:.6f}")
 
-        # 2) cp v1 vs dense (sdpa) reference.
+        # 2) cp dynamic-trie vs dense (sdpa) reference.
         cp_vs_dense_max = 0.0
-        for a, d in zip(out_v1_main, out_dense):
+        for a, d in zip(out_dyn_main, out_dense, strict=False):
             cp_vs_dense_max = max(cp_vs_dense_max, (a - d).abs().max().item())
-        print(f"[CP-SANITY] cp v1 vs dense (sdpa) baseline:        max_diff={cp_vs_dense_max:.6f}")
+        print(f"[CP-SANITY] cp dynamic-trie vs dense (sdpa) baseline:        max_diff={cp_vs_dense_max:.6f}")
 
         BOLD = "\033[1m"
         GREEN = "\033[0;32m"
@@ -222,17 +222,23 @@ def main() -> int:
         ok_vs_dense = cp_vs_dense_max < 1.0
 
         if ok_within and ok_vs_dense:
-            print(f"  {GREEN}{BOLD}[CP-SANITY PASS] cp_size={cp_size} V1+Magi correct under LRU pollution{RESET}")
+            print(
+                f"  {GREEN}{BOLD}[CP-SANITY PASS] cp_size={cp_size} dynamic-trie + Magi correct under LRU pollution{RESET}"
+            )
             print(f"  {GREEN}                  and matches dense baseline within bf16 noise{RESET}")
             rc = 0
         elif not ok_within:
-            print(f"  {RED}{BOLD}[CP-SANITY FAIL] LRU pollution affected output beyond bf16 noise "
-                  f"(max_diff={within_max:.4f}){RESET}")
+            print(
+                f"  {RED}{BOLD}[CP-SANITY FAIL] LRU pollution affected output beyond bf16 noise "
+                f"(max_diff={within_max:.4f}){RESET}"
+            )
             print(f"  {RED}                  module-attribute threading likely broken.{RESET}")
             rc = 1
         else:
-            print(f"  {RED}{BOLD}[CP-SANITY FAIL] cp_size={cp_size} V1 diverges from dense "
-                  f"(max_diff={cp_vs_dense_max:.4f}){RESET}")
+            print(
+                f"  {RED}{BOLD}[CP-SANITY FAIL] cp_size={cp_size} dynamic-trie diverges from dense "
+                f"(max_diff={cp_vs_dense_max:.4f}){RESET}"
+            )
             rc = 2
     else:
         rc = 0

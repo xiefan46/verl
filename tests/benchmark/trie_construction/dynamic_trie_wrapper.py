@@ -1,10 +1,10 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
-# Benchmark-only thin wrapper around verl/utils/prefix_tree_v1.py.
+# Benchmark-only thin wrapper around verl/utils/prefix_tree_dynamic.py.
 # Adds 3-layer timing instrumentation; skips attention-key construction
 # (which needs GPU + MAGI install) so the benchmark stays CPU-only.
 
-"""V1 benchmark wrapper — wraps the production module with timing."""
+"""Benchmark wrapper around the dynamic-trie production module with timing."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def _load_verl_module(rel_path: str, mod_name: str):
 _ptp = _load_verl_module("verl/utils/prefix_tree_params.py", "verl.utils.prefix_tree_params")
 _ptu = _load_verl_module("verl/utils/prefix_tree_utils.py", "verl.utils.prefix_tree_utils")
 _ptm = _load_verl_module("verl/utils/prefix_tree_magi.py", "verl.utils.prefix_tree_magi")
-_v1 = _load_verl_module("verl/utils/prefix_tree_v1.py", "verl.utils.prefix_tree_v1")
+_dynamic = _load_verl_module("verl/utils/prefix_tree_dynamic.py", "verl.utils.prefix_tree_dynamic")
 
 # Re-export production-API symbols for compatibility with the benchmark harness
 PrefixTreeMagiBatch = _ptm.PrefixTreeMagiBatch
@@ -39,17 +39,17 @@ TreeNode = _ptu.TreeNode
 build_multilevel_flex_spec = _ptu.build_multilevel_flex_spec
 
 # Production entry — re-export
-build_prefix_tree_micro_batch_v1 = _v1.build_prefix_tree_micro_batch_v1
+build_prefix_tree_micro_batch_dynamic = _dynamic.build_prefix_tree_micro_batch_dynamic
 
 # Lower-level production helpers (used by benchmark `_full` variant for timing)
-_unpack = _v1.unpack_nested_to_list
-_v1_greedy_build_tries = _v1.v1_greedy_build_tries
-_convert_v1_trie_to_meituan = _v1.convert_v1_trie_to_meituan
-_build_arbitrary_depth_params = _v1.build_arbitrary_depth_params
+_unpack = _dynamic.unpack_nested_to_list
+_greedy_build_tries = _dynamic.greedy_build_tries
+_convert_trie_to_tree_node = _dynamic.convert_trie_to_tree_node
+_build_arbitrary_depth_params = _dynamic.build_arbitrary_depth_params
 
 
 def tree_max_depth(node: TreeNode) -> int:
-    """Max depth of a Meituan TreeNode tree."""
+    """Max depth of a TreeNode tree."""
     if not node.children:
         return 1
     return 1 + max(tree_max_depth(c) for c in node.children)
@@ -60,17 +60,17 @@ def tree_max_depth(node: TreeNode) -> int:
 # ============================================================================
 
 
-def build_prefix_tree_micro_batch_v1_full(
+def build_prefix_tree_micro_batch_dynamic_full(
     model,
     input_ids,
     loss_mask=None,
     position_ids=None,
-    prefix_segments_batch=None,  # V1 ignores this
+    prefix_segments_batch=None,  # dynamic path ignores this
     attention_type: str = "flex",
     tp_size: int = 1,
     cp_size: int = 1,
 ) -> tuple[Optional[PrefixTreeMagiBatch], Optional[PrefixTreeParams], dict]:
-    """Benchmark variant of build_prefix_tree_micro_batch_v1.
+    """Benchmark variant of build_prefix_tree_micro_batch_dynamic.
 
     Same algorithm as the production entry, but:
       - Returns (batch, params, timings) instead of just batch
@@ -78,8 +78,8 @@ def build_prefix_tree_micro_batch_v1_full(
       - 3-layer timing decomposition:
           unpack_ms / tree_detect_ms / pack_ms / total_ms
 
-    Calls the same production-side helpers (`_v1_greedy_build_tries`,
-    `_convert_v1_trie_to_meituan`, `_build_arbitrary_depth_params`) so any
+    Calls the same production-side helpers (`_greedy_build_tries`,
+    `_convert_trie_to_tree_node`, `_build_arbitrary_depth_params`) so any
     correctness drift in production code is reflected here.
     """
     timings: dict[str, float] = {}
@@ -95,28 +95,28 @@ def build_prefix_tree_micro_batch_v1_full(
         timings["total_ms"] = (time.perf_counter() - t_total) * 1000
         return None, None, timings
 
-    # Tree detect = V1 trie build + convert
+    # Tree detect = trie build + convert
     t0 = time.perf_counter()
     sequences = [t.tolist() for t in tokens_by_sample]
     max_tokens_per_tree = sum(len(s) for s in sequences) * 10
-    tries, _ = _v1_greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
+    tries, _ = _greedy_build_tries(sequences, max_tokens_per_tree=max_tokens_per_tree)
     if not tries or len(tries) > 1:
         timings["tree_detect_ms"] = (time.perf_counter() - t0) * 1000
         timings["total_ms"] = (time.perf_counter() - t_total) * 1000
         return None, None, timings
-    converted = _convert_v1_trie_to_meituan(tries[0])
+    converted = _convert_trie_to_tree_node(tries[0])
     if converted is None:
         timings["tree_detect_ms"] = (time.perf_counter() - t0) * 1000
         timings["total_ms"] = (time.perf_counter() - t_total) * 1000
         return None, None, timings
-    meituan_root, node_info, leaves_in_dfs = converted
+    tree_root, node_info, leaves_in_dfs = converted
     timings["tree_detect_ms"] = (time.perf_counter() - t0) * 1000
 
     # Pack
     t0 = time.perf_counter()
     params = _build_arbitrary_depth_params(
         tokens_by_sample,
-        meituan_root,
+        tree_root,
         node_info,
         leaves_in_dfs,
         loss_masks_by_sample=loss_masks_by_sample,

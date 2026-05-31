@@ -219,7 +219,7 @@ class FSDPEngine(BaseEngine):
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
         # Magi context-parallel device mesh + group (orthogonal to FSDP DP).
-        # Used by V1 prefix-tree path with prefix_tree_attention=magi.
+        # Used by dynamic prefix-tree path with prefix_tree_attention=magi.
         self.context_parallel_size = getattr(self.engine_config, "context_parallel_size", 1)
         self.cp_device_mesh = None
         self.cp_group = None
@@ -307,14 +307,14 @@ class FSDPEngine(BaseEngine):
                 ulysses_sp_size=self.ulysses_sequence_parallel_size,
                 use_fused_kernels=use_fused_kernels,
                 fused_kernels_backend=fused_kernels_backend,
-                use_prefix_tree_v1=getattr(self.engine_config, "use_prefix_tree_v1", False),
+                use_prefix_tree_dynamic=getattr(self.engine_config, "use_prefix_tree_dynamic", False),
             )
 
-            # V1 prefix-tree + Magi: walk the model and attach `cp_group` to
+            # dynamic prefix-tree + Magi: walk the model and attach `cp_group` to
             # every attention module, then flip `_attn_implementation` so HF
             # dispatches every layer through our registered Magi backend.
-            if getattr(self.engine_config, "use_prefix_tree_v1", False):
-                # V1+Magi is only supported on FSDP2. FSDP1 (legacy
+            if getattr(self.engine_config, "use_prefix_tree_dynamic", False):
+                # dynamic+Magi is only supported on FSDP2. FSDP1 (legacy
                 # FullyShardedDataParallel) was empirically found to produce
                 # numerically-divergent forward outputs between eval and train
                 # modes when combined with Magi attention, manifesting as
@@ -323,7 +323,7 @@ class FSDPEngine(BaseEngine):
                 # (examples/torch_native/main.py) uses FSDP2 (`fully_shard`),
                 # which is the validated combination.
                 assert self.engine_config.strategy == "fsdp2", (
-                    f"use_prefix_tree_v1=True requires engine.strategy='fsdp2'; "
+                    f"use_prefix_tree_dynamic=True requires engine.strategy='fsdp2'; "
                     f"got strategy='{self.engine_config.strategy}'. "
                     "FSDP1 + Magi attention is unsupported (causes EVAL/TRAIN "
                     "forward divergence). Set: "
@@ -374,7 +374,7 @@ class FSDPEngine(BaseEngine):
             and torch.distributed.get_rank() == 0
             or not torch.distributed.is_initialized()
         ):
-            print(f"[PrefixTreeV1] Attached cp_group to {attached} attention modules")
+            print(f"[PrefixTreeDynamic] Attached cp_group to {attached} attention modules")
 
     def _build_lora_module(self, module):
         module.enable_input_require_grads()
@@ -1291,10 +1291,10 @@ class FSDPEngineWithLMHead(FSDPEngine):
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
-        # V1 prefix tree opt-in flag (passed via non-tensor data on the micro-batch).
-        use_prefix_tree_v1 = tu.get_non_tensor_data(data=micro_batch, key="use_prefix_tree_v1", default=False)
+        # dynamic prefix-tree opt-in flag (passed via non-tensor data on the micro-batch).
+        use_prefix_tree_dynamic = tu.get_non_tensor_data(data=micro_batch, key="use_prefix_tree_dynamic", default=False)
         prefix_tree_attention = tu.get_non_tensor_data(data=micro_batch, key="prefix_tree_attention", default="magi")
-        if use_prefix_tree_v1 and prefix_tree_attention != "magi":
+        if use_prefix_tree_dynamic and prefix_tree_attention != "magi":
             raise ValueError(
                 f"prefix_tree_attention={prefix_tree_attention!r} is unsupported on FSDP; "
                 "only 'magi' is supported (flex was retired due to the AReaL 8x entropy bug)."
@@ -1312,12 +1312,12 @@ class FSDPEngineWithLMHead(FSDPEngine):
         )
         with autocast_ctx:
             pt_batch = None
-            if use_prefix_tree_v1:
+            if use_prefix_tree_dynamic:
                 # Defense-in-depth: _build_module already asserts strategy=fsdp2,
                 # but re-check in forward_step in case a code path constructs the
-                # engine without going through _build_module's V1 setup.
+                # engine without going through _build_module's dynamic-trie setup.
                 assert self.engine_config.strategy == "fsdp2", (
-                    f"use_prefix_tree_v1=True requires engine.strategy='fsdp2'; "
+                    f"use_prefix_tree_dynamic=True requires engine.strategy='fsdp2'; "
                     f"got strategy='{self.engine_config.strategy}'. "
                     "FSDP1 + Magi attention is unsupported."
                 )
@@ -1330,19 +1330,19 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # asserts this. The single-rank case (cp_size=1) still works: Magi's
                 # FFA kernel runs locally without dispatch.
                 assert not self.use_ulysses_sp, (
-                    "use_prefix_tree_v1 + Magi is mutually exclusive with Ulysses SP; "
+                    "use_prefix_tree_dynamic + Magi is mutually exclusive with Ulysses SP; "
                     "set actor.ulysses_sequence_parallel_size=1 and use "
                     "actor.context_parallel_size for Magi-side CP instead."
                 )
+                from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
                 from verl.utils.prefix_tree_magi import restore_flat_to_nested
-                from verl.utils.prefix_tree_v1 import build_prefix_tree_micro_batch_v1
 
                 # NOTE: pass loss_mask=None — verl's loss_mask in RL flow may have
                 # a different length than input_ids (response-only mask), and we
                 # don't actually consume pt_batch.flat_loss_mask anywhere in this
                 # forward path (prepare_model_outputs reads loss_mask from the
                 # original micro_batch, not from pt_batch).
-                pt_batch = build_prefix_tree_micro_batch_v1(
+                pt_batch = build_prefix_tree_micro_batch_dynamic(
                     self.module,
                     micro_batch["input_ids"],
                     loss_mask=None,
@@ -1377,12 +1377,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 if self.context_parallel_size > 1:
                     from magi_attention.api import dispatch
 
-                    local_flat_input_ids = dispatch(
-                        pt_batch.local_flat_input_ids, pt_batch.magi_key
-                    )
-                    local_flat_position_ids = dispatch(
-                        pt_batch.local_flat_position_ids, pt_batch.magi_key
-                    )
+                    local_flat_input_ids = dispatch(pt_batch.local_flat_input_ids, pt_batch.magi_key)
+                    local_flat_position_ids = dispatch(pt_batch.local_flat_position_ids, pt_batch.magi_key)
                 else:
                     local_flat_input_ids = pt_batch.local_flat_input_ids
                     local_flat_position_ids = pt_batch.local_flat_position_ids
