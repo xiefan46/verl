@@ -1,12 +1,13 @@
 # Copyright 2026 Bytedance Ltd. and/or its affiliates
 #
-# Synthetic data generators for trie construction benchmark.
+# Synthetic data generators for dynamic-trie prefix tree construction benchmark.
 
-"""Scenarios for dynamic-trie vs hash-based prefix tree construction benchmark.
+"""Scenarios feeding build_prefix_tree_micro_batch_dynamic.
 
-Two benchmark families:
-  - B1.*: depth-3 scenarios where both dynamic-trie and hash-based work. Fair comparison.
-  - B2.*: deep / long scenarios where ONLY the dynamic-trie path works (hash-based hardcoded to depth-3).
+Three families:
+  - B1.*: shallow (depth-3) trees — GRPO-style rollouts.
+  - B2.*: deep trees + long-sequence cases.
+  - B3.*: paper-derived realistic configurations (TreeRL, rStar-Math, DeepSearch).
 """
 
 from __future__ import annotations
@@ -37,7 +38,7 @@ def _gen_tokens(n: int, base: int, rng: torch.Generator) -> list[int]:
 
 
 # ============================================================================
-# Benchmark 1: depth-3 — both work
+# Benchmark 1: shallow (depth-3) trees
 # ============================================================================
 
 
@@ -62,7 +63,7 @@ def _make_depth3_scenario(
     """
     assert batch_size % num_groups == 0
     samples_per_group = batch_size // num_groups
-    assert samples_per_group >= 2, "Need ≥2 samples per group for depth-3 (the hash-based path)"
+    assert samples_per_group >= 2, "Need ≥2 samples per group for depth-3"
 
     rng = torch.Generator().manual_seed(seed)
 
@@ -92,7 +93,7 @@ def _make_depth3_scenario(
 
 
 def b1_scenarios() -> list[Scenario]:
-    """Depth-3 fair comparison scenarios."""
+    """Shallow depth-3 scenarios (GRPO-style rollouts)."""
     return [
         _make_depth3_scenario(
             "B1.small",
@@ -148,7 +149,7 @@ def b1_scenarios() -> list[Scenario]:
 
 
 # ============================================================================
-# Benchmark 2: deep trees + long sequences (dynamic only)
+# Benchmark 2: deep trees + long sequences
 # ============================================================================
 
 
@@ -212,9 +213,8 @@ def _make_deep_scenario(
 
     samples = [torch.tensor(samples_tokens[i], dtype=torch.long) for i in range(batch_size)]
 
-    # Generate prefix_segments_batch — the hash-based path can only see up to depth-3, so segments
-    # beyond depth-3 are just leaf tokens. We provide depth-3 segments (turn1=root,
-    # turn2=intermediate, turn3=rest) as best-effort for fairness.
+    # Generate prefix_segments_batch — the dynamic path ignores it, but we still
+    # populate it so the same scenario data could feed a hash-based comparison if needed.
     prefix_segments_batch: list[list[tuple[int, int]]] = []
     for s in samples:
         toks = s.tolist()
@@ -267,7 +267,7 @@ def _make_long_seq_scenario(
 
 
 def b2_scenarios() -> list[Scenario]:
-    """Deep trees + long sequences (dynamic only; the hash-based path falls back).
+    """Deep trees + long sequences.
 
     For "real" depth-D, we need B = branch_factor^(D-1) samples to avoid the dynamic-trie path
     compressing single-sample chains at the bottom of the tree.
