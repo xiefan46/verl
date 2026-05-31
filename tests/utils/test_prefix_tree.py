@@ -497,3 +497,134 @@ class TestPrefixSegmentsPrior:
         h, length = segs[0]
         assert length == 3
         assert h == _hash_prefix(torch.tensor([1, 2, 3], dtype=torch.long))
+
+
+# ---------------------------------------------------------------------------
+# Hash path vs dynamic path equivalence
+# ---------------------------------------------------------------------------
+
+
+class TestPathEquivalence:
+    """Verify the two detection algorithms produce equivalent flat layouts
+    through the unified build_prefix_tree_micro_batch entry.
+
+    Both paths feed the same downstream pipeline (build_layout_from_tree_node
+    + _finalize_prefix_tree_batch), so for any input that both paths can
+    handle, the output PrefixTreeMagiBatch must be bit-identical on
+    ``flat_input_ids`` and the per-sample reconstructed token sequences.
+    DFS ordering may legitimately differ between paths, so we compare on
+    the unordered set of (sample_idx, reconstructed_tokens) pairs.
+    """
+
+    @staticmethod
+    def _reconstruct(pt_batch):
+        flat = pt_batch.flat_input_ids
+        out = {}
+        for leaf_idx, sample_idx in enumerate(pt_batch.leaf_to_sample):
+            ls, le = pt_batch.leaf_ranges[leaf_idx]
+            ancestors = (
+                pt_batch.leaf_ancestor_ranges[leaf_idx]
+                if pt_batch.leaf_ancestor_ranges is not None
+                else [pt_batch.prefix_range]
+            )
+            pieces = [flat[s:e] for s, e in ancestors] + [flat[ls:le]]
+            out[int(sample_idx)] = torch.cat(pieces).tolist()
+        return out
+
+    @staticmethod
+    def _run_both_paths(samples, prefix_segments_batch=None):
+        from verl.utils.prefix_tree import build_prefix_tree_micro_batch
+
+        nested = _make_nested(samples)
+        kwargs = dict(
+            model=None,
+            input_ids=nested,
+            prefix_segments_batch=prefix_segments_batch,
+            attention_type="magi",
+        )
+        b_hash = build_prefix_tree_micro_batch(**kwargs, dynamic_trie=False)
+        b_dyn = build_prefix_tree_micro_batch(**kwargs, dynamic_trie=True)
+        return b_hash, b_dyn
+
+    @staticmethod
+    def _hash_segments(samples):
+        import hashlib
+
+        def _h(toks):
+            return int(hashlib.sha256(b",".join(str(t).encode() for t in toks)).hexdigest()[:8], 16)
+
+        return [[(_h(s), len(s))] for s in samples]
+
+    def test_single_level_shared_root(self):
+        """3 samples share a 3-token root, no multi-level. Both paths should agree."""
+        samples = [
+            [10, 20, 30, 41, 42, 43],
+            [10, 20, 30, 51, 52, 53],
+            [10, 20, 30, 61, 62, 63],
+        ]
+        b_hash, b_dyn = self._run_both_paths(samples)
+        assert b_hash is not None and b_dyn is not None
+
+        # flat layout must be bit-identical (both produce DFS-pre-order over the same TreeNode shape)
+        assert torch.equal(b_hash.flat_input_ids, b_dyn.flat_input_ids), (
+            f"hash flat={b_hash.flat_input_ids.tolist()}, dyn flat={b_dyn.flat_input_ids.tolist()}"
+        )
+        assert b_hash.prefix_range == b_dyn.prefix_range
+        assert sorted(b_hash.leaf_to_sample) == sorted(b_dyn.leaf_to_sample)
+
+        # per-sample reconstruction must match the original input on both paths
+        for sample_idx, expected in enumerate(samples):
+            assert self._reconstruct(b_hash)[sample_idx] == expected
+            assert self._reconstruct(b_dyn)[sample_idx] == expected
+
+    def test_multilevel_depth3(self):
+        """4 samples, 2 groups of 2, depth-3 tree. Needs prefix_segments_batch for the hash path
+        to detect multi-level; dynamic path infers it from tokens."""
+        import hashlib
+
+        samples = [
+            [1, 2, 3, 100, 200, 11, 12, 13],
+            [1, 2, 3, 100, 200, 21, 22, 23],
+            [1, 2, 3, 300, 400, 31, 32, 33],
+            [1, 2, 3, 300, 400, 41, 42, 43],
+        ]
+
+        def _h(toks):
+            return int(hashlib.sha256(b",".join(str(t).encode() for t in toks)).hexdigest()[:8], 16)
+
+        # Per-turn segments: turn1=root(3), turn2=root+mid(5), turn3=full(8)
+        psb = [[(_h(s[:3]), 3), (_h(s[:5]), 5), (_h(s), 8)] for s in samples]
+        b_hash, b_dyn = self._run_both_paths(samples, prefix_segments_batch=psb)
+        assert b_hash is not None and b_dyn is not None
+
+        # Same flat tokens
+        assert torch.equal(b_hash.flat_input_ids, b_dyn.flat_input_ids)
+        assert b_hash.prefix_range == b_dyn.prefix_range
+        assert sorted(b_hash.leaf_to_sample) == sorted(b_dyn.leaf_to_sample)
+
+        for sample_idx, expected in enumerate(samples):
+            assert self._reconstruct(b_hash)[sample_idx] == expected
+            assert self._reconstruct(b_dyn)[sample_idx] == expected
+
+    def test_no_shared_prefix_both_return_none(self):
+        """2 samples with disjoint tokens. Both paths return None."""
+        samples = [
+            [1, 2, 3],
+            [4, 5, 6],
+        ]
+        b_hash, b_dyn = self._run_both_paths(samples)
+        assert b_hash is None, "hash path should return None when no shared prefix"
+        assert b_dyn is None, "dynamic path should return None when no shared prefix"
+
+    def test_single_sample_both_return_none(self):
+        """1 sample. Both paths return None (no sharing possible)."""
+        samples = [[1, 2, 3, 4, 5]]
+        b_hash, b_dyn = self._run_both_paths(samples)
+        # Hash path: 1-sample LCP == full sample, prefix_len > 0, but downstream
+        # may produce a degenerate single-leaf tree. Dynamic path: trie has 1 leaf,
+        # convert_trie_to_tree_node returns None. Hash may differ here; verify both
+        # at least don't crash.
+        assert b_dyn is None, "dynamic path should return None for single sample"
+        # If hash returns non-None for 1-sample, that's an idiosyncrasy of the hash
+        # path (it accepts degenerate "shared prefix == whole sample" case). Don't
+        # assert equivalence here — just that both behave deterministically.

@@ -276,6 +276,8 @@ def main() -> int:
         for f in fail:
             print(f"  {RED}  - {f}{RESET}")
     print("=" * 70)
+    if dist.is_initialized():
+        dist.destroy_process_group()
     return 0 if not fail else 1
 
 
