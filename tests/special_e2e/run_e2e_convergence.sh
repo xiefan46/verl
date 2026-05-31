@@ -100,21 +100,12 @@ COMMON_ARGS=(
 )
 
 # ----------------------------------------------------------------------------
-# R1: Dense baseline (no prefix tree). The "gold ground truth" trajectory.
+# Run order: tree runs FIRST so we fail fast on tree-side bugs without
+# spending baseline GPU-time. Dense baseline runs last; without it we still
+# know whether the tree path itself trained successfully.
 # ----------------------------------------------------------------------------
-echo ""
-echo "=========================================="
-echo "[E2E] R1: Dense baseline (no prefix tree)"
-echo "=========================================="
-python3 -m verl.trainer.main_ppo \
-    "${COMMON_ARGS[@]}" \
-    actor_rollout_ref.actor.use_prefix_tree_dynamic=False \
-    trainer.experiment_name=R1_dense \
-    2>&1 | tee "$LOG_DIR/R1_dense.log"
 
-# ----------------------------------------------------------------------------
-# R2: Tree non-CP. Same as R1 plus use_prefix_tree_dynamic=True (cp_size=1).
-# ----------------------------------------------------------------------------
+# R2: Tree non-CP. use_prefix_tree_dynamic=True (cp_size=1).
 echo ""
 echo "=========================================="
 echo "[E2E] R2: Tree non-CP (use_prefix_tree_dynamic=True, cp_size=1)"
@@ -127,9 +118,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=R2_tree_noncp \
     2>&1 | tee "$LOG_DIR/R2_tree_noncp.log"
 
-# ----------------------------------------------------------------------------
-# R3: Tree CP=2. Same as R2 plus context_parallel_size=2 (8 GPU = 4 DP × 2 CP).
-# ----------------------------------------------------------------------------
+# R3: Tree CP=2. context_parallel_size=2 (8 GPU = 4 DP × 2 CP).
 if [ "$SKIP_R3" != "1" ]; then
     echo ""
     echo "=========================================="
@@ -143,6 +132,18 @@ if [ "$SKIP_R3" != "1" ]; then
         trainer.experiment_name=R3_tree_cp2 \
         2>&1 | tee "$LOG_DIR/R3_tree_cp2.log"
 fi
+
+# R1: Dense baseline (no prefix tree). The "gold ground truth" trajectory,
+# run last because the tree runs above are what we're actually validating.
+echo ""
+echo "=========================================="
+echo "[E2E] R1: Dense baseline (no prefix tree)"
+echo "=========================================="
+python3 -m verl.trainer.main_ppo \
+    "${COMMON_ARGS[@]}" \
+    actor_rollout_ref.actor.use_prefix_tree_dynamic=False \
+    trainer.experiment_name=R1_dense \
+    2>&1 | tee "$LOG_DIR/R1_dense.log"
 
 # ----------------------------------------------------------------------------
 # Compare: R2 vs R1 (non-CP convergence), R3 vs R1 (CP convergence)
