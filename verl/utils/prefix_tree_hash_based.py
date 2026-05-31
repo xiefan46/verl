@@ -32,6 +32,64 @@ from torch import Tensor
 
 from verl.utils.prefix_tree_utils import TreeNode, longest_common_prefix_length
 
+# ---------------------------------------------------------------------------
+# Token-tensor hash + prefix_segments builder
+#
+# These two helpers feed the hash detection pipeline:
+#   - _hash_prefix produces the per-turn or per-prompt hash entries that go
+#     into a sample's prefix_segments list at data-load / rollout time.
+#   - build_prefix_segments_single_turn is the degenerate (one-entry) builder
+#     used by RL trainers when the dataset doesn't emit per-sub-turn
+#     boundaries — it treats the whole prompt as one turn.
+#
+# _hash_prefix is also used by unrelated callers (SSM cache, multi-turn SFT
+# dataset) as a convenient token-hash utility; they import from this module.
+# ---------------------------------------------------------------------------
+
+
+def _hash_prefix(token_ids_flat: Tensor) -> int:
+    """128-bit hash of a 1-D token-id tensor (full cumulative prefix).
+
+    Uses xxhash when available (faster); falls back to hashlib.md5.
+    The 128-bit width makes accidental collision negligible in practice.
+    """
+    raw = token_ids_flat.numpy().tobytes()
+    try:
+        import xxhash  # type: ignore[import]
+
+        return xxhash.xxh128_intdigest(raw)
+    except ImportError:
+        import hashlib
+
+        return int.from_bytes(hashlib.md5(raw).digest(), "little")
+
+
+def build_prefix_segments_single_turn(
+    input_ids: Tensor,
+    attention_mask: Optional[Tensor] = None,
+) -> list[tuple[int, int]]:
+    """Build a single-entry prefix_segments list for one sample.
+
+    Used by RL trainers when per-sub-turn boundaries are unavailable —
+    the single entry covers the entire real (non-pad) prompt and lets
+    the hash path detect the prompt as a shared root prefix across
+    GRPO-style rollouts.
+
+    Args:
+        input_ids: 1-D or 2-D (1, seq_len) token tensor.
+        attention_mask: Optional 1-D or 2-D mask; when provided, only the
+            tokens where mask==1 are considered (strips padding).
+
+    Returns:
+        ``[(hash, prompt_len)]`` — a one-element prefix_segments list.
+    """
+    ids = input_ids.flatten()
+    if attention_mask is not None:
+        mask = attention_mask.flatten().bool()
+        ids = ids[mask]
+    h = _hash_prefix(ids.cpu())
+    return [(h, int(ids.numel()))]
+
 
 def build_tree_hash_based(
     samples: list[Tensor],

@@ -1364,7 +1364,7 @@ class RayPPOTrainer:
                     and gen_batch_output.batch is not None
                     and "input_ids" in gen_batch_output.batch.keys()
                 ):
-                    from verl.utils.prefix_tree import build_prefix_segments_single_turn
+                    from verl.utils.prefix_tree_hash_based import build_prefix_segments_single_turn
                     _ids = gen_batch_output.batch["input_ids"]
                     _mask = gen_batch_output.batch.get("attention_mask", None)
                     gen_batch_output.non_tensor_batch["prefix_segments"] = np.array(

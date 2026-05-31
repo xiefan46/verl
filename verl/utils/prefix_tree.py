@@ -253,53 +253,6 @@ def restore_flat_to_nested(
     return torch.nested.as_nested_tensor(sample_tensors, layout=torch.jagged)
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-
-def _hash_prefix(token_ids_flat: Tensor) -> int:
-    """128-bit hash of a 1-D token-id tensor (full cumulative prefix).
-
-    Uses xxhash when available (faster); falls back to hashlib.md5.
-    The 128-bit width makes accidental collision negligible in practice.
-    """
-    raw = token_ids_flat.numpy().tobytes()
-    try:
-        import xxhash  # type: ignore[import]
-
-        return xxhash.xxh128_intdigest(raw)
-    except ImportError:
-        import hashlib
-
-        return int.from_bytes(hashlib.md5(raw).digest(), "little")
-
-
-def build_prefix_segments_single_turn(
-    input_ids: Tensor,
-    attention_mask: Optional[Tensor] = None,
-) -> list[tuple[int, int]]:
-    """Build a single-entry prefix_segments list for one sample.
-
-    Used by RL trainers when per-sub-turn boundaries are unavailable.
-    The single entry covers the entire real (non-pad) prompt.
-
-    Args:
-        input_ids: 1-D or 2-D (1, seq_len) token tensor.
-        attention_mask: Optional 1-D or 2-D mask; when provided, only the
-            tokens where mask==1 are considered (strips padding).
-
-    Returns:
-        ``[(hash, prompt_len)]`` — a one-element prefix_segments list.
-    """
-    ids = input_ids.flatten()
-    if attention_mask is not None:
-        mask = attention_mask.flatten().bool()
-        ids = ids[mask]
-    h = _hash_prefix(ids.cpu())
-    return [(h, int(ids.numel()))]
-
-
 def _build_flex_key(params, device):
     """Build a torch flex_attention block_mask from PrefixTreeParams.
 

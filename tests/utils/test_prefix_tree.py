@@ -348,7 +348,7 @@ class TestPrefixSegmentsPrior:
 
     def _make_segments(self, token_lists: list[list[int]]) -> list[list[tuple[int, int]]]:
         """Build ground-truth prefix_segments for a list of token sequences."""
-        from verl.utils.prefix_tree import _hash_prefix
+        from verl.utils.prefix_tree_hash_based import _hash_prefix
         result = []
         for tokens in token_lists:
             segs = []
@@ -397,7 +397,7 @@ class TestPrefixSegmentsPrior:
         import verl.utils.prefix_tree as ptm
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
-        from verl.utils.prefix_tree import _hash_prefix
+        from verl.utils.prefix_tree_hash_based import _hash_prefix
 
         # Two samples sharing the first 3 tokens (one sub-turn boundary).
         # Sub-turn 0 ends at token index 3; sub-turn 1 ends at 5/4 respectively.
@@ -435,7 +435,7 @@ class TestPrefixSegmentsPrior:
         import verl.utils.prefix_tree as ptm
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
-        from verl.utils.prefix_tree import _hash_prefix
+        from verl.utils.prefix_tree_hash_based import _hash_prefix
 
         t0 = torch.tensor([1, 2, 3], dtype=torch.long)
         t1 = torch.tensor([4, 5, 6], dtype=torch.long)
@@ -454,7 +454,7 @@ class TestPrefixSegmentsPrior:
         import verl.utils.prefix_tree as ptm
         monkeypatch.setattr(ptm, "_build_magi_key", lambda model, params: object())
 
-        from verl.utils.prefix_tree import _hash_prefix
+        from verl.utils.prefix_tree_hash_based import _hash_prefix
 
         token_lists = [
             [10, 20, 30, 41],   # sample 0
@@ -477,7 +477,7 @@ class TestPrefixSegmentsPrior:
 
     def test_build_prefix_segments_single_turn(self):
         """build_prefix_segments_single_turn produces a one-entry list."""
-        from verl.utils.prefix_tree import build_prefix_segments_single_turn, _hash_prefix
+        from verl.utils.prefix_tree_hash_based import build_prefix_segments_single_turn, _hash_prefix
 
         ids = torch.tensor([1, 2, 3, 4, 5], dtype=torch.long)
         segs = build_prefix_segments_single_turn(ids)
@@ -488,7 +488,7 @@ class TestPrefixSegmentsPrior:
 
     def test_build_prefix_segments_single_turn_with_mask(self):
         """Padding tokens are excluded when attention_mask is provided."""
-        from verl.utils.prefix_tree import build_prefix_segments_single_turn, _hash_prefix
+        from verl.utils.prefix_tree_hash_based import build_prefix_segments_single_turn, _hash_prefix
 
         ids = torch.tensor([1, 2, 3, 0, 0], dtype=torch.long)
         mask = torch.tensor([1, 1, 1, 0, 0], dtype=torch.long)
