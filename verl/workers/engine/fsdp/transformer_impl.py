@@ -228,13 +228,17 @@ class FSDPEngine(BaseEngine):
                 "context_parallel_size > 1 (Magi CP) is mutually exclusive with "
                 "ulysses_sequence_parallel_size > 1; pick one parallelism scheme."
             )
-            assert dp_size * self.context_parallel_size == world_size, (
-                f"dp_size ({dp_size}) * cp_size ({self.context_parallel_size}) "
-                f"!= world_size ({world_size}); adjust fsdp_size or context_parallel_size"
+            # CP mesh is orthogonal to FSDP — its (dp × cp) must cover world.
+            # get_data_parallel_size() returns world_size // ulysses_sp and
+            # doesn't account for CP, so compute the CP-side dp locally.
+            cp_dp_size = world_size // self.context_parallel_size
+            assert cp_dp_size * self.context_parallel_size == world_size, (
+                f"world_size ({world_size}) not divisible by context_parallel_size "
+                f"({self.context_parallel_size}); choose a cp_size that divides world_size"
             )
             self.cp_device_mesh = init_device_mesh(
                 device_name,
-                mesh_shape=(dp_size, self.context_parallel_size),
+                mesh_shape=(cp_dp_size, self.context_parallel_size),
                 mesh_dim_names=["dp", "cp"],
             )
             self.cp_group = self.cp_device_mesh["cp"].get_group()
