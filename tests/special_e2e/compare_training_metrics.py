@@ -39,6 +39,8 @@ from dataclasses import asdict, dataclass
 from typing import Optional
 
 
+# Ray colours its per-worker prefix with ANSI escapes (e.g. \x1b[36m(...)\x1b[0m).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Ray prefixes step lines with "(TaskRunner pid=NNN) " when logged through Ray.
 _RAY_PREFIX_RE = re.compile(r"^\([\w]+\s+pid=\d+\)\s+")
 # step:NN - key:value - key:value - ...
@@ -63,7 +65,8 @@ def parse_log(path: str) -> dict[int, dict[str, float]]:
     out: dict[int, dict[str, float]] = {}
     with open(path) as f:
         for line in f:
-            line = line.strip()
+            # Strip ANSI colour codes Ray injects around its (worker pid=NNN) prefix.
+            line = _ANSI_RE.sub("", line).strip()
             # Strip optional "(TaskRunner pid=NNN) " Ray prefix
             ray_m = _RAY_PREFIX_RE.match(line)
             if ray_m:
