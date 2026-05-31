@@ -26,7 +26,7 @@ REQUIREMENTS (enforced by ``FSDPEngine._build_module`` assertion):
     mutually exclusive seq-parallel schemes.
 
 Trade-offs vs the hash-based static path (from benchmark in
-``tests/benchmark/trie_construction/``):
+``tests/benchmark/tree_training/``):
   - 10–300× slower at trie *detection* (Python token-by-token insert).
   - For typical RL workloads (<1M total tokens), absolute overhead is
     <250 ms (~2–3% of a 10 s step).

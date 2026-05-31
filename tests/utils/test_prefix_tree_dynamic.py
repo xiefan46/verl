@@ -27,7 +27,7 @@ import torch
 
 # All tests below need the full verl env (transformers triggers verl.__init__).
 # Skip the entire module if missing — keeps `pytest --collect-only` clean on
-# minimal CPU envs (e.g. the trie_construction benchmark machine).
+# minimal CPU envs (e.g. the tree_training benchmark machine).
 pytest.importorskip("transformers")
 
 
