@@ -8,6 +8,8 @@
 #   bash tests/special_e2e/run_dense_only.sh                  # default STEPS=100
 #   STEPS=50 bash tests/special_e2e/run_dense_only.sh
 #   USE_WANDB=0 bash tests/special_e2e/run_dense_only.sh
+#   EXTRA_ARGS='actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8' \
+#       bash tests/special_e2e/run_dense_only.sh              # extra hydra overrides
 #
 set -ex
 
@@ -29,6 +31,9 @@ if [ "$USE_WANDB" = "1" ]; then
 else
     LOGGER_ARG=("trainer.logger=console")
 fi
+
+EXTRA_ARGS=${EXTRA_ARGS:-}
+read -ra EXTRA_ARGS_ARR <<< "$EXTRA_ARGS"
 
 export NCCL_NVLS_ENABLE=0
 
@@ -76,6 +81,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.total_epochs=1 \
     trainer.total_training_steps=$STEPS \
     +trainer.seed=$SEED \
+    "${EXTRA_ARGS_ARR[@]}" \
     2>&1 | tee "$LOG_FILE"
 
 echo ""
