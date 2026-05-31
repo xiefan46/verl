@@ -220,6 +220,12 @@ class FSDPEngine(BaseEngine):
 
         # Magi context-parallel device mesh + group (orthogonal to FSDP DP).
         # Used by dynamic prefix-tree path with prefix_tree_attention=magi.
+        #
+        # We always build a CP mesh — even for cp_size=1 — so the dynamic-trie
+        # path can pass a concrete cp_group to Magi. Without it, _build_magi_key
+        # falls back to dist.group.WORLD, which makes Magi think CP=world_size
+        # and triggers a2av buffer mismatches in the cp_size=1 case where each
+        # rank actually processes the full sequence.
         self.context_parallel_size = getattr(self.engine_config, "context_parallel_size", 1)
         self.cp_device_mesh = None
         self.cp_group = None
@@ -228,20 +234,22 @@ class FSDPEngine(BaseEngine):
                 "context_parallel_size > 1 (Magi CP) is mutually exclusive with "
                 "ulysses_sequence_parallel_size > 1; pick one parallelism scheme."
             )
-            # CP mesh is orthogonal to FSDP — its (dp × cp) must cover world.
-            # get_data_parallel_size() returns world_size // ulysses_sp and
-            # doesn't account for CP, so compute the CP-side dp locally.
-            cp_dp_size = world_size // self.context_parallel_size
-            assert cp_dp_size * self.context_parallel_size == world_size, (
-                f"world_size ({world_size}) not divisible by context_parallel_size "
-                f"({self.context_parallel_size}); choose a cp_size that divides world_size"
-            )
-            self.cp_device_mesh = init_device_mesh(
-                device_name,
-                mesh_shape=(cp_dp_size, self.context_parallel_size),
-                mesh_dim_names=["dp", "cp"],
-            )
-            self.cp_group = self.cp_device_mesh["cp"].get_group()
+        # CP mesh is orthogonal to FSDP — its (dp × cp) must cover world.
+        # get_data_parallel_size() returns world_size // ulysses_sp and doesn't
+        # account for CP, so compute the CP-side dp locally. For cp_size=1
+        # this produces a (world, 1) mesh and each rank gets a size-1 cp_group
+        # (Magi treats CP as off).
+        cp_dp_size = world_size // self.context_parallel_size
+        assert cp_dp_size * self.context_parallel_size == world_size, (
+            f"world_size ({world_size}) not divisible by context_parallel_size "
+            f"({self.context_parallel_size}); choose a cp_size that divides world_size"
+        )
+        self.cp_device_mesh = init_device_mesh(
+            device_name,
+            mesh_shape=(cp_dp_size, self.context_parallel_size),
+            mesh_dim_names=["dp", "cp"],
+        )
+        self.cp_group = self.cp_device_mesh["cp"].get_group()
 
     def _build_module(self):
         from verl.utils.model import get_hf_auto_model_class
