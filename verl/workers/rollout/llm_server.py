@@ -248,9 +248,14 @@ class LLMServerManager:
 
         # for recipe to change
         if not hasattr(self, "rollout_replica_class"):
+            # Some rollout configs (older schemas without the SGLang PD knobs)
+            # don't define `disaggregation` — match the defensive access at
+            # `_initialize_llm_servers`.
+            _disagg = getattr(self.rollout_config, "disaggregation", None)
+            _disagg_enabled = bool(getattr(_disagg, "enabled", False)) if _disagg is not None else False
             self.rollout_replica_class = get_rollout_replica_class(
                 self.rollout_config.name,
-                disaggregation_enabled=self.rollout_config.disaggregation.enabled,
+                disaggregation_enabled=_disagg_enabled,
             )
 
     @classmethod
