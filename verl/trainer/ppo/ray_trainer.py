@@ -1072,7 +1072,16 @@ class RayPPOTrainer:
         dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
 
         # Use group-level balancing for PrefixGrouper to keep same-uid samples together
-        if getattr(self, "use_prefix_grouper", False) and "uid" in batch.non_tensor_batch:
+        # Both PrefixGrouper and dynamic prefix-tree (tree training) need same-uid
+        # samples to stay together in the same DP rank — otherwise the shared-prefix
+        # detection within a micro-batch degrades to just chat-template overlap.
+        _use_prefix_grouper = getattr(self, "use_prefix_grouper", False)
+        _use_tree_training = self.config.actor_rollout_ref.actor.get(
+            "use_prefix_tree_dynamic", False
+        )
+        _keep_uid_grouping = _use_prefix_grouper or _use_tree_training
+
+        if _keep_uid_grouping and "uid" in batch.non_tensor_batch:
             from verl.utils.seqlen_balancing import get_group_balanced_partitions
 
             uid_list = list(batch.non_tensor_batch["uid"])
@@ -1083,8 +1092,8 @@ class RayPPOTrainer:
 
             if num_groups % dp_size != 0:
                 raise ValueError(
-                    f"PrefixGrouper with balance_batch requires num_uid_groups ({num_groups}) "
-                    f"% dp_size ({dp_size}) == 0. "
+                    f"uid-preserving balance_batch (PrefixGrouper or tree training) requires "
+                    f"num_uid_groups ({num_groups}) % dp_size ({dp_size}) == 0. "
                     f"This ensures each rank gets equal number of groups. "
                     f"Current batch_size={batch_size}, adjust batch_size to be a multiple of "
                     f"dp_size * rollout.n."
@@ -1111,9 +1120,10 @@ class RayPPOTrainer:
                     global_partition_lst[j].extend([x + minibatch_size * i for x in part])
         else:
             global_partition_lst = get_seqlen_balanced_partitions(workload_lst, k_partitions=dp_size, equal_size=True)
-        # Place smaller micro-batches at both ends to reduce the bubbles in pipeline parallel.
-        # Skip reordering within partitions for PrefixGrouper to maintain uid grouping
-        if not getattr(self, "use_prefix_grouper", False):
+        # Place smaller micro-batches at both ends to reduce pipeline-parallel bubbles.
+        # Skip when uid grouping must be preserved (PrefixGrouper or tree training)
+        # — sorting by seqlen would scramble same-prompt rollouts within a rank.
+        if not _keep_uid_grouping:
             for idx, partition in enumerate(global_partition_lst):
                 partition.sort(key=lambda x: (workload_lst[x], x))
                 ordered_partition = partition[::2] + partition[1::2][::-1]
