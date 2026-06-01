@@ -144,15 +144,13 @@ def _dense_forward_per_sample(model, samples):
     """Per-sample sdpa forward (8 separate forwards, 8 retained graphs).
 
     Kept for reference; NOT what verl uses in training. Memory dominated by
-    8× retained activations.
+    8× retained activations. Caller must set
+    ``model.config._attn_implementation = "sdpa"`` before calling and keep
+    it set through loss.backward().
     """
-    model.config._attn_implementation = "sdpa"
-    try:
-        return [
-            model(input_ids=s.unsqueeze(0), attention_mask=None, use_cache=False).logits[0] for s in samples
-        ]
-    finally:
-        model.config._attn_implementation = "Magi_Attention"
+    return [
+        model(input_ids=s.unsqueeze(0), attention_mask=None, use_cache=False).logits[0] for s in samples
+    ]
 
 
 def _dense_forward_packed(model, samples):
@@ -163,21 +161,22 @@ def _dense_forward_packed(model, samples):
     backend infers cu_seqlens from the position_ids resets and applies a
     per-sample causal mask without materialising a full (T, T) attention
     matrix — same effective semantics as varlen FA2.
+
+    Caller must set ``model.config._attn_implementation = "flash_attention_2"``
+    BEFORE this call AND keep it set through loss.backward() — otherwise
+    gradient checkpointing recompute uses a different attention impl than
+    the original forward and crashes with a saved-tensor-count mismatch.
     """
     flat_input = torch.cat(samples).unsqueeze(0)  # (1, total_tokens)
     pos_pieces = [torch.arange(s.shape[0], device="cuda", dtype=torch.long) for s in samples]
     flat_pos = torch.cat(pos_pieces).unsqueeze(0)  # (1, total_tokens), resets per sample
 
-    model.config._attn_implementation = "flash_attention_2"
-    try:
-        out = model(
-            input_ids=flat_input,
-            attention_mask=None,
-            position_ids=flat_pos,
-            use_cache=False,
-        )
-    finally:
-        model.config._attn_implementation = "Magi_Attention"
+    out = model(
+        input_ids=flat_input,
+        attention_mask=None,
+        position_ids=flat_pos,
+        use_cache=False,
+    )
 
     # Restore per-sample logits (so loss computation matches tree path's output shape)
     logits = out.logits[0]  # (total_tokens, vocab)
@@ -242,6 +241,7 @@ def main() -> int:
     print("[PROFILE] Tree (dynamic-trie + Magi) forward + backward")
     print("=" * 70)
     model.zero_grad(set_to_none=True)
+    model.config._attn_implementation = "Magi_Attention"
     _profile_one(
         "tree",
         lambda: _tree_forward(model, nested, cp_group),
@@ -255,6 +255,9 @@ def main() -> int:
     print("[PROFILE] Dense packed (FA2 rmpad) forward + backward — production-equivalent")
     print("=" * 70)
     model.zero_grad(set_to_none=True)
+    # Set FA2 BEFORE forward and keep through backward — grad ckpt recompute
+    # must see the same _attn_implementation as the original forward.
+    model.config._attn_implementation = "flash_attention_2"
     _profile_one(
         "dense_packed",
         lambda: _dense_forward_packed(model, samples),
@@ -269,6 +272,7 @@ def main() -> int:
         print("[PROFILE] Dense per-sample sdpa forward + backward (reference, NOT production)")
         print("=" * 70)
         model.zero_grad(set_to_none=True)
+        model.config._attn_implementation = "sdpa"
         _profile_one(
             "dense_per_sample",
             lambda: _dense_forward_per_sample(model, samples),
