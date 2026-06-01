@@ -1,0 +1,228 @@
+# Copyright 2026 Bytedance Ltd. and/or its affiliates
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+"""Profile peak GPU memory of one tree forward+backward vs one dense forward+backward.
+
+Records a torch.cuda memory snapshot for each path. Upload the resulting
+pickles to https://pytorch.org/memory_viz to see the per-tensor timeline
+and identify which allocations cause the tree path to peak higher.
+
+Output files:
+  /tmp/profile_dense_memory.pickle
+  /tmp/profile_tree_memory.pickle
+
+Usage:
+    USE_FSDP=1 torchrun --standalone --nproc_per_node=1 \\
+        tests/special_e2e/profile_tree_memory.py
+
+Env knobs (defaults match the convergence test workload):
+    MODEL_PATH    HF model dir (default ~/models/Qwen/Qwen2.5-3B-Instruct)
+    N             rollouts/prompt (default 8)
+    P             prompt length (default 110, matches GSM8K mean)
+    R             response length (default 290, matches GSM8K mean)
+    USE_FSDP      1 to wrap in FSDP2 (default 1)
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+import torch
+import torch.distributed as dist
+
+
+N = int(os.environ.get("N", "8"))
+P = int(os.environ.get("P", "110"))
+R = int(os.environ.get("R", "290"))
+USE_FSDP = os.environ.get("USE_FSDP", "1") == "1"
+
+
+def _init_dist():
+    if not dist.is_initialized():
+        if "RANK" not in os.environ:
+            raise RuntimeError("Run via torchrun")
+        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        dist.init_process_group(backend="nccl")
+
+
+def _build_fsdp_qwen(model_path):
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+    from transformers import Qwen2ForCausalLM
+
+    from verl.utils.fsdp_utils import apply_fsdp2, fsdp2_load_full_state_dict
+
+    model = Qwen2ForCausalLM.from_pretrained(model_path, dtype=torch.float32).cuda()
+    world = dist.get_world_size()
+    mesh = init_device_mesh("cuda", mesh_shape=(world,), mesh_dim_names=("fsdp",))
+    mp = MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.float32,
+        cast_forward_inputs=True,
+    )
+    full_state = model.state_dict()
+    apply_fsdp2(
+        model,
+        {"mesh": mesh, "mp_policy": mp, "offload_policy": None, "reshard_after_forward": True},
+        config={},
+    )
+    fsdp2_load_full_state_dict(model, full_state, mesh, None)
+    return model
+
+
+def _load_model(model_path, cp_group):
+    from transformers import Qwen2ForCausalLM
+
+    from verl.models.transformers.monkey_patch import apply_magi_prefix_tree_backend
+
+    apply_magi_prefix_tree_backend()
+
+    if USE_FSDP:
+        model = _build_fsdp_qwen(model_path)
+    else:
+        model = Qwen2ForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16).cuda()
+    model.train()
+    model.config._attn_implementation = "Magi_Attention"
+    model.config.attention_dropout = 0.0
+
+    for _, mod in model.named_modules():
+        cls = mod.__class__.__name__.lower()
+        if cls.endswith(("attention", "self_attn", "selfattention")):
+            mod.cp_group = cp_group
+    return model
+
+
+def _build_batch(model):
+    """1 prompt × N rollouts, prompt length P, response length R."""
+    torch.manual_seed(42)
+    vocab = model.config.vocab_size
+    prompt = torch.randint(0, vocab, (P,), device="cuda")
+    samples = []
+    for i in range(N):
+        torch.manual_seed(100 + i)
+        response = torch.randint(0, vocab, (R,), device="cuda")
+        samples.append(torch.cat([prompt, response]))
+    nested = torch.nested.nested_tensor(samples, layout=torch.jagged)
+    return samples, nested
+
+
+def _tree_forward(model, nested, cp_group):
+    from verl.models.transformers.monkey_patch import set_magi_attention_key
+    from verl.utils.prefix_tree import restore_flat_to_nested
+    from verl.utils.prefix_tree_dynamic import build_prefix_tree_micro_batch_dynamic
+
+    pt_batch = build_prefix_tree_micro_batch_dynamic(
+        model, nested, attention_type="magi", cp_group=cp_group, cp_size=1
+    )
+    set_magi_attention_key(model, pt_batch.magi_key)
+    flat_in = pt_batch.local_flat_input_ids.unsqueeze(0)
+    flat_pos = pt_batch.local_flat_position_ids.unsqueeze(0)
+    out = model(input_ids=flat_in, attention_mask=None, position_ids=flat_pos, use_cache=False)
+    flat_logits = out.logits[0][: pt_batch.real_tokens]
+    nested_logits = restore_flat_to_nested(flat_logits, pt_batch)
+    return [nested_logits[i] for i in range(pt_batch.original_batch_size)]
+
+
+def _dense_forward(model, samples):
+    """Per-sample dense (sdpa) forward — matches sanity_dynamic_magi's baseline."""
+    model.config._attn_implementation = "sdpa"
+    try:
+        return [
+            model(input_ids=s.unsqueeze(0), attention_mask=None, use_cache=False).logits[0] for s in samples
+        ]
+    finally:
+        model.config._attn_implementation = "Magi_Attention"
+
+
+def _loss(per_sample, samples):
+    losses = []
+    for logits, s in zip(per_sample, samples, strict=False):
+        f = logits.float()
+        labels = s[1:]
+        logp = torch.log_softmax(f[:-1], dim=-1).gather(1, labels.unsqueeze(1)).squeeze(1)
+        losses.append(-logp.mean())
+    return torch.stack(losses).mean()
+
+
+def _profile_one(label: str, fwd_fn, samples, output_path: str):
+    """Record one forward+backward with memory history → dump snapshot pickle."""
+    # Reset baseline so peak is for THIS forward only
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated() / 1e9
+    print(f"[PROFILE] {label}: baseline allocated = {base:.2f} GB")
+
+    # Start recording history (each allocation + free with stack)
+    torch.cuda.memory._record_memory_history(max_entries=200_000)
+
+    per_sample = fwd_fn()
+    loss = _loss(per_sample, samples)
+    loss.backward()
+
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    final = torch.cuda.memory_allocated() / 1e9
+    print(f"[PROFILE] {label}: peak={peak:.2f} GB  final={final:.2f} GB  (loss={loss.item():.4f})")
+
+    # Dump snapshot for memory_viz
+    torch.cuda.memory._dump_snapshot(output_path)
+    print(f"[PROFILE] {label}: snapshot → {output_path}")
+    torch.cuda.memory._record_memory_history(enabled=None)
+
+
+def main() -> int:
+    _init_dist()
+    cp_group = dist.group.WORLD
+
+    model_path = os.environ.get("MODEL_PATH", os.path.expanduser("~/models/Qwen/Qwen2.5-3B-Instruct"))
+    print(f"[PROFILE] USE_FSDP={USE_FSDP}  N={N} P={P} R={R}")
+    print(f"[PROFILE] Loading {model_path}")
+    model = _load_model(model_path, cp_group)
+    samples, nested = _build_batch(model)
+    print(f"[PROFILE] total_tokens = {sum(s.shape[0] for s in samples)}, prefix_shared = {P * (N - 1)}")
+    print()
+
+    # ── Tree path
+    print("=" * 70)
+    print("[PROFILE] Tree (dynamic-trie + Magi) forward + backward")
+    print("=" * 70)
+    model.zero_grad(set_to_none=True)
+    _profile_one(
+        "tree",
+        lambda: _tree_forward(model, nested, cp_group),
+        samples,
+        "/tmp/profile_tree_memory.pickle",
+    )
+    print()
+
+    # ── Dense path
+    print("=" * 70)
+    print("[PROFILE] Dense (sdpa per-sample) forward + backward")
+    print("=" * 70)
+    model.zero_grad(set_to_none=True)
+    _profile_one(
+        "dense",
+        lambda: _dense_forward(model, samples),
+        samples,
+        "/tmp/profile_dense_memory.pickle",
+    )
+
+    print()
+    print("=" * 70)
+    print("[PROFILE] DONE. Upload these to https://pytorch.org/memory_viz :")
+    print("           /tmp/profile_tree_memory.pickle")
+    print("           /tmp/profile_dense_memory.pickle")
+    print("=" * 70)
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
