@@ -198,6 +198,27 @@ def _loss(per_sample, samples):
     return torch.stack(losses).mean()
 
 
+def _magi_lru_size(cp_group) -> int:
+    """Return current size of Magi's per-cp_group runtime LRU. 0 if Magi
+    internals not importable."""
+    try:
+        from magi_attention.api.magi_attn_interface import dist_attn_runtime_dict_mgr
+
+        return len(dist_attn_runtime_dict_mgr.keys(cp_group))
+    except Exception:
+        return 0
+
+
+def _magi_lru_clear(cp_group):
+    """Clear Magi's per-cp_group LRU."""
+    try:
+        from magi_attention.api.magi_attn_interface import clear_cache
+
+        clear_cache(cp_group)
+    except Exception as e:
+        print(f"[MULTI] WARN: clear_cache failed: {e}")
+
+
 def _profile_multi_forward(
     label: str,
     model,
@@ -205,23 +226,30 @@ def _profile_multi_forward(
     forward_kind: str,  # "tree" or "dense_packed"
     n_iters: int,
     response_lengths: list[int],
+    clear_lru: bool = False,
 ):
     """Run n_iters forward+backward with varying response lengths to expose
     LRU / persistent-state memory accumulation. Reports peak memory growth
-    across iterations.
+    across iterations + Magi LRU size after each iter.
 
     forward_kind:
       "tree":          builds a fresh Magi key per iter (registers in Magi LRU)
       "dense_packed":  FA2 packed forward, no persistent state
+
+    clear_lru: when True, call magi_attention.api.clear_cache after each iter
+        to test whether LRU accumulation drives the peak growth.
     """
     torch.cuda.empty_cache()
+    if forward_kind == "tree":
+        _magi_lru_clear(cp_group)  # start fresh
+
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated() / 1e9
-    print(f"[MULTI] {label}: baseline allocated = {base:.2f} GB")
+    print(f"[MULTI] {label}: baseline allocated = {base:.2f} GB,  clear_lru = {clear_lru}")
     print(f"[MULTI] {label}: running {n_iters} iters, response lengths = "
           f"[{min(response_lengths)}..{max(response_lengths)}]")
-    print(f"[MULTI] {'iter':>5} {'resp_len':>10} {'peak_GB':>10} {'final_GB':>10} {'delta_GB':>10}")
-    print("-" * 60)
+    print(f"[MULTI] {'iter':>5} {'resp_len':>10} {'peak_GB':>10} {'final_GB':>10} {'delta_GB':>10} {'magi_lru':>10}")
+    print("-" * 70)
 
     peaks: list[float] = []
     finals: list[float] = []
@@ -242,10 +270,15 @@ def _profile_multi_forward(
 
         peak = torch.cuda.max_memory_allocated() / 1e9
         final = torch.cuda.memory_allocated() / 1e9
+        lru_size = _magi_lru_size(cp_group)
         peaks.append(peak)
         finals.append(final)
         delta = (peaks[i] - peaks[0]) if i > 0 else 0.0
-        print(f"[MULTI] {i:>5} {r_len:>10} {peak:>10.2f} {final:>10.2f} {delta:>+10.2f}")
+        print(f"[MULTI] {i:>5} {r_len:>10} {peak:>10.2f} {final:>10.2f} {delta:>+10.2f} {lru_size:>10}")
+
+        if clear_lru and forward_kind == "tree":
+            _magi_lru_clear(cp_group)
+            torch.cuda.empty_cache()
 
     print(f"[MULTI] {label}: peak growth iter[0]→iter[-1] = "
           f"{peaks[-1] - peaks[0]:+.2f} GB ({peaks[0]:.2f} → {peaks[-1]:.2f})")
@@ -306,22 +339,54 @@ def main() -> int:
             step = (hi - lo) // (multi_n - 1)
             response_lengths = [lo + step * i for i in range(multi_n)]
 
+        # ── A: tree path with LRU left intact (method 1 — measure accumulation)
         print("=" * 70)
-        print(f"[PROFILE] Multi-forward test: tree path, {multi_n} iters")
+        print(f"[PROFILE] A: tree path, {multi_n} iters, LRU INTACT (measures accumulation)")
         print("=" * 70)
         model.config._attn_implementation = "Magi_Attention"
-        _profile_multi_forward("tree", model, cp_group, "tree", multi_n, response_lengths)
+        peaks_tree_keep, _ = _profile_multi_forward(
+            "tree_lru_keep", model, cp_group, "tree", multi_n, response_lengths, clear_lru=False
+        )
         print()
 
+        # ── B: tree path with LRU cleared after each iter (method 3 — test the fix)
         print("=" * 70)
-        print(f"[PROFILE] Multi-forward test: dense packed path, {multi_n} iters")
+        print(f"[PROFILE] B: tree path, {multi_n} iters, LRU CLEARED after each iter")
+        print("=" * 70)
+        model.config._attn_implementation = "Magi_Attention"
+        peaks_tree_clear, _ = _profile_multi_forward(
+            "tree_lru_clear", model, cp_group, "tree", multi_n, response_lengths, clear_lru=True
+        )
+        print()
+
+        # ── C: dense packed baseline
+        print("=" * 70)
+        print(f"[PROFILE] C: dense packed path, {multi_n} iters (no LRU, sanity baseline)")
         print("=" * 70)
         model.config._attn_implementation = "flash_attention_2"
-        _profile_multi_forward("dense", model, cp_group, "dense_packed", multi_n, response_lengths)
+        peaks_dense, _ = _profile_multi_forward(
+            "dense", model, cp_group, "dense_packed", multi_n, response_lengths, clear_lru=False
+        )
         print()
 
-        # Skip the single-forward snapshot pickles in MULTI mode — the
-        # multi-iter trajectory is what we care about.
+        # ── Summary table
+        print("=" * 70)
+        print("[PROFILE] SUMMARY")
+        print("=" * 70)
+        print(f"{'condition':<25} {'iter[0] peak':>15} {'iter[-1] peak':>15} {'growth':>10}")
+        print("-" * 70)
+        for cond, peaks in [
+            ("tree (LRU intact)", peaks_tree_keep),
+            ("tree (LRU cleared)", peaks_tree_clear),
+            ("dense packed", peaks_dense),
+        ]:
+            growth = peaks[-1] - peaks[0]
+            print(f"{cond:<25} {peaks[0]:>15.2f} {peaks[-1]:>15.2f} {growth:>+10.2f}")
+        print()
+        print("[PROFILE] Hypothesis check:")
+        print("  - LRU accumulation drives peak ⇔ tree(intact).growth >> tree(cleared).growth")
+        print("  - dense.growth should ≈ 0 (no persistent state)")
+
         if dist.is_initialized():
             dist.destroy_process_group()
         return 0
