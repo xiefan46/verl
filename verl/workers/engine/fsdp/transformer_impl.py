@@ -1303,6 +1303,27 @@ class FSDPEngineWithLMHead(FSDPEngine):
         micro_batch = micro_batch.to(get_device_id())
         model_inputs, output_args = self.prepare_model_inputs(micro_batch=micro_batch)
 
+        # ── Optional memory profiling (set PROFILE_MEMORY_LOG=1 to enable).
+        # Logs allocated + max_allocated at three checkpoints per forward_step
+        # so we can A/B tree vs dense and find the phase where the diff lives.
+        _profile_mem = os.environ.get("PROFILE_MEMORY_LOG", "0") == "1"
+        _profile_mem_rank = int(os.environ.get("PROFILE_MEMORY_LOG_RANK", "0"))
+        _profile_mem_active = _profile_mem and torch.distributed.get_rank() == _profile_mem_rank
+
+        def _mem_log(phase: str):
+            if not _profile_mem_active:
+                return
+            alloc = torch.cuda.memory_allocated() / 1e9
+            peak = torch.cuda.max_memory_allocated() / 1e9
+            print(
+                f"[MEM] forward_step phase={phase} forward_only={forward_only} "
+                f"tree={tu.get_non_tensor_data(data=micro_batch, key='use_prefix_tree_dynamic', default=False)} "
+                f"alloc={alloc:.3f}GB peak={peak:.3f}GB",
+                flush=True,
+            )
+
+        _mem_log("enter")
+
         # dynamic prefix-tree opt-in flag (passed via non-tensor data on the micro-batch).
         use_prefix_tree_dynamic = tu.get_non_tensor_data(data=micro_batch, key="use_prefix_tree_dynamic", default=False)
         prefix_tree_attention = tu.get_non_tensor_data(data=micro_batch, key="prefix_tree_attention", default="magi")
@@ -1355,6 +1376,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 # don't actually consume pt_batch.flat_loss_mask anywhere in this
                 # forward path (prepare_model_outputs reads loss_mask from the
                 # original micro_batch, not from pt_batch).
+                _mem_log("before_pt_batch_build")
                 pt_batch = build_prefix_tree_micro_batch_dynamic(
                     self.module,
                     micro_batch["input_ids"],
@@ -1365,6 +1387,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     cp_size=self.context_parallel_size,
                     cp_group=self.cp_group,
                 )
+                _mem_log("after_pt_batch_build")
 
                 # Emit tree-dedup visibility metrics. Original = sum of per-sample
                 # lengths (no sharing); packed = real_tokens after prefix tree
@@ -1439,11 +1462,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 flat_logits = logits[: pt_batch.real_tokens]
                 nested_logits = restore_flat_to_nested(flat_logits, pt_batch)
                 raw_output.logits = nested_logits.values().unsqueeze(0)
+                _mem_log("after_tree_forward")
             else:
                 raw_output = self.module(
                     **model_inputs,
                     use_cache=False,
                 )  # prevent model thinks we are generating
+                _mem_log("after_dense_forward")
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
@@ -1469,6 +1494,7 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 "metrics": metrics,
             }
 
+            _mem_log("before_return")
             return loss, output
 
 
