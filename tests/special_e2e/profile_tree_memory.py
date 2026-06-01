@@ -25,6 +25,8 @@ Env knobs (defaults match the convergence test workload):
     P             prompt length (default 110, matches GSM8K mean)
     R             response length (default 290, matches GSM8K mean)
     USE_FSDP      1 to wrap in FSDP2 (default 1)
+    ENABLE_GC     1 to enable HF gradient checkpointing (default 1, matches
+                  verl training defaults). Set 0 to disable for comparison.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ N = int(os.environ.get("N", "8"))
 P = int(os.environ.get("P", "110"))
 R = int(os.environ.get("R", "290"))
 USE_FSDP = os.environ.get("USE_FSDP", "1") == "1"
+ENABLE_GC = os.environ.get("ENABLE_GC", "1") == "1"
 
 
 def _init_dist():
@@ -89,6 +92,15 @@ def _load_model(model_path, cp_group):
     model.train()
     model.config._attn_implementation = "Magi_Attention"
     model.config.attention_dropout = 0.0
+
+    # verl training enables HF gradient checkpointing by default. Mirror it here
+    # so the profile peaks line up with the production training observation.
+    if ENABLE_GC:
+        # FSDP2 + HF gradient_checkpointing needs use_reentrant=False
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        print(f"[PROFILE] gradient checkpointing: ENABLED (use_reentrant=False)")
+    else:
+        print(f"[PROFILE] gradient checkpointing: DISABLED")
 
     for _, mod in model.named_modules():
         cls = mod.__class__.__name__.lower()
