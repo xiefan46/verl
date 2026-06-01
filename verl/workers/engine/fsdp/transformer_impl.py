@@ -1441,12 +1441,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 flat_position_ids = local_flat_position_ids.unsqueeze(0)
 
                 set_magi_attention_key(self.module, pt_batch.magi_key)
+                _mem_log("before_magi_forward")
                 raw_output = self.module(
                     input_ids=flat_input_ids,
                     attention_mask=None,
                     position_ids=flat_position_ids,
                     use_cache=False,
                 )
+                _mem_log("after_magi_forward_packed_logits")
 
                 # Per-rank logits (1, local_seq, V) → full flat (full_seq, V).
                 logits = raw_output.logits
@@ -1456,11 +1458,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     logits = undispatch(logits.squeeze(0), pt_batch.magi_key)
                 else:
                     logits = logits.squeeze(0)
+                _mem_log("after_squeeze_undispatch")
 
                 # Trim prefix-tree padding → restore per-sample → rmpad layout
                 # so prepare_model_outputs sees the standard shape.
                 flat_logits = logits[: pt_batch.real_tokens]
+                _mem_log("after_trim_to_real_tokens")
                 nested_logits = restore_flat_to_nested(flat_logits, pt_batch)
+                _mem_log("after_restore_to_nested")
                 raw_output.logits = nested_logits.values().unsqueeze(0)
                 _mem_log("after_tree_forward")
             else:
