@@ -109,15 +109,15 @@ def _load_model(model_path, cp_group):
     return model
 
 
-def _build_batch(model):
-    """1 prompt × N rollouts, prompt length P, response length R."""
+def _build_batch(model, response_len: int = R):
+    """1 prompt × N rollouts, prompt length P, response length response_len."""
     torch.manual_seed(42)
     vocab = model.config.vocab_size
     prompt = torch.randint(0, vocab, (P,), device="cuda")
     samples = []
     for i in range(N):
         torch.manual_seed(100 + i)
-        response = torch.randint(0, vocab, (R,), device="cuda")
+        response = torch.randint(0, vocab, (response_len,), device="cuda")
         samples.append(torch.cat([prompt, response]))
     nested = torch.nested.nested_tensor(samples, layout=torch.jagged)
     return samples, nested
@@ -198,6 +198,60 @@ def _loss(per_sample, samples):
     return torch.stack(losses).mean()
 
 
+def _profile_multi_forward(
+    label: str,
+    model,
+    cp_group,
+    forward_kind: str,  # "tree" or "dense_packed"
+    n_iters: int,
+    response_lengths: list[int],
+):
+    """Run n_iters forward+backward with varying response lengths to expose
+    LRU / persistent-state memory accumulation. Reports peak memory growth
+    across iterations.
+
+    forward_kind:
+      "tree":          builds a fresh Magi key per iter (registers in Magi LRU)
+      "dense_packed":  FA2 packed forward, no persistent state
+    """
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated() / 1e9
+    print(f"[MULTI] {label}: baseline allocated = {base:.2f} GB")
+    print(f"[MULTI] {label}: running {n_iters} iters, response lengths = "
+          f"[{min(response_lengths)}..{max(response_lengths)}]")
+    print(f"[MULTI] {'iter':>5} {'resp_len':>10} {'peak_GB':>10} {'final_GB':>10} {'delta_GB':>10}")
+    print("-" * 60)
+
+    peaks: list[float] = []
+    finals: list[float] = []
+    for i, r_len in enumerate(response_lengths):
+        samples, nested = _build_batch(model, response_len=r_len)
+        model.zero_grad(set_to_none=True)
+        torch.cuda.reset_peak_memory_stats()
+
+        if forward_kind == "tree":
+            per_sample = _tree_forward(model, nested, cp_group)
+        elif forward_kind == "dense_packed":
+            per_sample = _dense_forward_packed(model, samples)
+        else:
+            raise ValueError(f"unknown forward_kind={forward_kind}")
+        loss = _loss(per_sample, samples)
+        loss.backward()
+        torch.cuda.synchronize()
+
+        peak = torch.cuda.max_memory_allocated() / 1e9
+        final = torch.cuda.memory_allocated() / 1e9
+        peaks.append(peak)
+        finals.append(final)
+        delta = (peaks[i] - peaks[0]) if i > 0 else 0.0
+        print(f"[MULTI] {i:>5} {r_len:>10} {peak:>10.2f} {final:>10.2f} {delta:>+10.2f}")
+
+    print(f"[MULTI] {label}: peak growth iter[0]→iter[-1] = "
+          f"{peaks[-1] - peaks[0]:+.2f} GB ({peaks[0]:.2f} → {peaks[-1]:.2f})")
+    return peaks, finals
+
+
 def _profile_one(label: str, fwd_fn, samples, output_path: str):
     """Record one forward+backward with memory history → dump snapshot pickle."""
     # Reset baseline so peak is for THIS forward only
@@ -235,6 +289,42 @@ def main() -> int:
     samples, nested = _build_batch(model)
     print(f"[PROFILE] total_tokens = {sum(s.shape[0] for s in samples)}, prefix_shared = {P * (N - 1)}")
     print()
+
+    # ── Multi-forward LRU-accumulation test (env: MULTI_N) — if set, runs that
+    # many forward+backward iters with varying response lengths to expose any
+    # persistent state (Magi LRU mgr cache, FSDP buffers, etc.) that grows
+    # across iters. Mimics what a real training step does (~96 forwards
+    # over 32 distinct micro-batch shapes).
+    multi_n = int(os.environ.get("MULTI_N", "0"))
+    if multi_n > 0:
+        # Spread response lengths: 100..700 in N steps (matches GSM8K's
+        # observed response_length min/max range from R2_tree run)
+        lo, hi = 100, 700
+        if multi_n == 1:
+            response_lengths = [R]
+        else:
+            step = (hi - lo) // (multi_n - 1)
+            response_lengths = [lo + step * i for i in range(multi_n)]
+
+        print("=" * 70)
+        print(f"[PROFILE] Multi-forward test: tree path, {multi_n} iters")
+        print("=" * 70)
+        model.config._attn_implementation = "Magi_Attention"
+        _profile_multi_forward("tree", model, cp_group, "tree", multi_n, response_lengths)
+        print()
+
+        print("=" * 70)
+        print(f"[PROFILE] Multi-forward test: dense packed path, {multi_n} iters")
+        print("=" * 70)
+        model.config._attn_implementation = "flash_attention_2"
+        _profile_multi_forward("dense", model, cp_group, "dense_packed", multi_n, response_lengths)
+        print()
+
+        # Skip the single-forward snapshot pickles in MULTI mode — the
+        # multi-iter trajectory is what we care about.
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        return 0
 
     # ── Tree path
     print("=" * 70)
