@@ -159,10 +159,10 @@ else
 fi
 
 # Opt into NCCL communicator suspend/resume during the rollout phase. Defaults
-# off so existing CI jobs are unaffected. When set to True and the runtime
-# libnccl is < 2.29.7 (no ncclCommSuspend symbol), the script stages a
-# newer nvidia-nccl-cu12 wheel into a temp dir and LD_PRELOADs it just for
-# this run — site-packages and the rest of the environment are untouched.
+# off so existing CI jobs are unaffected. When True, the script stages
+# nvidia-nccl-cu12>=2.29.7 into a temp dir and LD_PRELOADs it for this run
+# (the current CI image is on NCCL 2.26, which lacks ncclCommSuspend);
+# site-packages and the rest of the environment are untouched.
 SUSPEND_NCCL_COMMS=${SUSPEND_NCCL_COMMS:-False}
 
 common_params=(
@@ -300,45 +300,16 @@ print(get_device_name())
 EOF
 )
 
-# When SUSPEND_NCCL_COMMS=True but the runtime libnccl lacks ncclCommSuspend
-# (NCCL < 2.29.7, e.g. the current verl CI image), stage a newer wheel into
-# a temp dir and LD_PRELOAD it just for this script's python invocations.
-# site-packages stays untouched; cleanup on exit. No-op when SUSPEND is off
-# or the runtime libnccl already exports the symbol.
-NCCL_STAGE_DIR=""
-cleanup_nccl_stage() {
-    if [ -n "$NCCL_STAGE_DIR" ] && [ -d "$NCCL_STAGE_DIR" ]; then
-        rm -rf "$NCCL_STAGE_DIR"
-    fi
-}
-trap cleanup_nccl_stage EXIT
-
+# Stage NCCL >= 2.29.7 via LD_PRELOAD when SUSPEND_NCCL_COMMS=True, so the
+# current CI image (NCCL 2.26 < 2.29.7) gets ncclCommSuspend/Resume without
+# touching site-packages. Once the default CI image bumps to NCCL >= 2.29.7
+# this whole block can be removed.
 if [ "$SUSPEND_NCCL_COMMS" = "True" ] || [ "$SUSPEND_NCCL_COMMS" = "true" ]; then
-    has_suspend=$(python3 - <<'EOF'
-import ctypes
-try:
-    lib = ctypes.CDLL("libnccl.so.2")
-    print("1" if hasattr(lib, "ncclCommSuspend") else "0")
-except OSError:
-    print("0")
-EOF
-)
-    if [ "$has_suspend" != "1" ]; then
-        echo "[run_ppo_trainer_megatron.sh] SUSPEND_NCCL_COMMS=True but runtime libnccl lacks ncclCommSuspend; staging NCCL >= 2.29.7..."
-        NCCL_STAGE_DIR=$(mktemp -d)
-        pip install --no-deps --target "$NCCL_STAGE_DIR" "nvidia-nccl-cu12>=2.29.7,<3.0"
-        NCCL_PRELOAD_SO="$NCCL_STAGE_DIR/nvidia/nccl/lib/libnccl.so.2"
-        python3 - "$NCCL_PRELOAD_SO" <<'EOF'
-import ctypes, sys
-so = sys.argv[1]
-lib = ctypes.CDLL(so)
-assert hasattr(lib, "ncclCommSuspend"), f"ncclCommSuspend missing in {so}"
-ver = ctypes.c_int(0); lib.ncclGetVersion(ctypes.byref(ver))
-v = ver.value
-print(f"[run_ppo_trainer_megatron.sh] staged libnccl: {v // 10000}.{(v % 10000) // 100}.{v % 100}")
-EOF
-        export LD_PRELOAD="$NCCL_PRELOAD_SO${LD_PRELOAD:+:$LD_PRELOAD}"
-    fi
+    NCCL_STAGE_DIR=$(mktemp -d)
+    trap 'rm -rf "$NCCL_STAGE_DIR"' EXIT
+    echo "[run_ppo_trainer_megatron.sh] SUSPEND_NCCL_COMMS=True; staging nvidia-nccl-cu12>=2.29.7 via LD_PRELOAD"
+    pip install --no-deps --target "$NCCL_STAGE_DIR" "nvidia-nccl-cu12>=2.29.7,<3.0"
+    export LD_PRELOAD="$NCCL_STAGE_DIR/nvidia/nccl/lib/libnccl.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 
 if [ -n "$device_name" ] && [ "$device_name" == "cuda" ]; then
