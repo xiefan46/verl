@@ -514,8 +514,10 @@ class CheckpointEngineManager:
     async def update_weights(self, global_steps: int = None):
         """Update weights from trainer to rollout replicas.
 
-        Also suspends training-side NCCL comms on exit if ``suspend_nccl_comms``
-        is on (rollout phase begins next).
+        If ``suspend_nccl_comms`` is on, training-side NCCL comms are released
+        once the trainer has finished gathering/broadcasting weights and before
+        the rollout grabs kv_cache back, so the freed memory is available to
+        the rollout at its peak.
 
         Args:
             global_steps: The global steps of the trainer.
@@ -524,6 +526,7 @@ class CheckpointEngineManager:
         # 0. update weights for sync training with colocated trainer and rollout
         if self.backend == "naive":
             ray.get(self.trainer.update_weights(global_steps=global_steps, mode=self.backend))
+            # Trainer is done; rollout is invoked by the caller next — release training comms first.
             self._suspend_training_nccl_comms()
             return
 
@@ -555,14 +558,16 @@ class CheckpointEngineManager:
             + rollout.execute_checkpoint_engine(["finalize"] * rollout.world_size)
         )
 
+        # Trainer-side comms are now idle (weight gather + bridge transfer done);
+        # release them before rollout wakes back up so the freed memory is
+        # available to kv_cache restore and in-flight generation that follow.
+        self._suspend_training_nccl_comms()
+
         # 7. restore kv_cache after weight sync
         await self.resume_kv_cache_replicas()
 
         # 8. resume all unfinished requests for partial rollout
         await self.resume_generation_replicas()
-
-        # 9. suspend training-side NCCL comms — rollout is now serving
-        self._suspend_training_nccl_comms()
 
 
 async def split_weight_chunks(
