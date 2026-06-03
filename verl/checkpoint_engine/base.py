@@ -388,15 +388,14 @@ class CheckpointEngineManager:
         self.trainer = trainer
         self.replicas = replicas
         self.suspend_nccl_comms_enabled: bool = suspend_nccl_comms
-        if self.suspend_nccl_comms_enabled:
-            self._validate_suspend_mode_compat()
 
     def _validate_suspend_mode_compat(self) -> None:
         """Raise if suspend_nccl_comms is requested but rollout is STANDALONE.
 
         The feature only frees memory when trainer and rollout share GPUs
         (HYBRID / COLOCATED). All replicas share one mode, so checking the
-        first one is enough.
+        first one is enough. Called just-in-time from suspend/resume so
+        replicas added after __init__ (elastic scale-up) are also validated.
         """
         if not self.replicas:
             return
@@ -413,6 +412,7 @@ class CheckpointEngineManager:
         """Fan out a suspend RPC to every training worker, aggregate to one INFO line."""
         if not self.suspend_nccl_comms_enabled:
             return
+        self._validate_suspend_mode_compat()
         results = self.trainer.suspend_training_nccl_comms()
         log_aggregate_summary("suspend", results, size_attr="freed_mb", size_verb="freed")
 
@@ -420,6 +420,7 @@ class CheckpointEngineManager:
         """Reverse of ``_suspend_training_nccl_comms``."""
         if not self.suspend_nccl_comms_enabled:
             return
+        self._validate_suspend_mode_compat()
         results = self.trainer.resume_training_nccl_comms()
         log_aggregate_summary("resume", results, size_attr="reclaimed_mb", size_verb="reclaimed")
 
