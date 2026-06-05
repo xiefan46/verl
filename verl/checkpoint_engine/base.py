@@ -388,6 +388,7 @@ class CheckpointEngineManager:
         self.trainer = trainer
         self.replicas = replicas
         self.suspend_nccl_comms_enabled: bool = suspend_nccl_comms
+        self._pending_nccl_telemetry: dict[str, float] = {}
 
     def _validate_suspend_mode_compat(self) -> None:
         """Raise if suspend_nccl_comms is requested but rollout is STANDALONE.
@@ -414,7 +415,9 @@ class CheckpointEngineManager:
             return
         self._validate_suspend_mode_compat()
         results = self.trainer.suspend_training_nccl_comms()
-        log_aggregate_summary("suspend", results, size_attr="freed_mb", size_verb="freed")
+        self._pending_nccl_telemetry.update(
+            log_aggregate_summary("suspend", results, size_attr="freed_mb", size_verb="freed")
+        )
 
     def _resume_training_nccl_comms(self) -> None:
         """Reverse of ``_suspend_training_nccl_comms``."""
@@ -422,7 +425,19 @@ class CheckpointEngineManager:
             return
         self._validate_suspend_mode_compat()
         results = self.trainer.resume_training_nccl_comms()
-        log_aggregate_summary("resume", results, size_attr="reclaimed_mb", size_verb="reclaimed")
+        self._pending_nccl_telemetry.update(
+            log_aggregate_summary("resume", results, size_attr="reclaimed_mb", size_verb="reclaimed")
+        )
+
+    def consume_nccl_telemetry(self) -> dict[str, float]:
+        """Return accumulated NCCL suspend/resume metrics and clear the buffer.
+
+        The trainer calls this once per training step after ``update_weights``
+        to fold per-cycle freed/reclaimed MB and latency into its step metrics.
+        """
+        telemetry = self._pending_nccl_telemetry
+        self._pending_nccl_telemetry = {}
+        return telemetry
 
     def build_process_group(self, rollout: RayWorkerGroup):
         """Build process group for trainer and rollout replicas."""

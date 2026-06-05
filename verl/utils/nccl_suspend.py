@@ -216,18 +216,23 @@ def resume_batch(handles: list[tuple[str, int]], *, measure_per_comm: bool = Fal
     return ResumeResult(success=n_ok > 0, reclaimed_mb=reclaimed_mb, total_ms=total_ms, comms=comms_stats)
 
 
-def log_aggregate_summary(action: str, results, *, size_attr: str, size_verb: str) -> None:
-    """Aggregate per-rank Suspend/ResumeResult into one INFO line.
+def log_aggregate_summary(action: str, results, *, size_attr: str, size_verb: str) -> dict[str, float]:
+    """Aggregate per-rank Suspend/ResumeResult into one INFO line and a metrics dict.
 
     Args:
         action: "suspend" or "resume", used as the log message label.
         results: One result per rank; ``None`` entries are dropped.
         size_attr: ``"freed_mb"`` for suspend, ``"reclaimed_mb"`` for resume.
         size_verb: ``"freed"`` for suspend, ``"reclaimed"`` for resume.
+
+    Returns:
+        Dict of metrics suitable for wandb/tracker emission (avg + max of
+        per-rank size and duration). Empty dict if no rank reported a usable
+        result.
     """
     valid = [r for r in (results or []) if r is not None]
     if not valid:
-        return
+        return {}
     skipped = [r for r in valid if r.skipped_reason]
     if skipped:
         reasons = sorted({r.skipped_reason for r in skipped})
@@ -240,7 +245,7 @@ def log_aggregate_summary(action: str, results, *, size_attr: str, size_verb: st
         )
     actual = [r for r in valid if not r.skipped_reason]
     if not actual:
-        return
+        return {}
     sizes = [getattr(r, size_attr) for r in actual]
     durations = [r.total_ms for r in actual]
     n_ok = sum(1 for r in actual if r.success)
@@ -257,3 +262,9 @@ def log_aggregate_summary(action: str, results, *, size_attr: str, size_verb: st
         min(durations),
         max(durations),
     )
+    return {
+        f"nccl_suspend/{size_verb}_mb_avg": sum(sizes) / len(sizes),
+        f"nccl_suspend/{size_verb}_mb_max": max(sizes),
+        f"nccl_suspend/{action}_ms_avg": sum(durations) / len(durations),
+        f"nccl_suspend/{action}_ms_max": max(durations),
+    }
