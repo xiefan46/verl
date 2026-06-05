@@ -221,9 +221,16 @@ TRAINER=(
 
 EXTRA=(
     model_engine=megatron
-    +actor_rollout_ref.rollout.moe_tensor_parallel_size=${gen_moe_tp}
-    actor_rollout_ref.rollout.expert_parallel_size=${gen_moe_ep}
 )
+
+# rollout.moe_tensor_parallel_size + expert_parallel_size are only valid for the
+# trtllm rollout backend; vllm asserts against them in RolloutConfig.__post_init__.
+if [ "${INFER_BACKEND}" = "trtllm" ]; then
+    EXTRA+=(
+        +actor_rollout_ref.rollout.moe_tensor_parallel_size=${gen_moe_tp}
+        actor_rollout_ref.rollout.expert_parallel_size=${gen_moe_ep}
+    )
+fi
 
 if [ -n "$MCORE_MODEL_PATH" ]; then
     EXTRA+=(
