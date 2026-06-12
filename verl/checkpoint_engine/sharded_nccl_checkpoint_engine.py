@@ -46,7 +46,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Callable, Generator
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,6 +58,7 @@ import torch
 from verl.checkpoint_engine.base import CheckpointEngine, CheckpointEngineRegistry
 from verl.checkpoint_engine.parallel_meta import ParameterShardMeta, TransferEdge, TransferPlan
 from verl.checkpoint_engine.transfer_plan import build_transfer_plan, sanity_check_cross_rank
+from verl.checkpoint_engine.vllm_edge_enricher import vllm_enrich_edge
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -101,12 +102,24 @@ class ShardedNCCLCheckpointEngine(CheckpointEngine):
         group_name: str = "sharded_nccl",
         rebuild_group: bool = False,
         rollout_dtype: torch.dtype = torch.bfloat16,
+        metas_provider: Callable[[], list[ParameterShardMeta]] | None = None,
+        role: str | None = None,
+        **_unused_kwargs: Any,
     ) -> None:
         self.group_name = group_name
         self.rebuild_group = rebuild_group
         self.rollout_dtype = rollout_dtype
 
-        # Injected by ``set_shard_metas`` before ``prepare``.
+        # Lazy meta source. EngineWorker / CheckpointEngineWorker registers a
+        # closure that walks the local model on first prepare() call. This
+        # keeps the heavy module walk OUT of __init__ (where the engine isn't
+        # always GPU-resident yet) and lets the same registration site decide
+        # the role.
+        self._metas_provider = metas_provider
+        self._init_role = role
+
+        # Injected by ``set_shard_metas`` before ``prepare``; populated either
+        # by an explicit caller or lazily by ``prepare`` via metas_provider.
         self._shard_metas: list[ParameterShardMeta] = []
         self._role: str | None = None
 
@@ -142,11 +155,16 @@ class ShardedNCCLCheckpointEngine(CheckpointEngine):
     # ------------------------------------------------------------------
 
     def prepare(self) -> dict[str, Any]:
+        # Lazy meta resolution: if metas weren't injected via set_shard_metas,
+        # try the registered provider (typical EngineWorker init path).
         if self._role is None:
-            raise RuntimeError(
-                "ShardedNCCLCheckpointEngine.prepare() called before set_shard_metas(). "
-                "Call set_shard_metas(metas, role) first."
-            )
+            if self._metas_provider is None or self._init_role is None:
+                raise RuntimeError(
+                    "ShardedNCCLCheckpointEngine.prepare() called before set_shard_metas() "
+                    "and no metas_provider/role was registered at construction."
+                )
+            metas = self._metas_provider()
+            self.set_shard_metas(metas, role=self._init_role)
         return ShardedNCCLPrepareInfo(
             shard_metas=[m.to_dict() for m in self._shard_metas],
             role=self._role,
@@ -200,7 +218,7 @@ class ShardedNCCLCheckpointEngine(CheckpointEngine):
                 )
                 target_list.append(m)
 
-        plan = build_transfer_plan(train_metas, rollout_metas)
+        plan = build_transfer_plan(train_metas, rollout_metas, enrich_edge=vllm_enrich_edge)
         plan_json = plan.to_json()
 
         total_ws = trainer_world_size + rollout_world_size
@@ -339,6 +357,19 @@ class ShardedNCCLCheckpointEngine(CheckpointEngine):
         if self._incoming_edges is None:
             raise RuntimeError("get_incoming_edges called before init_process_group")
         return list(self._incoming_edges)
+
+    def get_incoming_edges_json(self) -> str:
+        """Return this rank's incoming edges as JSON.
+
+        Convenience helper for the cross-process bridge: the rollout-side
+        ``vllm_rollout.update_weights`` ships this string to the vLLM worker
+        subprocess so it can decode encoded names back to vLLM weight_loader
+        kwargs without holding a TransferPlan import.
+        """
+        import json
+
+        edges = self.get_incoming_edges()
+        return json.dumps([e.to_dict() for e in edges])
 
     def plan_hash(self) -> str:
         """Expose plan hash for cross-rank sanity checking."""

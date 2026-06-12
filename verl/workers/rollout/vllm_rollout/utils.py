@@ -291,6 +291,104 @@ class vLLMColocateWorkerExtension:
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
 
+    def update_weights_from_sharded_ipc(
+        self,
+        incoming_edges_json: str,
+        use_shm: bool = False,
+    ):
+        """Sharded-aware weight update from rollout-side ``CheckpointEngineWorker`` bridge.
+
+        Counterpart to :meth:`update_weights_from_ipc`, but expects tensors
+        keyed by ``"<param_name>|<edge_idx>"`` rather than HF-canonical name.
+        Each bucket entry maps back to a routing-plan edge via the
+        ``incoming_edges_json`` payload (the local-rank-subset of edges,
+        serialized once at startup).
+
+        Per-edge metadata (``target_param_name`` / ``shard_id`` / ``expert_id``)
+        feeds vLLM's per-param ``weight_loader`` so MoE expert / QKV /
+        fused-MLP packings happen correctly without an intermediate full
+        ``model.load_weights`` pass.
+
+        MVP scope:
+        * MoE routed experts (``shard_id`` in {"w1","w2","w3"}).
+        * Standard attention QKV (``shard_id`` in {"q","k","v"}).
+        * 1:1 params (no shard_id, no expert_id) — direct ``param.data.copy_``
+          fallback when no ``weight_loader`` is attached.
+        * Dense MergedColumn gate_up fusion is NOT covered — Qwen3 MoE / our
+          demo target uses RoutedExperts; for dense models we'd need an
+          additional enricher rule. Plain ``copy_`` of the unfused param
+          handles standalone gate_proj/up_proj names.
+        """
+        import json
+
+        from verl.checkpoint_engine.parallel_meta import TransferEdge
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+        # Reapply MoE patch (sender flow does the same; idempotent post-init).
+        for model in self._iter_all_models():
+            patch_vllm_moe_model_weight_loader(model)
+
+        edges_payload = json.loads(incoming_edges_json)
+        incoming_edges: list[TransferEdge] = [TransferEdge.from_dict(d) for d in edges_payload]
+
+        assert self.device is not None
+        main_model = self.model_runner.model
+        name_to_param = dict(main_model.named_parameters())
+
+        def _route_one(encoded_name: str, tensor: torch.Tensor) -> None:
+            param_name, _, edge_idx_str = encoded_name.rpartition("|")
+            edge_idx = int(edge_idx_str)
+            edge = incoming_edges[edge_idx]
+
+            target = edge.target_param_name or param_name
+            param = name_to_param.get(target)
+            if param is None:
+                raise KeyError(
+                    f"update_weights_from_sharded_ipc: target param {target!r} "
+                    f"not found in vLLM model (encoded={encoded_name!r})"
+                )
+
+            loader = getattr(param, "weight_loader", None)
+            if loader is None:
+                # No special packing — direct copy. Shapes must match.
+                param.data.copy_(tensor)
+                return
+
+            if edge.expert_id is not None:
+                # MoE routed expert: vLLM's RoutedExperts.weight_loader expects
+                # (param, loaded_weight, weight_name, shard_id, expert_id).
+                loader(
+                    param,
+                    tensor,
+                    weight_name=param_name,
+                    shard_id=edge.shard_id,
+                    expert_id=edge.expert_id,
+                )
+            elif edge.shard_id is not None:
+                # QKV / MergedColumn: vLLM weight_loader's "loaded_shard_id"
+                # picks the right column slice within the fused param.
+                loader(param, tensor, loaded_shard_id=edge.shard_id)
+            else:
+                # 1:1 default loader.
+                loader(param, tensor)
+
+        def _on_bucket(weights):
+            for encoded_name, tensor in weights:
+                _route_one(encoded_name, tensor)
+
+        receiver = BucketedWeightReceiver(
+            zmq_handle=self._get_zmq_handle(),
+            device=self.device,
+            use_shm=use_shm,
+        )
+        receiver.receive_weights(on_bucket_received=_on_bucket)
+
+        # Post-load transforms (same one-shot pass as update_weights_from_ipc).
+        from vllm.model_executor.model_loader.utils import process_weights_after_loading
+
+        for model, model_config in self._iter_all_models_with_config():
+            process_weights_after_loading(model, model_config, self.device)
+
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.
 

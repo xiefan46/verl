@@ -162,9 +162,13 @@ class TestQKVConvert:
         ctx = MegatronToHFContext(hf_config=hf, tp_rank=1, tp_size=2)
         param = torch.zeros(32, 16)
         outs = list(convert_qkv_to_q_k_v(ctx, param, layer_idx=0))
-        _, _, q_box = outs[0]
-        _, _, k_box = outs[1]
-        _, _, v_box = outs[2]
+        _, _, q_box, q_full = outs[0]
+        _, _, k_box, k_full = outs[1]
+        _, _, v_box, v_full = outs[2]
+        # Full shapes are HF-canonical (un-TP-sharded)
+        assert q_full == (32, 16)
+        assert k_full == (16, 16)
+        assert v_full == (16, 16)
         # rank=1 → second half
         assert q_box == ((16, 32), (0, 16))
         assert k_box == ((8, 16), (0, 16))

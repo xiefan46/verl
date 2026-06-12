@@ -166,3 +166,116 @@ class TestRegistry:
         eng = CheckpointEngineRegistry.new("sharded_nccl", group_name="test")
         assert isinstance(eng, ShardedNCCLCheckpointEngine)
         assert eng.group_name == "test"
+
+
+class TestM4MetasProvider:
+    """M4: lazy metas_provider closure resolution at prepare()."""
+
+    def test_lazy_provider_fires_once_at_prepare(self):
+        called = []
+
+        def provider():
+            called.append(1)
+            return [_meta("w", (8, 4), ((0, 4), (0, 4)), 0, "train")]
+
+        # Engine accepts is_master/bucket_size via **_unused_kwargs (so
+        # CheckpointEngineRegistry.new can pass them generically).
+        eng = ShardedNCCLCheckpointEngine(
+            is_master=True,
+            bucket_size=1024,
+            metas_provider=provider,
+            role="train",
+        )
+        assert not called  # not invoked yet
+        info = eng.prepare()
+        assert called == [1]
+        assert info["role"] == "train"
+        assert info["shard_metas"][0]["param_name"] == "w"
+
+    def test_explicit_set_shard_metas_short_circuits_provider(self):
+        """If set_shard_metas was called explicitly, provider should NOT fire."""
+        called = []
+
+        def provider():
+            called.append(1)
+            return []
+
+        eng = ShardedNCCLCheckpointEngine(metas_provider=provider, role="train")
+        eng.set_shard_metas(
+            [_meta("w", (8, 4), ((0, 4), (0, 4)), 0, "train")],
+            role="train",
+        )
+        eng.prepare()
+        assert not called
+
+
+class TestM4VllmEnrichInTopology:
+    """M4: build_topology must run edges through vllm_enrich_edge."""
+
+    def test_moe_expert_edge_gets_vllm_metadata(self):
+        full = (16, 8)
+        ranges = ((0, 16), (0, 8))
+        train_info = {
+            "shard_metas": [
+                _meta(
+                    "model.layers.0.mlp.experts.3.gate_proj.weight",
+                    full,
+                    ranges,
+                    0,
+                    "train",
+                ).to_dict()
+            ],
+            "role": "train",
+        }
+        rollout_info = {
+            "shard_metas": [
+                _meta(
+                    "model.layers.0.mlp.experts.3.gate_proj.weight",
+                    full,
+                    ranges,
+                    0,
+                    "rollout",
+                ).to_dict()
+            ],
+            "role": "rollout",
+        }
+        tkw, _ = ShardedNCCLCheckpointEngine.build_topology(1, 1, [train_info, rollout_info])
+        plan = TransferPlan.from_json(tkw["transfer_plan_json"][0])
+        assert len(plan.edges) == 1
+        e = plan.edges[0]
+        assert e.target_param_name == "model.layers.0.mlp.experts.w13_weight"
+        assert e.shard_id == "w1"
+        assert e.expert_id == 3
+
+
+class TestM4IncomingEdgesJsonExport:
+    """M4: get_incoming_edges_json gives the JSON the vLLM bridge consumes."""
+
+    def test_roundtrip_via_transfer_edge_from_dict(self):
+        import json
+
+        from verl.checkpoint_engine.parallel_meta import TransferEdge
+
+        full = (4, 4)
+        ranges = ((0, 4), (0, 4))
+        train_info = {
+            "shard_metas": [_meta("a", full, ranges, 0, "train").to_dict()],
+            "role": "train",
+        }
+        rollout_info = {
+            "shard_metas": [_meta("a", full, ranges, 0, "rollout").to_dict()],
+            "role": "rollout",
+        }
+        _, rkw = ShardedNCCLCheckpointEngine.build_topology(1, 1, [train_info, rollout_info])
+        plan = TransferPlan.from_json(rkw["transfer_plan_json"][0])
+
+        eng = ShardedNCCLCheckpointEngine()
+        # Bypass NCCL init by setting the rank-filtered edges directly.
+        eng._incoming_edges = plan.edges_for_dst(rkw["rank"][0])
+
+        as_json = eng.get_incoming_edges_json()
+        decoded = json.loads(as_json)
+        assert len(decoded) >= 1
+        # Each entry must roundtrip back through TransferEdge.
+        edge = TransferEdge.from_dict(decoded[0])
+        assert edge.param_name == "a"

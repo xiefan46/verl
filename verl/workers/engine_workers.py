@@ -620,10 +620,34 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             checkpoint_engine_config = omega_conf_to_dataclass(self.config.rollout.checkpoint_engine)
             backend = checkpoint_engine_config.backend
             bucket_size = checkpoint_engine_config.update_weights_bucket_megabytes << 20
-            engine_kwargs = checkpoint_engine_config.engine_kwargs.get(backend, {})
+            engine_kwargs = dict(checkpoint_engine_config.engine_kwargs.get(backend, {}))
             # If custom_backend_module is set, import it so plugins can register
             # in CheckpointEngineRegistry before the backend is instantiated.
             import_external_libs(checkpoint_engine_config.custom_backend_module or None)
+
+            # Sharded-aware NCCL backend needs a lazy way to read this rank's
+            # local Megatron shard layout. Register a closure that walks the
+            # model and emits HF-canonical ParameterShardMeta; the backend
+            # invokes it from ``prepare()`` exactly once per rendezvous.
+            if backend == "sharded_nccl":
+                if not hasattr(self.actor.engine, "get_local_shards_and_metas"):
+                    raise RuntimeError(
+                        f"sharded_nccl checkpoint backend requires an engine with "
+                        f"get_local_shards_and_metas(); got {type(self.actor.engine).__name__}. "
+                        f"Currently only the Megatron engine implements this. Use 'nccl' for FSDP."
+                    )
+                actor_engine = self.actor.engine
+
+                def _trainer_metas_provider():
+                    # NOTE: get_local_shards_and_metas does a full materialization
+                    # walk; we discard the weights generator and keep only metas
+                    # here. The send path re-walks at update_weights time.
+                    _gen, metas = actor_engine.get_local_shards_and_metas()
+                    return metas
+
+                engine_kwargs.setdefault("metas_provider", _trainer_metas_provider)
+                engine_kwargs.setdefault("role", "train")
+
             self.checkpoint_engine = CheckpointEngineRegistry.new(
                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
             )
@@ -692,6 +716,15 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # Resolve mode: "auto" falls back to config, explicit values take precedence
         effective_mode = mode if mode != "auto" else self.config.rollout.checkpoint_engine.backend
+
+        # 0a. Sharded-aware NCCL: skip the allgather inside ``get_per_tensor_param``
+        # and stream this rank's local Megatron→HF shards directly. The
+        # backend's send_weights routes each shard P2P per the routing plan
+        # built at ``build_topology`` time.
+        if effective_mode == "sharded_nccl":
+            weights_gen, _metas = self.actor.engine.get_local_shards_and_metas()
+            await self.checkpoint_engine.send_weights(weights_gen, global_steps=global_steps)
+            return
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if effective_mode != "naive":

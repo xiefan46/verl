@@ -170,13 +170,32 @@ class ServerAdapter(BaseRollout):
     async def update_weights(
         self, weights: Generator[tuple[str, torch.Tensor], None, None], global_steps: int = None, **kwargs
     ):
-        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers."""
+        """Update model weights via CUDA IPC (fallback to shared memory if IPC not supported) to inference workers.
+
+        Sharded path: when ``incoming_edges_json`` is provided (passed through
+        from ``CheckpointEngineWorker.update_weights`` when the backend is
+        ``sharded_nccl``), tensors arrive keyed by ``"<param_name>|<edge_idx>"``
+        rather than HF-canonical name, and the vLLM worker invokes
+        ``update_weights_from_sharded_ipc`` to dispatch each shard through
+        the correct ``weight_loader``.
+        """
         start_time = time.time()
 
+        incoming_edges_json = kwargs.pop("incoming_edges_json", None)
+        if incoming_edges_json is not None:
+            method_name = "update_weights_from_sharded_ipc"
+            method_kwargs = {
+                "incoming_edges_json": incoming_edges_json,
+                "use_shm": self.use_shm,
+            }
+        else:
+            method_name = "update_weights_from_ipc"
+            method_kwargs = {**kwargs, "use_shm": self.use_shm}
+
         future = await self._execute_method(
-            "update_weights_from_ipc",
+            method_name,
             non_block=True,
-            kwargs={**kwargs, "use_shm": self.use_shm},
+            kwargs=method_kwargs,
         )
 
         bucket_size_mb = self.config.checkpoint_engine.update_weights_bucket_megabytes

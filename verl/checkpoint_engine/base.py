@@ -322,7 +322,12 @@ class CheckpointEngineWorker(Worker):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None):
         weights = self.checkpoint_engine.receive_weights(global_steps=global_steps)
-        await self.server_adapter.update_weights(weights, global_steps=global_steps)
+        extra_kwargs = {}
+        # Sharded backends additionally need to ship per-edge metadata so the
+        # vLLM worker subprocess can dispatch to the correct weight_loader.
+        if hasattr(self.checkpoint_engine, "get_incoming_edges_json"):
+            extra_kwargs["incoming_edges_json"] = self.checkpoint_engine.get_incoming_edges_json()
+        await self.server_adapter.update_weights(weights, global_steps=global_steps, **extra_kwargs)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

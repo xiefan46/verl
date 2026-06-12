@@ -756,6 +756,75 @@ class MegatronEngine(BaseEngine):
 
         return per_tensor_param, peft_config
 
+    def get_local_shards_and_metas(self):
+        """Sharded-aware counterpart to ``get_per_tensor_param``.
+
+        Returns ``(weights_generator, shard_metas)`` where:
+
+        * ``weights_generator`` yields ``(hf_name, local_tensor)`` pairs in
+          HF-canonical layout WITHOUT any allgather. This is what
+          ``ShardedNCCLCheckpointEngine.send_weights`` consumes.
+        * ``shard_metas`` is a ``list[ParameterShardMeta]`` describing this
+          rank's local holdings, fed to
+          ``ShardedNCCLCheckpointEngine.set_shard_metas`` BEFORE the joint
+          NCCL group is initialized so the routing plan can include this rank.
+
+        Unlike ``get_per_tensor_param`` (which routes through mbridge and
+        triggers EP/TP allgather), this path walks ``named_parameters()``
+        directly and applies pure-local Megatron→HF layout transforms via
+        ``sharded_export``.
+
+        Used only by the ``sharded_nccl`` checkpoint backend. The legacy
+        broadcast backends continue using ``get_per_tensor_param``.
+        """
+        from megatron.core import parallel_state as mpu
+
+        from verl.checkpoint_engine.parallel_meta import ParameterShardMeta
+        from verl.workers.engine.megatron.sharded_export import (
+            MegatronToHFContext,
+            get_local_shards,
+        )
+
+        load_megatron_model_to_gpu(self.module, load_grad=False, load_frozen_params=True)
+
+        # Megatron returns a list (one entry per VPP stage; single-stage = length 1).
+        module = self.module[0] if isinstance(self.module, list) else self.module
+
+        ep_rank = mpu.get_expert_model_parallel_rank() if hasattr(mpu, "get_expert_model_parallel_rank") else 0
+        ep_size = (
+            mpu.get_expert_model_parallel_world_size() if hasattr(mpu, "get_expert_model_parallel_world_size") else 1
+        )
+
+        ctx = MegatronToHFContext(
+            hf_config=self.model_config.hf_config,
+            tp_rank=mpu.get_tensor_model_parallel_rank(),
+            tp_size=mpu.get_tensor_model_parallel_world_size(),
+            ep_rank=ep_rank,
+            ep_size=ep_size,
+        )
+
+        # Materialize results once so we can compute metas without forcing the
+        # caller to consume the generator twice.
+        collected: list[tuple[str, torch.Tensor]] = []
+        metas: list[ParameterShardMeta] = []
+        for hf_name, tensor, box, full_shape in get_local_shards(module, ctx):
+            collected.append((hf_name, tensor))
+            metas.append(
+                ParameterShardMeta(
+                    param_name=hf_name,
+                    full_shape=full_shape,
+                    dtype_str=str(tensor.dtype).split(".")[-1],
+                    ranges=box,
+                    global_rank=0,  # overridden by build_topology at NCCL-group setup
+                    role="train",
+                )
+            )
+
+        def _gen():
+            yield from collected
+
+        return _gen(), metas
+
     def disable_adapter(self) -> ContextManager:
         return self.peft_cls.disable_adapter(self.module)
 
