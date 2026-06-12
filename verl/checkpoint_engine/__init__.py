@@ -64,3 +64,10 @@ try:
     __all__ += ["MooncakeCheckpointEngine"]
 except ImportError:
     MooncakeCheckpointEngine = None
+
+try:
+    from .sharded_nccl_checkpoint_engine import ShardedNCCLCheckpointEngine
+
+    __all__ += ["ShardedNCCLCheckpointEngine"]
+except ImportError:
+    ShardedNCCLCheckpointEngine = None
