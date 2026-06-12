@@ -11,33 +11,87 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Verify vLLM MoE parameter layout for Qwen3.5 (sharded-aware refit M3 prep).
+"""Verify vLLM MoE parameter layout (sharded-aware refit M3 prep).
 
-Loads a Qwen3.5 MoE model into vLLM and prints:
-  - FusedMoE-related layer 0 module type + named_parameters
+Loads a Qwen MoE model into vLLM and prints:
+  - FusedMoE-related layer 0 module type
   - Full named_parameters keys + shapes for layer 0
   - Whether experts are grouped (single fused tensor) or list-of-modules
   - packed_modules_mapping (HF→vLLM fused param mapping — critical for M3)
 
-Run on 2×H100 (Qwen3.5-35B-A3B at TP=2):
-    cd verl
-    python tests/sharded_refit_verify/verify_vllm_moe_layout.py \
-        --model Qwen/Qwen3.5-35B-A3B \
-        --tp 2
+vLLM v1 runs the model in multiprocess engine workers, so we must walk it
+via ``collective_rpc`` with a module-level function (lambdas/closures don't
+serialize). We set ``VLLM_ALLOW_INSECURE_SERIALIZATION=1`` to allow
+cloudpickle of the dump callback.
 
-vLLM requirements: Qwen3.5 support landed in vLLM main ~2026-03. Use a
-recent build (>= v0.10 or main). If your build is too old, fallback:
-    python tests/sharded_refit_verify/verify_vllm_moe_layout.py \
-        --model Qwen/Qwen3-30B-A3B \
-        --tp 2
-(Qwen3 and Qwen3.5 share the same MoE block structure in vLLM, so the
-layout dump for Qwen3 is still informative for Qwen3.5 M3 prep.)
+Run on 2×H100:
+    cd verl
+    python tests/sharded_refit_verify/verify_vllm_moe_layout.py \\
+        --model /root/models/Qwen/Qwen3-30B-A3B --tp 2
+
+(Qwen3 / Qwen3.5 share the same FusedMoE block structure in vLLM, so
+Qwen3-30B-A3B is a good stand-in if Qwen3.5 not yet supported by your build.)
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+
+# Must set before importing vllm so the engine workers inherit it.
+os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+
+# Module-level (NOT lambda / closure) so vLLM v1's cloudpickle can serialize
+# this callback across the engine subprocess boundary.
+def _dump_model_info(self) -> dict:
+    """Run inside the vLLM worker; serialize layout info back to driver."""
+    m = self.model_runner.model
+
+    # Walk inner model for module type info (best-effort).
+    layer0_info: dict = {}
+    try:
+        inner = m.model if hasattr(m, "model") else m
+        if hasattr(inner, "layers"):
+            layer0 = inner.layers[0]
+        elif hasattr(inner, "decoder"):
+            layer0 = inner.decoder.layers[0]
+        else:
+            layer0 = None
+
+        if layer0 is not None:
+            layer0_info["layer0_type"] = type(layer0).__name__
+            mlp = getattr(layer0, "mlp", None) or getattr(layer0, "feed_forward", None)
+            if mlp is not None:
+                layer0_info["mlp_type"] = type(mlp).__name__
+                sub_info = {}
+                for attr_name in ["experts", "gate", "shared_expert", "shared_experts"]:
+                    sub = getattr(mlp, attr_name, None)
+                    if sub is not None:
+                        entry = {"type": type(sub).__name__, "attrs": {}}
+                        for fattr in [
+                            "w13_weight",
+                            "w2_weight",
+                            "weight",
+                            "linear_fc1",
+                            "linear_fc2",
+                        ]:
+                            v = getattr(sub, fattr, None)
+                            if v is not None and hasattr(v, "shape"):
+                                entry["attrs"][fattr] = (tuple(v.shape), str(v.dtype))
+                        sub_info[attr_name] = entry
+                layer0_info["mlp_children"] = sub_info
+    except Exception as e:
+        layer0_info["walk_error"] = repr(e)
+
+    return {
+        "model_class": type(m).__name__,
+        "model_mro": [c.__name__ for c in type(m).__mro__[:5]],
+        "params": [(n, tuple(p.shape), str(p.dtype)) for n, p in m.named_parameters()],
+        "packed_modules_mapping": getattr(m, "packed_modules_mapping", None),
+        "layer0_info": layer0_info,
+    }
 
 
 def main() -> int:
@@ -72,78 +126,38 @@ def main() -> int:
         trust_remote_code=True,
     )
 
-    # Walk to the underlying model. Path varies across vLLM versions.
-    try:
-        model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    except AttributeError:
-        # vLLM v1 / newer path
-        try:
-            model = llm.llm_engine.engine_core.engine_core.model_executor.driver_worker.model_runner.model
-        except AttributeError:
-            # Fallback: collective_rpc to driver worker
-            def _get_named(self):
-                m = self.model_runner.model
-                return [(n, tuple(p.shape), str(p.dtype)) for n, p in m.named_parameters()]
+    # vLLM v1: model lives in engine subprocess; RPC into driver worker.
+    info = llm.llm_engine.collective_rpc(_dump_model_info)[0]
 
-            result = llm.llm_engine.collective_rpc(_get_named)[0]
-            print(f"=== Got params via collective_rpc ({len(result)} total) ===")
-            _print_layer0(result)
-            return 0
+    print(f"\nModel class: {info['model_class']}")
+    print(f"MRO: {info['model_mro']}")
 
-    print(f"\nModel class: {type(model).__name__}")
-    print(f"MRO: {[c.__name__ for c in type(model).__mro__[:5]]}")
-
-    # Try walking to layer 0 MoE module.
-    print("\n=== layer 0 module structure ===")
-    try:
-        if hasattr(model, "model"):
-            inner = model.model
-        else:
-            inner = model
-        if hasattr(inner, "layers"):
-            layer0 = inner.layers[0]
-        elif hasattr(inner, "decoder"):
-            layer0 = inner.decoder.layers[0]
-        else:
-            layer0 = None
-
-        if layer0 is not None:
-            print(f"Layer 0 type:       {type(layer0).__name__}")
-            mlp = getattr(layer0, "mlp", None) or getattr(layer0, "feed_forward", None)
-            if mlp is not None:
-                print(f"Layer 0 mlp type:   {type(mlp).__name__}")
-                for attr_name in ["experts", "gate", "shared_expert", "shared_experts"]:
-                    sub = getattr(mlp, attr_name, None)
-                    if sub is not None:
-                        print(f"  .{attr_name} type: {type(sub).__name__}")
-                        # Check for FusedMoE typical fused tensors
-                        for fattr in ["w13_weight", "w2_weight", "weight", "linear_fc1", "linear_fc2"]:
-                            v = getattr(sub, fattr, None)
-                            if v is not None and hasattr(v, "shape"):
-                                print(f"    .{attr_name}.{fattr}\t{tuple(v.shape)}\t{v.dtype}")
-    except Exception as e:
-        print(f"Layer walk failed: {e}")
-        import traceback
-
-        traceback.print_exc()
-
-    # Dump all named_parameters for layer 0 (most useful output).
-    print("\n=== layer 0 named_parameters (rank-0 driver_worker view) ===")
-    layer0_params = [(n, tuple(p.shape), str(p.dtype)) for n, p in model.named_parameters() if "layers.0." in n]
-    for n, s, d in layer0_params:
-        print(f"  {n}\t{s}\t{d}")
-    print(f"\n(total {len(layer0_params)} params in layer 0)")
+    layer0_info = info.get("layer0_info", {})
+    if layer0_info.get("walk_error"):
+        print(f"\n=== layer 0 walk error: {layer0_info['walk_error']} ===")
+    else:
+        print("\n=== layer 0 module structure ===")
+        if "layer0_type" in layer0_info:
+            print(f"Layer 0 type:       {layer0_info['layer0_type']}")
+        if "mlp_type" in layer0_info:
+            print(f"Layer 0 mlp type:   {layer0_info['mlp_type']}")
+        for sub_name, entry in layer0_info.get("mlp_children", {}).items():
+            print(f"  .{sub_name} type: {entry['type']}")
+            for fattr, (shape, dtype) in entry["attrs"].items():
+                print(f"    .{sub_name}.{fattr}\t{shape}\t{dtype}")
 
     print("\n=== first 8 named_parameters() (embedding + first layer head) ===")
-    for i, (n, p) in enumerate(model.named_parameters()):
-        if i >= 8:
-            break
-        print(f"  {i:3d}: {n}\t{tuple(p.shape)}")
+    for i, (n, s, _d) in enumerate(info["params"][:8]):
+        print(f"  {i:3d}: {n}\t{s}")
 
-    # Dump packed_modules_mapping if exposed — this is the key info for
-    # HF→vLLM fused offset computation in build_transfer_plan.
+    print("\n=== layer 0 named_parameters ===")
+    layer0_params = [(n, s, d) for n, s, d in info["params"] if "layers.0." in n]
+    for n, s, d in layer0_params:
+        print(f"  {n}\t{s}\t{d}")
+    print(f"\n(total {len(layer0_params)} params in layer 0, {len(info['params'])} total)")
+
     print("\n=== packed_modules_mapping (HF→vLLM fused param mapping) ===")
-    pmm = getattr(model, "packed_modules_mapping", None)
+    pmm = info["packed_modules_mapping"]
     if pmm is not None:
         for k, v in pmm.items():
             print(f"  {k!r}: {v}")
@@ -154,14 +168,6 @@ def main() -> int:
     print("=== END VERIFY ===")
     print(f"{'=' * 78}\n")
     return 0
-
-
-def _print_layer0(params):
-    layer0 = [(n, s, d) for n, s, d in params if "layers.0." in n]
-    print("=== layer 0 named_parameters ===")
-    for n, s, d in layer0:
-        print(f"  {n}\t{s}\t{d}")
-    print(f"(total {len(layer0)} layer-0 params)")
 
 
 if __name__ == "__main__":
