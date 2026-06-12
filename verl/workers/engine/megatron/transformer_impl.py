@@ -293,6 +293,11 @@ class MegatronEngine(BaseEngine):
         self.tf_config = updated_tf_config
         print(f"module: {len(module)}")
 
+        # Sharded-aware refit M3 verify hook (env-var triggered; no-op by default).
+        from ._verify_moe_layout_hook import maybe_run_verify
+
+        maybe_run_verify(module, self.tf_config, self.model_config.hf_config)
+
         if self.engine_config.use_dist_checkpointing:
             load_mcore_dist_weights(
                 module, self.engine_config.dist_checkpointing_path, is_value_model=self.is_value_model
