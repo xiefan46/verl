@@ -49,7 +49,7 @@ bash tests/special_e2e/sharded_refit_e2e/run.sh
 DISTINGUISHING=1 bash tests/special_e2e/sharded_refit_e2e/run.sh
 ```
 
-### MoE Qwen3-30B-A3B (4×H100, ~15-25 min)
+### MoE Qwen3-30B-A3B (8×H200, ~25-40 min)
 
 ```bash
 cd /root/verl
@@ -57,10 +57,12 @@ bash tests/special_e2e/sharded_refit_e2e/run_moe.sh
 DISTINGUISHING=1 bash tests/special_e2e/sharded_refit_e2e/run_moe.sh
 ```
 
-Trainer Megatron 2 GPU EP=2 (param+grad+optim offload), rollout vLLM
-2 GPU TP=2 EP=2 DP=1. Exercises per-expert routing + multi-rank
-``ParameterShardMeta`` enumeration on both sides. First run downloads
-Qwen3-30B-A3B-Instruct (~60 GB) — subsequent runs reuse the local copy.
+Trainer Megatron 4 GPU **TP=2 EP=2** (param+grad+optim offload),
+rollout vLLM 4 GPU **TP=4 EP=4 DP=1**. The asymmetric configuration is
+deliberate — it forces cross-TP (2→4) and cross-EP (2→4)
+redistribution, which is the actual value-add of sharded refit over
+the broadcast baseline. First run downloads Qwen3-30B-A3B-Instruct
+(~60 GB) — subsequent runs reuse the local copy.
 
 ## Tunables (env vars)
 

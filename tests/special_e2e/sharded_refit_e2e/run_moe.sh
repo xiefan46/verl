@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Sharded-aware NCCL refit MoE e2e gate — Qwen3-30B-A3B-Instruct on 4×H100.
+# Sharded-aware NCCL refit MoE e2e gate — Qwen3-30B-A3B-Instruct on 8×H200.
 #
-# Trainer Megatron: 2 GPU, PP=1 CP=1 TP=1 EP=2 ETP=1, param+grad+optim offload ON.
-# Rollout vLLM:     2 GPU, TP=2 EP=2 DP=1, standalone, gpu_mem_util=0.85.
+# Trainer Megatron: 4 GPU, PP=1 CP=1 TP=2 EP=2 ETP=1, offload ON.
+# Rollout vLLM:     4 GPU, TP=4 EP=4 DP=1, standalone, gpu_mem_util=0.85.
+#
+# The asymmetric trainer-vs-rollout TP/EP is intentional — it forces the
+# routing plan to do cross-TP (2→4) and cross-EP (2→4) shard
+# redistribution, which is the actual value-add over broadcast.
 #
 # Validates:
-#   - multi-rank ParameterShardMeta enumeration (rollout EP-split experts,
-#     TP-split attention)
+#   - multi-rank ParameterShardMeta enumeration on BOTH sides
+#   - cross-TP redistribution of attention rows + dense col splits
+#   - cross-EP redistribution of routed experts
 #   - per-expert routing: trainer's local experts land on the right vLLM
 #     EP rank via the M3 enricher's w1/w2/w3 + expert_id mapping
 #   - DISTINGUISHING=1 confirms shards actually overwrite vLLM

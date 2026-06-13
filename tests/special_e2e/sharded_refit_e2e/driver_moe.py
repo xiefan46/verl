@@ -14,29 +14,33 @@
 """Sharded-aware NCCL weight-refit MoE e2e driver.
 
 Same shape as ``driver.py`` (Qwen2.5-0.5B dense, single-GPU each side),
-but configured for **Qwen3-30B-A3B-Instruct on 4×H100**:
+but configured for **Qwen3-30B-A3B-Instruct on 8×H200**:
 
-* Megatron trainer: 2 GPU, PP=1 CP=1 TP=1 **EP=2** ETP=1.
-  Param offload ON because raw 30B BF16 + optimizer state exceeds 80GB
-  even split across 2 EP ranks (each rank still holds the full dense
-  trunk + half the routed experts).
-* vLLM rollout: 2 GPU, **TP=2 EP=2 DP=1**. vLLM enforces
+* Megatron trainer: 4 GPU, PP=1 CP=1 **TP=2 EP=2** ETP=1.
+  Each rank holds 1/2 attention + 64/128 routed experts. Param +
+  grad + optim offload ON for headroom (H200 141 GB has more room,
+  but Adam state still benefits from offload).
+* vLLM rollout: 4 GPU, **TP=4 EP=4 DP=1**. vLLM enforces
   ``ep_size == tp_size * dp_size`` (see
-  :class:`verl.workers.config.rollout.RolloutConfig`) so with DP=1 we
-  must pair TP=2 with EP=2; each TP rank holds half attention + half
-  experts.
+  :class:`verl.workers.config.rollout.RolloutConfig`); we pair TP=4
+  with EP=4 so each rank holds 1/4 attention + 32/128 experts.
 
-What this validates beyond the Qwen2.5-0.5B driver:
+The asymmetric trainer-vs-rollout split is the WHOLE point. It exercises
+the routing algorithm's actual value-add over naive broadcast:
 
-* Multi-rank rollout — both trainer and rollout actors have rank > 1,
-  so ``CheckpointEngineWorker``'s ``tp_rank`` / ``ep_rank`` derivation
-  from ``self._rank`` actually matters.
-* MoE routed-expert routing — each rank's ``ParameterShardMeta`` enumerates
-  ~64 of the 128 experts (per-EP-rank), the routing plan must dispatch
-  each trainer expert to the right rollout EP rank, and vLLM's
-  ``RoutedExperts.weight_loader`` must accept the encoded edge metadata
-  (shard_id ``w1`` / ``w2`` / ``w3``, ``expert_id`` int).
-* TP-split QKV (Qwen3 has ``attention_bias=False`` so no bias path).
+* **Cross-TP redistribution (2→4)** — each trainer TP rank holds half
+  the attention rows; each rollout TP rank wants a quarter. Every
+  trainer rank must split its half across two rollout ranks.
+* **Cross-EP redistribution (2→4)** — trainer EP rank 0 owns experts
+  [0..64); rollout EP rank 0 wants experts [0..32) and rank 1 wants
+  [32..64). The routing plan must dispatch the right per-expert
+  slices to the right rollout actor.
+* MoE routed-expert routing — vLLM's ``RoutedExperts.weight_loader``
+  must accept ``shard_id`` ∈ {"w1","w2","w3"} + ``expert_id: int``.
+* TP-split QKV with no bias (Qwen3 has ``attention_bias=False``).
+
+Without cross-TP/EP redistribution the test would collapse to trivial
+1:1 routing — covered already by the dense Qwen2.5-0.5B driver.
 
 Reuses ``driver.py``'s ``init_separated_stack`` and ``run_e2e`` to keep
 the stack/dump/logprob plumbing in one place.
@@ -65,8 +69,8 @@ def build_config_moe(backend: str, model_path: str) -> DictConfig:
     with initialize_config_dir(config_dir=config_dir, version_base=None):
         config = compose(config_name="ppo_megatron_trainer")
 
-    # ---- cluster: 2+2 GPU (trainer 2 EP=2, rollout 2 TP=2 EP=2) ----
-    config.trainer.n_gpus_per_node = 2
+    # ---- cluster: 4+4 GPU (trainer TP=2 EP=2, rollout TP=4 EP=4 DP=1) ----
+    config.trainer.n_gpus_per_node = 4
     config.trainer.nnodes = 1
     config.actor_rollout_ref.hybrid_engine = False
     config.trainer.total_epochs = 1
@@ -83,12 +87,12 @@ def build_config_moe(backend: str, model_path: str) -> DictConfig:
     config.actor_rollout_ref.model.path = model_path
     config.actor_rollout_ref.model.use_remove_padding = False
 
-    # ---- Megatron actor: PP=1 CP=1 TP=1 EP=2 ETP=1 ----
+    # ---- Megatron actor: PP=1 CP=1 TP=2 EP=2 ETP=1 ----
     actor_mc = config.actor_rollout_ref.actor.megatron
     actor_mc.pipeline_model_parallel_size = 1
     actor_mc.virtual_pipeline_model_parallel_size = None
     actor_mc.context_parallel_size = 1
-    actor_mc.tensor_model_parallel_size = 1
+    actor_mc.tensor_model_parallel_size = 2
     actor_mc.expert_model_parallel_size = 2
     actor_mc.expert_tensor_parallel_size = 1
     # 30B dense trunk + half experts per rank exceeds 80GB raw; offload.
@@ -102,7 +106,7 @@ def build_config_moe(backend: str, model_path: str) -> DictConfig:
     ref_mc.pipeline_model_parallel_size = 1
     ref_mc.virtual_pipeline_model_parallel_size = None
     ref_mc.context_parallel_size = 1
-    ref_mc.tensor_model_parallel_size = 1
+    ref_mc.tensor_model_parallel_size = 2
     ref_mc.expert_model_parallel_size = 2
     ref_mc.expert_tensor_parallel_size = 1
     ref_mc.param_offload = True
@@ -121,15 +125,15 @@ def build_config_moe(backend: str, model_path: str) -> DictConfig:
     config.actor_rollout_ref.actor.optim.lr_decay_steps = 1
     config.actor_rollout_ref.actor.optim.lr_warmup_steps = 0
 
-    # ---- rollout: vLLM async, STANDALONE, TP=2 EP=2 DP=1 ----
+    # ---- rollout: vLLM async, STANDALONE, TP=4 EP=4 DP=1 ----
     config.actor_rollout_ref.rollout.name = "vllm"
     config.actor_rollout_ref.rollout.mode = "async"
     config.actor_rollout_ref.rollout.nnodes = 1
-    config.actor_rollout_ref.rollout.n_gpus_per_node = 2
-    config.actor_rollout_ref.rollout.tensor_model_parallel_size = 2
-    config.actor_rollout_ref.rollout.expert_parallel_size = 2
+    config.actor_rollout_ref.rollout.n_gpus_per_node = 4
+    config.actor_rollout_ref.rollout.tensor_model_parallel_size = 4
+    config.actor_rollout_ref.rollout.expert_parallel_size = 4
     config.actor_rollout_ref.rollout.data_parallel_size = 1
-    # Lower utilization than dense — Qwen3-30B + KV needs headroom.
+    # H200 141 GB has more room than H100; can run hotter.
     config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.85
     config.actor_rollout_ref.rollout.enforce_eager = True
     config.actor_rollout_ref.rollout.n = 1
