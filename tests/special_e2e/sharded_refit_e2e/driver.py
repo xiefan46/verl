@@ -111,6 +111,14 @@ def build_config(backend: str, model_path: str) -> DictConfig:
     config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu = 1
     config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu = 1
 
+    # ---- LR scheduler — RayPPOTrainer.fit() normally resolves these from the
+    # dataloader before init_model(); we bypass fit() so we have to set them
+    # by hand. Without this Megatron's OptimizerParamScheduler hits
+    # ``assert lr_decay_steps > 0`` because total_training_steps stays at -1.
+    config.actor_rollout_ref.actor.optim.total_training_steps = 1
+    config.actor_rollout_ref.actor.optim.lr_decay_steps = 1
+    config.actor_rollout_ref.actor.optim.lr_warmup_steps = 0
+
     # ---- rollout: vLLM async (required for OpenAI client + checkpoint engine flow) ----
     config.actor_rollout_ref.rollout.name = "vllm"
     config.actor_rollout_ref.rollout.mode = "async"
