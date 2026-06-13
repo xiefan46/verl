@@ -39,12 +39,28 @@ backend). Each invocation:
 
 ## Run
 
+### Dense Qwen2.5-0.5B (2×H100, ~3-5 min)
+
 ```bash
 cd /root/verl
 bash tests/special_e2e/sharded_refit_e2e/run.sh
+# Distinguishing — zero out trainer pre-update; both backends must
+# produce identical garbage output:
+DISTINGUISHING=1 bash tests/special_e2e/sharded_refit_e2e/run.sh
 ```
 
-Wall time: ~3-5 min (two full Megatron+vLLM cold-starts dominate).
+### MoE Qwen3-30B-A3B (4×H100, ~15-25 min)
+
+```bash
+cd /root/verl
+bash tests/special_e2e/sharded_refit_e2e/run_moe.sh
+DISTINGUISHING=1 bash tests/special_e2e/sharded_refit_e2e/run_moe.sh
+```
+
+Trainer Megatron 2 GPU EP=2 (param+grad+optim offload), rollout vLLM
+2 GPU TP=2 EP=2 DP=1. Exercises per-expert routing + multi-rank
+``ParameterShardMeta`` enumeration on both sides. First run downloads
+Qwen3-30B-A3B-Instruct (~60 GB) — subsequent runs reuse the local copy.
 
 ## Tunables (env vars)
 

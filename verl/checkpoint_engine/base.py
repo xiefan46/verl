@@ -312,7 +312,22 @@ class CheckpointEngineWorker(Worker):
             from verl.checkpoint_engine.rollout_shard_metas import build_rollout_shard_metas
 
             tp_size = self.rollout_config.tensor_model_parallel_size
-            ep_size = getattr(self.rollout_config, "expert_parallel_size", 1)
+            ep_size = max(1, int(getattr(self.rollout_config, "expert_parallel_size", 1) or 1))
+            dp_size = max(1, int(getattr(self.rollout_config, "data_parallel_size", 1) or 1))
+
+            # vLLM's MoE EP enforces ``ep_size == tp_size * dp_size`` (see
+            # RolloutConfig.__post_init__). In the DP=1 case this collapses
+            # to ``ep_rank = tp_rank`` — each TP rank holds 1/TP attention +
+            # 1/EP experts and the two indices coincide.
+            if ep_size > 1 and ep_size != tp_size * dp_size:
+                raise ValueError(
+                    f"expert_parallel_size {ep_size} must equal tp_size {tp_size} * dp_size {dp_size}; "
+                    "see verl.workers.config.rollout.RolloutConfig.__post_init__."
+                )
+            rank_in_replica = (self._rank or 0) % max(tp_size, 1)
+            tp_rank = rank_in_replica
+            ep_rank = rank_in_replica if ep_size > 1 else 0
+
             model_config_ref = self.model_config
 
             def _resolve_hf_config():
@@ -336,9 +351,9 @@ class CheckpointEngineWorker(Worker):
             def _rollout_metas_provider():
                 return build_rollout_shard_metas(
                     _resolve_hf_config(),
-                    tp_rank=0,  # MVP single-rank rollout
+                    tp_rank=tp_rank,
                     tp_size=tp_size,
-                    ep_rank=0,
+                    ep_rank=ep_rank,
                     ep_size=ep_size,
                 )
 
