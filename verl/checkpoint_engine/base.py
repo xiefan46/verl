@@ -299,10 +299,34 @@ class CheckpointEngineWorker(Worker):
         self.server_adapter: BaseRollout = server_adapter
         backend = self.rollout_config.checkpoint_engine.backend
         bucket_size = self.rollout_config.checkpoint_engine.update_weights_bucket_megabytes << 20
-        engine_kwargs = self.rollout_config.checkpoint_engine.engine_kwargs.get(backend, {})
+        engine_kwargs = dict(self.rollout_config.checkpoint_engine.engine_kwargs.get(backend, {}))
         # If custom_backend_module is set, import it so plugins can register
         # in CheckpointEngineRegistry before the backend is instantiated.
         import_external_libs(self.rollout_config.checkpoint_engine.custom_backend_module or None)
+
+        # Sharded-aware NCCL needs rollout-side shard metas to compute the
+        # routing plan. Unlike the trainer side (which walks a live Megatron
+        # module via ``get_local_shards_and_metas``), the rollout actor has no
+        # model to walk — we synthesize metas from ``hf_config`` instead.
+        if backend == "sharded_nccl":
+            from verl.checkpoint_engine.rollout_shard_metas import build_rollout_shard_metas
+
+            tp_size = self.rollout_config.tensor_model_parallel_size
+            ep_size = getattr(self.rollout_config, "expert_parallel_size", 1)
+            model_config_ref = self.model_config
+
+            def _rollout_metas_provider():
+                return build_rollout_shard_metas(
+                    model_config_ref.hf_config,
+                    tp_rank=0,  # MVP single-rank rollout
+                    tp_size=tp_size,
+                    ep_rank=0,
+                    ep_size=ep_size,
+                )
+
+            engine_kwargs.setdefault("metas_provider", _rollout_metas_provider)
+            engine_kwargs.setdefault("role", "rollout")
+
         self.checkpoint_engine: CheckpointEngine = CheckpointEngineRegistry.new(
             backend, bucket_size=bucket_size, **engine_kwargs
         )

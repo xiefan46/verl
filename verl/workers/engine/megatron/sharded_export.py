@@ -205,6 +205,46 @@ def convert_qkv_to_q_k_v(
     yield f"{base}.v_proj.weight", v_flat, _tp_split_box(kv_full, 0, ctx.tp_rank, ctx.tp_size), kv_full
 
 
+def convert_qkv_bias_to_q_k_v(
+    ctx: MegatronToHFContext,
+    qkv_bias: torch.Tensor,
+    layer_idx: int,
+) -> Iterator[LocalShardTuple]:
+    """Megatron ``linear_qkv.bias`` → HF ``q_proj.bias`` / ``k_proj.bias`` / ``v_proj.bias``.
+
+    Same per-group interleaved layout as the weight, just 1-D.
+    """
+    nq = ctx.num_heads()
+    nkv = ctx.num_kv_heads()
+    hd = ctx.head_dim()
+    num_query_groups = nkv
+    if nq % num_query_groups != 0:
+        raise ValueError(f"num_heads ({nq}) not divisible by num_query_groups ({num_query_groups})")
+    qpg = nq // num_query_groups
+    if num_query_groups % ctx.tp_size != 0:
+        raise ValueError(
+            f"num_query_groups ({num_query_groups}) not divisible by tp_size ({ctx.tp_size}); "
+            "MVP only supports clean TP partitioning of KV heads"
+        )
+    groups_per_rank = num_query_groups // ctx.tp_size
+    expected_rows = (qpg + 2) * hd * groups_per_rank
+    if qkv_bias.shape != (expected_rows,):
+        raise ValueError(f"linear_qkv.bias shape {tuple(qkv_bias.shape)} != expected ({expected_rows},)")
+
+    reshaped = qkv_bias.view(groups_per_rank, qpg + 2, hd)
+    q, k, v = torch.split(reshaped, [qpg, 1, 1], dim=1)
+    q_flat = q.contiguous().view(-1)
+    k_flat = k.contiguous().view(-1)
+    v_flat = v.contiguous().view(-1)
+
+    q_full = (nq * hd,)
+    kv_full = (nkv * hd,)
+    base = f"model.layers.{layer_idx}.self_attn"
+    yield f"{base}.q_proj.bias", q_flat, _tp_split_box(q_full, 0, ctx.tp_rank, ctx.tp_size), q_full
+    yield f"{base}.k_proj.bias", k_flat, _tp_split_box(kv_full, 0, ctx.tp_rank, ctx.tp_size), kv_full
+    yield f"{base}.v_proj.bias", v_flat, _tp_split_box(kv_full, 0, ctx.tp_rank, ctx.tp_size), kv_full
+
+
 def convert_fc1_to_gate_up(
     ctx: MegatronToHFContext,
     fc1_param: torch.Tensor,
@@ -259,11 +299,18 @@ _MOE_EXPERT_FC2_RE = re.compile(r"^decoder\.layers\.(\d+)\.mlp\.experts\.linear_
 
 
 def _strip_module_prefix(name: str) -> str:
-    """Strip Float16Module + language_model wrapper prefixes."""
-    if name.startswith("module.language_model."):
-        return name[len("module.language_model.") :]
-    if name.startswith("module."):
-        return name[len("module.") :]
+    """Strip DDP / Float16Module / language_model wrapper prefixes.
+
+    Megatron with DistributedDataParallel + Float16Module produces names
+    like ``module.module.decoder.layers.0...`` — both wrappers add a
+    ``module.`` prefix, so a single-pass strip leaves one in place and
+    breaks the ``_LAYER_RE`` match. Strip iteratively, then handle the
+    VL-only ``language_model.`` namespace.
+    """
+    while name.startswith("module."):
+        name = name[len("module.") :]
+    if name.startswith("language_model."):
+        name = name[len("language_model.") :]
     return name
 
 
@@ -332,6 +379,9 @@ def _dispatch_layer(
     if rest == "self_attention.linear_qkv.weight":
         yield from convert_qkv_to_q_k_v(ctx, param, layer_idx)
         return
+    if rest == "self_attention.linear_qkv.bias":
+        yield from convert_qkv_bias_to_q_k_v(ctx, param, layer_idx)
+        return
     if rest == "self_attention.linear_qkv.layer_norm_weight":
         yield _emit_1to1(f"{base}.input_layernorm.weight", param)
         return
@@ -352,6 +402,10 @@ def _dispatch_layer(
             f"{base}.mlp.up_proj.weight",
             intermediate_size=ctx.intermediate_size(),
         )
+        return
+    if rest == "mlp.linear_fc1.layer_norm_weight":
+        # Megatron fuses post_attention_layernorm into the linear_fc1 module.
+        yield _emit_1to1(f"{base}.post_attention_layernorm.weight", param)
         return
     if rest == "mlp.linear_fc2.weight":
         yield from convert_fc2_to_down(
