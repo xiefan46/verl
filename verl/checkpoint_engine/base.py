@@ -315,9 +315,27 @@ class CheckpointEngineWorker(Worker):
             ep_size = getattr(self.rollout_config, "expert_parallel_size", 1)
             model_config_ref = self.model_config
 
+            def _resolve_hf_config():
+                # ``model_config`` may arrive either as a fully-instantiated
+                # HFModelConfig (which already cached an ``hf_config``) or as
+                # a raw OmegaConf DictConfig from the trainer overrides
+                # (which only has ``path``). Handle both — for the dict case
+                # we lazy-load via AutoConfig.
+                cached = None
+                try:
+                    cached = getattr(model_config_ref, "hf_config", None)
+                except Exception:
+                    cached = None
+                if cached is not None:
+                    return cached
+                from transformers import AutoConfig
+
+                model_path = getattr(model_config_ref, "hf_config_path", None) or model_config_ref.path
+                return AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
             def _rollout_metas_provider():
                 return build_rollout_shard_metas(
-                    model_config_ref.hf_config,
+                    _resolve_hf_config(),
                     tp_rank=0,  # MVP single-rank rollout
                     tp_size=tp_size,
                     ep_rank=0,
