@@ -43,8 +43,7 @@ import time
 import ray
 from omegaconf import DictConfig
 
-# Make ``tests.experimental.agent_loop.agent_utils`` importable when invoked
-# from the repo root (``python tests/special_e2e/sharded_refit_e2e/driver.py``).
+# Make verl root importable when invoked from the repo root.
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__) + "/../../.."))
 
 
@@ -61,9 +60,17 @@ def build_config(backend: str, model_path: str) -> DictConfig:
     with initialize_config_dir(config_dir=config_dir, version_base=None):
         config = compose(config_name="ppo_megatron_trainer")
 
-    # ---- cluster ----
+    # ---- cluster: 2 GPUs total (1 trainer + 1 standalone rollout) ----
+    # We CANNOT use the default hybrid mode (trainer+rollout colocated in one
+    # WorkerDict actor) — that path has no separate CheckpointEngineWorker
+    # and ``CheckpointEngineManager.build_process_group`` blows up looking
+    # for ``execute_checkpoint_engine`` on the trainer's WorkerDict.
+    # Standalone rollout (LLMServerManager.create with worker_group=None)
+    # creates its own CheckpointEngineWorker actors, which is what every
+    # NCCL-class checkpoint backend expects.
     config.trainer.n_gpus_per_node = 1
     config.trainer.nnodes = 1
+    config.actor_rollout_ref.hybrid_engine = False
     config.trainer.total_epochs = 1
     config.trainer.total_training_steps = 1
     config.trainer.val_before_train = False
@@ -119,11 +126,15 @@ def build_config(backend: str, model_path: str) -> DictConfig:
     config.actor_rollout_ref.actor.optim.lr_decay_steps = 1
     config.actor_rollout_ref.actor.optim.lr_warmup_steps = 0
 
-    # ---- rollout: vLLM async (required for OpenAI client + checkpoint engine flow) ----
+    # ---- rollout: vLLM async, STANDALONE (own placement group, separate process) ----
+    # Standalone mode requires rollout.nnodes >= 1 + rollout.n_gpus_per_node
+    # so LLMServerManager can create its own resource pool.
     config.actor_rollout_ref.rollout.name = "vllm"
     config.actor_rollout_ref.rollout.mode = "async"
+    config.actor_rollout_ref.rollout.nnodes = 1
+    config.actor_rollout_ref.rollout.n_gpus_per_node = 1
     config.actor_rollout_ref.rollout.tensor_model_parallel_size = 1
-    config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.4
+    config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.5
     config.actor_rollout_ref.rollout.enforce_eager = True
     config.actor_rollout_ref.rollout.n = 1
     # *** THE BACKEND UNDER TEST ***
@@ -138,11 +149,70 @@ def build_config(backend: str, model_path: str) -> DictConfig:
     return config
 
 
+def init_separated_stack(config: DictConfig):
+    """Spin up trainer + standalone rollout + CheckpointEngineManager, sync once.
+
+    Diverges from ``tests.experimental.agent_loop.agent_utils.init_agent_loop_manager``
+    in one critical place: we pass ``worker_group=None`` to
+    ``LLMServerManager.create`` so the rollout side runs as standalone
+    ``CheckpointEngineWorker`` actors (not WorkerDict-wrapped colocated
+    actors). That's the only configuration where the checkpoint engine's
+    ``execute_checkpoint_engine`` RPCs land on the right method —
+    ``WorkerDict`` would route everything through an ``actor_rollout_``
+    prefix and the call fails on AttributeError.
+    """
+    from verl.checkpoint_engine import CheckpointEngineManager
+    from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
+    from verl.single_controller.ray.base import create_colocated_worker_cls
+    from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
+    from verl.utils import omega_conf_to_dataclass
+    from verl.utils.device import get_device_name
+    from verl.workers.engine_workers import ActorRolloutRefWorker
+    from verl.workers.rollout.llm_server import LLMServerManager
+
+    # 1. trainer-only worker group (own GPU)
+    role_worker_mapping = {Role.ActorRollout: ray.remote(ActorRolloutRefWorker)}
+    trainer_pool_id = "trainer_pool"
+    resource_pool_spec = {trainer_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes}
+    mapping = {Role.ActorRollout: trainer_pool_id}
+    resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
+    resource_pool_manager.create_resource_pool()
+    resource_pool = resource_pool_manager.get_resource_pool(Role.ActorRollout)
+    actor_cls = RayClassWithInitArgs(
+        cls=role_worker_mapping[Role.ActorRollout],
+        config=config.actor_rollout_ref,
+        role="actor_rollout",
+    )
+    worker_dict_cls = create_colocated_worker_cls(class_dict={"actor_rollout": actor_cls})
+    wg_dict = RayWorkerGroup(
+        resource_pool=resource_pool,
+        ray_cls_with_init=worker_dict_cls,
+        device_name=get_device_name(),
+    )
+    actor_rollout_wg = wg_dict.spawn(prefix_set={"actor_rollout"})["actor_rollout"]
+    actor_rollout_wg.init_model()
+
+    # 2. STANDALONE rollout (own GPU, separate process, CheckpointEngineWorker actors)
+    llm_server_manager = LLMServerManager.create(config=config, worker_group=None)
+
+    # 3. checkpoint manager — this is the gate. update_weights() runs the full
+    # routing-plan / NCCL P2P / bucket-IPC pipeline against the live actor
+    # Megatron module on the trainer side and the live vLLM workers on the
+    # rollout side.
+    checkpoint_manager = CheckpointEngineManager(
+        config=omega_conf_to_dataclass(config.actor_rollout_ref.rollout.checkpoint_engine),
+        trainer=actor_rollout_wg,
+        replicas=llm_server_manager.get_replicas(),
+    )
+    checkpoint_manager.sleep_replicas()
+    checkpoint_manager.update_weights()
+
+    return llm_server_manager
+
+
 def run_e2e(backend: str, model_path: str, prompt: str) -> dict:
     """Spin up verl, sync weights once via ``backend``, generate, return dump."""
     from openai import OpenAI
-
-    from tests.experimental.agent_loop.agent_utils import init_agent_loop_manager
 
     # Fresh Ray each invocation — the companion shell script runs this
     # as a subprocess per backend, so we own the cluster lifecycle.
@@ -159,17 +229,15 @@ def run_e2e(backend: str, model_path: str, prompt: str) -> dict:
         }
     )
 
-    print(f"[driver:{backend}] initializing agent_loop_manager (model={model_path}) ...", flush=True)
+    print(f"[driver:{backend}] initializing separated stack (model={model_path}) ...", flush=True)
     t0 = time.time()
-    agent_loop_manager = init_agent_loop_manager(build_config(backend, model_path))
-    # ``init_agent_loop_manager`` already invokes ``checkpoint_manager.update_weights()``
-    # under the hood — that single call IS the gate this whole script is testing.
+    llm_server_manager = init_separated_stack(build_config(backend, model_path))
     init_seconds = time.time() - t0
     print(f"[driver:{backend}] init done in {init_seconds:.1f}s", flush=True)
 
     # Greedy completion with prompt_logprobs disabled (vLLM /completions
     # endpoint exposes per-position token logprobs via ``logprobs`` int).
-    server_address = agent_loop_manager.server_addresses[0]
+    server_address = llm_server_manager.server_addresses[0]
     client = OpenAI(api_key="x", base_url=f"http://{server_address}/v1")
     response = client.completions.create(
         model=model_path,
