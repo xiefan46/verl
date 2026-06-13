@@ -178,7 +178,10 @@ class TransferEdge:
     shape: tuple[int, ...]
     dtype_str: str
     target_param_name: str | None = None
-    shard_id: str | None = None
+    # ``shard_id`` accepts both strings ("q"/"k"/"v" for QKV, "w1"/"w2"/"w3"
+    # for MoE) and ints (0/1 for ``MergedColumnParallelLinear``'s
+    # gate_proj/up_proj fusion). JSON round-trips both cleanly.
+    shard_id: str | int | None = None
     expert_id: int | None = None
 
     def src_local_slice(self) -> tuple[slice, ...]:

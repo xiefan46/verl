@@ -61,10 +61,17 @@ _MOE_GATE_RE = re.compile(r"^(.*\.experts)\.(\d+)\.gate_proj\.weight$")
 _MOE_UP_RE = re.compile(r"^(.*\.experts)\.(\d+)\.up_proj\.weight$")
 _MOE_DOWN_RE = re.compile(r"^(.*\.experts)\.(\d+)\.down_proj\.weight$")
 
-# Standard attention QKV patterns.
-_ATTN_Q_RE = re.compile(r"^(.*\.self_attn)\.q_proj\.weight$")
-_ATTN_K_RE = re.compile(r"^(.*\.self_attn)\.k_proj\.weight$")
-_ATTN_V_RE = re.compile(r"^(.*\.self_attn)\.v_proj\.weight$")
+# Standard attention QKV patterns — capture (prefix, tail in {"weight","bias"}).
+_ATTN_Q_RE = re.compile(r"^(.*\.self_attn)\.q_proj\.(weight|bias)$")
+_ATTN_K_RE = re.compile(r"^(.*\.self_attn)\.k_proj\.(weight|bias)$")
+_ATTN_V_RE = re.compile(r"^(.*\.self_attn)\.v_proj\.(weight|bias)$")
+
+# Dense MLP gate / up — vLLM fuses these into ``gate_up_proj`` via
+# ``MergedColumnParallelLinear`` with int shard_ids 0/1. These patterns must
+# fire AFTER the MoE patterns above (which require ``experts.{i}.`` prefix);
+# anything matching here therefore can't be a routed-expert weight.
+_MLP_GATE_RE = re.compile(r"^(.+)\.gate_proj\.weight$")
+_MLP_UP_RE = re.compile(r"^(.+)\.up_proj\.weight$")
 
 
 def _replace_edge(
@@ -129,12 +136,13 @@ def vllm_enrich_edge(edge: TransferEdge) -> TransferEdge:
             expert_id=expert_idx,
         )
 
-    # ----- Standard attention QKV (fused into vLLM's qkv_proj) -----
+    # ----- Standard attention QKV (fused into vLLM's qkv_proj). Both .weight
+    # and .bias share the qkv_proj fusion, with the same string shard_id. -----
     m = _ATTN_Q_RE.match(name)
     if m is not None:
         return _replace_edge(
             edge,
-            target_param_name=f"{m.group(1)}.qkv_proj.weight",
+            target_param_name=f"{m.group(1)}.qkv_proj.{m.group(2)}",
             shard_id="q",
             expert_id=None,
         )
@@ -142,7 +150,7 @@ def vllm_enrich_edge(edge: TransferEdge) -> TransferEdge:
     if m is not None:
         return _replace_edge(
             edge,
-            target_param_name=f"{m.group(1)}.qkv_proj.weight",
+            target_param_name=f"{m.group(1)}.qkv_proj.{m.group(2)}",
             shard_id="k",
             expert_id=None,
         )
@@ -150,8 +158,29 @@ def vllm_enrich_edge(edge: TransferEdge) -> TransferEdge:
     if m is not None:
         return _replace_edge(
             edge,
-            target_param_name=f"{m.group(1)}.qkv_proj.weight",
+            target_param_name=f"{m.group(1)}.qkv_proj.{m.group(2)}",
             shard_id="v",
+            expert_id=None,
+        )
+
+    # ----- Dense MLP gate / up → MergedColumnParallelLinear gate_up_proj
+    # (int shard_ids 0 = gate, 1 = up). The MoE expert regex above guarantees
+    # routed experts already returned, so a match here means dense MLP (or a
+    # gated shared_expert sub-module that also uses MergedColumn). -----
+    m = _MLP_GATE_RE.match(name)
+    if m is not None:
+        return _replace_edge(
+            edge,
+            target_param_name=f"{m.group(1)}.gate_up_proj.weight",
+            shard_id=0,
+            expert_id=None,
+        )
+    m = _MLP_UP_RE.match(name)
+    if m is not None:
+        return _replace_edge(
+            edge,
+            target_param_name=f"{m.group(1)}.gate_up_proj.weight",
+            shard_id=1,
             expert_id=None,
         )
 

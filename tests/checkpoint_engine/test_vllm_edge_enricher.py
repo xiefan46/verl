@@ -79,6 +79,17 @@ class TestAttentionQKV:
         edge = vllm_enrich_edge(_proto_edge("model.layers.3.self_attn.v_proj.weight"))
         assert edge.shard_id == "v"
 
+    def test_q_proj_bias(self):
+        # Qwen2 has q_proj.bias — vLLM fuses bias too (qkv_proj.bias).
+        edge = vllm_enrich_edge(_proto_edge("model.layers.3.self_attn.q_proj.bias"))
+        assert edge.target_param_name == "model.layers.3.self_attn.qkv_proj.bias"
+        assert edge.shard_id == "q"
+
+    def test_k_proj_bias(self):
+        edge = vllm_enrich_edge(_proto_edge("model.layers.3.self_attn.k_proj.bias"))
+        assert edge.target_param_name == "model.layers.3.self_attn.qkv_proj.bias"
+        assert edge.shard_id == "k"
+
 
 class TestFallthrough:
     def test_o_proj_1to1(self):
@@ -87,10 +98,22 @@ class TestFallthrough:
         assert edge.shard_id is None
         assert edge.expert_id is None
 
-    def test_dense_mlp_gate_proj_1to1(self):
-        # No "experts.{i}." → dense path, no vLLM fusion.
+    def test_dense_mlp_gate_proj_merged(self):
+        # Dense MLP: vLLM fuses gate+up into gate_up_proj (MergedColumnParallelLinear).
         edge = vllm_enrich_edge(_proto_edge("model.layers.3.mlp.gate_proj.weight"))
-        assert edge.target_param_name == "model.layers.3.mlp.gate_proj.weight"
+        assert edge.target_param_name == "model.layers.3.mlp.gate_up_proj.weight"
+        assert edge.shard_id == 0
+        assert edge.expert_id is None
+
+    def test_dense_mlp_up_proj_merged(self):
+        edge = vllm_enrich_edge(_proto_edge("model.layers.3.mlp.up_proj.weight"))
+        assert edge.target_param_name == "model.layers.3.mlp.gate_up_proj.weight"
+        assert edge.shard_id == 1
+
+    def test_dense_mlp_down_proj_1to1(self):
+        # down_proj is RowParallelLinear (single-tensor), so 1:1.
+        edge = vllm_enrich_edge(_proto_edge("model.layers.3.mlp.down_proj.weight"))
+        assert edge.target_param_name == "model.layers.3.mlp.down_proj.weight"
         assert edge.shard_id is None
 
     def test_layernorm_1to1(self):
@@ -105,11 +128,12 @@ class TestFallthrough:
         edge = vllm_enrich_edge(_proto_edge("model.embed_tokens.weight"))
         assert edge.target_param_name == "model.embed_tokens.weight"
 
-    def test_shared_expert_1to1(self):
+    def test_shared_expert_gate_proj_merged(self):
+        # shared_expert is its own MergedColumnParallelLinear in Qwen MoE —
+        # not a routed expert, but still fused gate+up.
         edge = vllm_enrich_edge(_proto_edge("model.layers.3.mlp.shared_expert.gate_proj.weight"))
-        # Not a routed expert (no "...experts.{i}."), goes 1:1.
-        assert edge.target_param_name == "model.layers.3.mlp.shared_expert.gate_proj.weight"
-        assert edge.shard_id is None
+        assert edge.target_param_name == "model.layers.3.mlp.shared_expert.gate_up_proj.weight"
+        assert edge.shard_id == 0
 
 
 class TestIntegrationWithBuildTransferPlan:
