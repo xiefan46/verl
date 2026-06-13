@@ -14,16 +14,19 @@
 """Sharded-aware NCCL weight-refit MoE e2e driver.
 
 Same shape as ``driver.py`` (Qwen2.5-0.5B dense, single-GPU each side),
-but configured for **Qwen3-30B-A3B-Instruct on 8×H200**:
+but configured for **Qwen3-30B-A3B-Instruct on 8×H100**:
 
 * Megatron trainer: 4 GPU, PP=1 CP=1 **TP=2 EP=2** ETP=1.
-  Each rank holds 1/2 attention + 64/128 routed experts. Param +
-  grad + optim offload ON for headroom (H200 141 GB has more room,
-  but Adam state still benefits from offload).
+  Each rank holds 1/2 attention + 64/128 routed experts (~15 GB raw).
+  Param + grad + optim offload ON — without offload Adam fp32 state
+  alone would blow past 80 GB on H100; with offload, GPU peak during
+  the no-train forward walk is ~20 GB.
 * vLLM rollout: 4 GPU, **TP=4 EP=4 DP=1**. vLLM enforces
   ``ep_size == tp_size * dp_size`` (see
   :class:`verl.workers.config.rollout.RolloutConfig`); we pair TP=4
-  with EP=4 so each rank holds 1/4 attention + 32/128 experts.
+  with EP=4 so each rank holds 1/4 attention + 32/128 experts
+  (~15 GB weights). ``gpu_memory_utilization=0.7`` leaves headroom
+  for the NCCL bucket buffer (2 GB) + CUDA IPC handles + KV cache.
 
 The asymmetric trainer-vs-rollout split is the WHOLE point. It exercises
 the routing algorithm's actual value-add over naive broadcast:
@@ -133,8 +136,9 @@ def build_config_moe(backend: str, model_path: str) -> DictConfig:
     config.actor_rollout_ref.rollout.tensor_model_parallel_size = 4
     config.actor_rollout_ref.rollout.expert_parallel_size = 4
     config.actor_rollout_ref.rollout.data_parallel_size = 1
-    # H200 141 GB has more room than H100; can run hotter.
-    config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.85
+    # H100 80 GB: 15 GB model weight + 2 GB bucket buffer + NCCL/IPC
+    # state already eats ~25 GB; leave half the GPU for KV cache.
+    config.actor_rollout_ref.rollout.gpu_memory_utilization = 0.7
     config.actor_rollout_ref.rollout.enforce_eager = True
     config.actor_rollout_ref.rollout.n = 1
     config.actor_rollout_ref.rollout.checkpoint_engine.backend = backend
