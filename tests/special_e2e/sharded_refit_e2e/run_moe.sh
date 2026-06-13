@@ -17,7 +17,7 @@
 #   - DISTINGUISHING=1 confirms shards actually overwrite vLLM
 set -xeuo pipefail
 
-MODEL_ID=${MODEL_ID:-Qwen/Qwen3-30B-A3B-Instruct}
+MODEL_ID=${MODEL_ID:-Qwen/Qwen3-30B-A3B-Instruct-2507}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/${MODEL_ID}}
 OUT_DIR=${OUT_DIR:-/tmp/sharded_refit_moe_e2e}
 PROMPT=${PROMPT:-"The capital of France is"}

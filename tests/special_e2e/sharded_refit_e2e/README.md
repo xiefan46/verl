@@ -63,7 +63,7 @@ to leave room for the NCCL bucket buffer + CUDA IPC handles). The
 asymmetric configuration is deliberate — it forces cross-TP (2→4) and
 cross-EP (2→4) redistribution, which is the actual value-add of
 sharded refit over the broadcast baseline. First run downloads
-Qwen3-30B-A3B-Instruct (~60 GB) — subsequent runs reuse the local
+Qwen3-30B-A3B-Instruct-2507 (~60 GB) — subsequent runs reuse the local
 copy.
 
 ## Tunables (env vars)

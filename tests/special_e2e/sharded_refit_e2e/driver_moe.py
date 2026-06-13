@@ -162,7 +162,7 @@ def main():
     if not os.path.isdir(args.model_path):
         raise FileNotFoundError(
             f"--model-path must point at a local HF model directory, got {args.model_path!r}. "
-            f"Run: hf download Qwen/Qwen3-30B-A3B-Instruct --local-dir {args.model_path}"
+            f"Run: hf download Qwen/Qwen3-30B-A3B-Instruct-2507 --local-dir {args.model_path}"
         )
 
     # Monkey-patch base_driver.build_config so run_e2e picks up the MoE
