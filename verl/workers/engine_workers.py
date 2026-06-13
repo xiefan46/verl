@@ -687,6 +687,28 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         assert "actor" in self.role, "save_checkpoint only support actor role"
         self.actor.save_checkpoint(local_path, hdfs_path, global_step, max_ckpt_to_keep)
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def zero_init_module_for_testing(self) -> int:
+        """Overwrite every trainer module parameter with zeros — TEST ONLY.
+
+        Used by ``tests/special_e2e/sharded_refit_e2e/`` to distinguish
+        ``update_weights`` actually transferring shards (vLLM forward
+        diverges from its HF init) from a silent no-op (vLLM keeps its
+        HF init weights and outputs match the baseline regardless).
+        Returns the number of parameters mutated so the caller can
+        sanity-check the walk reached the whole module.
+        """
+        assert "actor" in self.role, "zero_init_module_for_testing only support actor role"
+        module = self.actor.engine.module
+        modules = module if isinstance(module, list) else [module]
+        count = 0
+        with torch.no_grad():
+            for m in modules:
+                for p in m.parameters():
+                    p.zero_()
+                    count += 1
+        return count
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def update_weights(self, global_steps: int = None, mode: str = "auto"):
         """Update weights from trainer to rollout.

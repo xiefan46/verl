@@ -149,7 +149,7 @@ def build_config(backend: str, model_path: str) -> DictConfig:
     return config
 
 
-def init_separated_stack(config: DictConfig):
+def init_separated_stack(config: DictConfig, zero_init_trainer: bool = False):
     """Spin up trainer + standalone rollout + CheckpointEngineManager, sync once.
 
     Diverges from ``tests.experimental.agent_loop.agent_utils.init_agent_loop_manager``
@@ -192,6 +192,15 @@ def init_separated_stack(config: DictConfig):
     actor_rollout_wg = wg_dict.spawn(prefix_set={"actor_rollout"})["actor_rollout"]
     actor_rollout_wg.init_model()
 
+    # 1b. (distinguishing test) zero out trainer weights so a real
+    # update_weights becomes observable: vLLM forward diverges from its HF
+    # init when the path actually transfers shards, and stays at HF init
+    # if the path is a no-op. Both backends, if working, should produce
+    # the same garbage output here.
+    if zero_init_trainer:
+        zeroed = actor_rollout_wg.zero_init_module_for_testing()
+        print(f"[driver] zero_init_trainer: mutated {zeroed!r} parameter(s) to zero", flush=True)
+
     # 2. STANDALONE rollout (own GPU, separate process, CheckpointEngineWorker actors)
     llm_server_manager = LLMServerManager.create(config=config, worker_group=None)
 
@@ -210,7 +219,7 @@ def init_separated_stack(config: DictConfig):
     return llm_server_manager
 
 
-def run_e2e(backend: str, model_path: str, prompt: str) -> dict:
+def run_e2e(backend: str, model_path: str, prompt: str, zero_init_trainer: bool = False) -> dict:
     """Spin up verl, sync weights once via ``backend``, generate, return dump."""
     from openai import OpenAI
 
@@ -231,7 +240,7 @@ def run_e2e(backend: str, model_path: str, prompt: str) -> dict:
 
     print(f"[driver:{backend}] initializing separated stack (model={model_path}) ...", flush=True)
     t0 = time.time()
-    llm_server_manager = init_separated_stack(build_config(backend, model_path))
+    llm_server_manager = init_separated_stack(build_config(backend, model_path), zero_init_trainer=zero_init_trainer)
     init_seconds = time.time() - t0
     print(f"[driver:{backend}] init done in {init_seconds:.1f}s", flush=True)
 
@@ -251,6 +260,7 @@ def run_e2e(backend: str, model_path: str, prompt: str) -> dict:
     choice = response.choices[0]
     dump = {
         "backend": backend,
+        "zero_init_trainer": zero_init_trainer,
         "model_path": model_path,
         "prompt": prompt,
         "text": choice.text,
@@ -277,6 +287,16 @@ def main():
         default="The capital of France is",
         help="Deterministic prompt for the greedy completion gate",
     )
+    ap.add_argument(
+        "--zero-init-trainer",
+        action="store_true",
+        help=(
+            "Distinguishing-test mode: zero out trainer Megatron parameters "
+            "before update_weights. Both backends should then push zeros into "
+            "vLLM and produce identical (garbage) output — if the test passes "
+            "WITHOUT this flag but FAILS with it, your backend is a silent no-op."
+        ),
+    )
     args = ap.parse_args()
 
     if not os.path.isdir(args.model_path):
@@ -285,7 +305,7 @@ def main():
             f"Run: hf download <model_id> --local-dir {args.model_path}"
         )
 
-    dump = run_e2e(args.backend, args.model_path, args.prompt)
+    dump = run_e2e(args.backend, args.model_path, args.prompt, zero_init_trainer=args.zero_init_trainer)
 
     with open(args.out_path, "w") as f:
         json.dump(dump, f, indent=2)

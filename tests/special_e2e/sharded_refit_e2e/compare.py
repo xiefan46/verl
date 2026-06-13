@@ -53,6 +53,8 @@ def main() -> int:
 
     print(f"[compare] A: backend={a['backend']!r}  text={a['text']!r}")
     print(f"[compare] B: backend={b['backend']!r}  text={b['text']!r}")
+    if a.get("zero_init_trainer") or b.get("zero_init_trainer"):
+        print("[compare] DISTINGUISHING mode (zero-init trainer): both backends were forced to push zeros.")
 
     # ----- Gate 1: token sequence -----
     if a["tokens"] != b["tokens"]:
