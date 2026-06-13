@@ -66,7 +66,7 @@ class ShardedTestWorker:
     trainer and rollout-side roles.
     """
 
-    def __init__(self, role: str, shard_metas_dict: list[dict]) -> None:
+    def __init__(self, role: str, shard_metas_dict: list[dict], group_name: str = "sharded_nccl_smoke") -> None:
         # Lazy imports so the module-level import in this test file is light.
         import torch as _torch  # noqa: F401
 
@@ -76,7 +76,7 @@ class ShardedTestWorker:
         )
 
         self.role = role
-        self.engine = ShardedNCCLCheckpointEngine(group_name="sharded_nccl_smoke")
+        self.engine = ShardedNCCLCheckpointEngine(group_name=group_name)
         self.metas = [ParameterShardMeta.from_dict(d) for d in shard_metas_dict]
         self.engine.set_shard_metas(self.metas, role=role)
 
@@ -179,9 +179,16 @@ def _run_smoke(
     train_metas_per_rank: list[list[dict]],
     rollout_metas_per_rank: list[list[dict]],
     trainer_patterns: list[float],
+    group_name: str = "sharded_nccl_smoke",
 ) -> dict:
     """Spin up the actors, run the full sharded refit cycle, return the
     rollout-side observations for assertion.
+
+    ``group_name`` MUST be unique per test in the same pytest process —
+    ``ray.util.collective`` registers a ``lifetime="detached"``
+    ``NCCLUniqueIDStore`` actor keyed by ``group_name``, and that store
+    survives ``ray.kill`` of all participating workers, so reusing a name
+    across tests trips ``ActorAlreadyExistsError`` on the next ``barrier``.
     """
     from verl.checkpoint_engine.sharded_nccl_checkpoint_engine import (
         ShardedNCCLCheckpointEngine,
@@ -190,8 +197,8 @@ def _run_smoke(
     if not ray.is_initialized():
         ray.init(num_gpus=4, log_to_driver=True)
 
-    trainer_actors = [ShardedTestWorker.remote("train", metas) for metas in train_metas_per_rank]
-    rollout_actors = [ShardedTestWorker.remote("rollout", metas) for metas in rollout_metas_per_rank]
+    trainer_actors = [ShardedTestWorker.remote("train", metas, group_name) for metas in train_metas_per_rank]
+    rollout_actors = [ShardedTestWorker.remote("rollout", metas, group_name) for metas in rollout_metas_per_rank]
 
     # 1. prepare (collect per-rank metadata payloads)
     prepare_metadata = ray.get(
@@ -261,7 +268,12 @@ class TestDenseRouting:
             [_meta_dict("w", full, ((0, 4), (0, 4)), "rollout")],  # rank 0
             [_meta_dict("w", full, ((4, 8), (0, 4)), "rollout")],  # rank 1
         ]
-        result = _run_smoke(train_metas_per_rank, rollout_metas_per_rank, trainer_patterns=[1.0, 2.0])
+        result = _run_smoke(
+            train_metas_per_rank,
+            rollout_metas_per_rank,
+            trainer_patterns=[1.0, 2.0],
+            group_name="sharded_nccl_smoke_dense",
+        )
 
         # Every actor sees the same plan_hash
         hashes = {r["plan_hash"] for r in result["init_results"]}
@@ -302,7 +314,12 @@ class TestMoERouting:
             [_meta_dict(f"experts.{e}.gate_proj.weight", full, ranges, "rollout") for e in (0, 1)],
             [_meta_dict(f"experts.{e}.gate_proj.weight", full, ranges, "rollout") for e in (2, 3)],
         ]
-        result = _run_smoke(train_metas_per_rank, rollout_metas_per_rank, trainer_patterns=[10.0, 20.0])
+        result = _run_smoke(
+            train_metas_per_rank,
+            rollout_metas_per_rank,
+            trainer_patterns=[10.0, 20.0],
+            group_name="sharded_nccl_smoke_moe",
+        )
 
         # 2 experts sent per trainer
         assert result["sent_counts"] == [2, 2]
