@@ -40,6 +40,19 @@ fi
 REPO_ROOT=$(cd "$(dirname "$0")/../../.." && pwd)
 cd "${REPO_ROOT}"
 
+# Helper: drain Ray state between runs. Qwen3-30B-A3B spins up ~16 Ray
+# actors per run (4 trainer + 4 CheckpointEngineWorker + 4 vLLM + 4 misc)
+# plus detached NCCLUniqueIDStore actors from ray.util.collective; the
+# next ray.init() routinely times out reading stale GCS state from
+# /tmp/ray. Force-stop + scrub keeps the second driver from hitting
+# "RPC error: Deadline Exceeded" on bootstrap.
+drain_ray() {
+    ray stop --force 2>/dev/null || true
+    sleep 3
+    rm -rf /tmp/ray /tmp/ray-* 2>/dev/null || true
+    sleep 2
+}
+
 # --- Pass 1: legacy broadcast (baseline) ---
 python tests/special_e2e/sharded_refit_e2e/driver_moe.py \
     --backend nccl \
@@ -48,6 +61,8 @@ python tests/special_e2e/sharded_refit_e2e/driver_moe.py \
     --prompt "${PROMPT}" \
     "${DRIVER_FLAGS[@]}"
 
+drain_ray
+
 # --- Pass 2: sharded routing (the gate) ---
 python tests/special_e2e/sharded_refit_e2e/driver_moe.py \
     --backend sharded_nccl \
@@ -55,6 +70,8 @@ python tests/special_e2e/sharded_refit_e2e/driver_moe.py \
     --out-path "${OUT_DIR}/dump_sharded_nccl.json" \
     --prompt "${PROMPT}" \
     "${DRIVER_FLAGS[@]}"
+
+drain_ray
 
 # --- Compare ---
 python tests/special_e2e/sharded_refit_e2e/compare.py \
