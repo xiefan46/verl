@@ -369,8 +369,18 @@ class vLLMColocateWorkerExtension:
                 # picks the right column slice within the fused param.
                 loader(param, tensor, loaded_shard_id=edge.shard_id)
             else:
-                # 1:1 default loader.
-                loader(param, tensor)
+                # 1:1 default loader, with one carve-out:
+                # vLLM ``VocabParallelEmbedding`` / ``ParallelLMHead``
+                # ``weight_loader`` expects the FULL vocab tensor and narrows
+                # internally (assertion at vocab_parallel_embedding.py:457).
+                # The sharded path already delivers each rank's slice via
+                # ``edge.dst_local_slice``, so bypass the loader and copy
+                # directly to the right offset in ``param.data``.
+                bound = getattr(loader, "__self__", None)
+                if bound is not None and hasattr(bound, "org_vocab_size"):
+                    param.data[edge.dst_local_slice()].copy_(tensor)
+                else:
+                    loader(param, tensor)
 
         def _on_bucket(weights):
             for encoded_name, tensor in weights:
