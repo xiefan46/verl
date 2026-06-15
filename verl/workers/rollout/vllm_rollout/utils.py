@@ -354,9 +354,22 @@ class vLLMColocateWorkerExtension:
                 param.data.copy_(tensor)
                 return
 
+            # vLLM's TP-parallel weight_loaders (VocabParallelEmbedding,
+            # QKVParallelLinear, MergedColumnParallelLinear) all share one
+            # contract that's INCOMPATIBLE with sharded refit: they expect
+            # the FULL (un-TP-split) tensor and narrow internally by
+            # tp_rank. We deliver each rank's slice directly so the
+            # internal ``narrow()`` blows past the dim bound.
+            #
+            # We bypass the loader and copy our pre-sliced shard to the
+            # correct offset in the fused ``param.data``.
+
             if edge.expert_id is not None:
-                # MoE routed expert: vLLM's RoutedExperts.weight_loader expects
-                # (param, loaded_weight, weight_name, shard_id, expert_id).
+                # MoE routed expert: vLLM's RoutedExperts.weight_loader is
+                # expert-dispatch-aware (uses expert_id to pick the right
+                # slot in the local-experts dim) and we send each expert
+                # in full (ETP=1 on the trainer side), so the loader
+                # narrows safely on intermediate dim.
                 loader(
                     param,
                     tensor,
@@ -364,23 +377,48 @@ class vLLMColocateWorkerExtension:
                     shard_id=edge.shard_id,
                     expert_id=edge.expert_id,
                 )
-            elif edge.shard_id is not None:
-                # QKV / MergedColumn: vLLM weight_loader's "loaded_shard_id"
-                # picks the right column slice within the fused param.
-                loader(param, tensor, loaded_shard_id=edge.shard_id)
+                return
+
+            if edge.shard_id in ("q", "k", "v"):
+                # Fused qkv_proj layout per local rank: [q | k | v] stacked
+                # on dim 0. Offsets derived from the param's vLLM
+                # attributes: ``head_size`` × ``num_heads`` (per-rank Q),
+                # ``num_kv_heads`` (per-rank K/V each).
+                head_size = getattr(param, "head_size", None)
+                num_heads = getattr(param, "num_heads", None)
+                num_kv_heads = getattr(param, "num_kv_heads", None)
+                if head_size is None or num_heads is None or num_kv_heads is None:
+                    loader(param, tensor, loaded_shard_id=edge.shard_id)
+                    return
+                q_local = num_heads * head_size
+                kv_local = num_kv_heads * head_size
+                if edge.shard_id == "q":
+                    offset = 0
+                elif edge.shard_id == "k":
+                    offset = q_local
+                else:  # "v"
+                    offset = q_local + kv_local
+                param.data[offset : offset + tensor.shape[0]].copy_(tensor)
+                return
+
+            if isinstance(edge.shard_id, int):
+                # MergedColumn (gate_up_proj). Per-rank layout: shards
+                # stacked on dim 0 with sizes ``param.output_partition_sizes``.
+                sizes = getattr(param, "output_partition_sizes", None)
+                if sizes is None:
+                    loader(param, tensor, loaded_shard_id=edge.shard_id)
+                    return
+                offset = sum(sizes[: edge.shard_id])
+                param.data[offset : offset + tensor.shape[0]].copy_(tensor)
+                return
+
+            # 1:1 default loader, with one carve-out:
+            # VocabParallelEmbedding / ParallelLMHead — also narrow-by-tp_rank.
+            bound = getattr(loader, "__self__", None)
+            if bound is not None and hasattr(bound, "org_vocab_size"):
+                param.data[edge.dst_local_slice()].copy_(tensor)
             else:
-                # 1:1 default loader, with one carve-out:
-                # vLLM ``VocabParallelEmbedding`` / ``ParallelLMHead``
-                # ``weight_loader`` expects the FULL vocab tensor and narrows
-                # internally (assertion at vocab_parallel_embedding.py:457).
-                # The sharded path already delivers each rank's slice via
-                # ``edge.dst_local_slice``, so bypass the loader and copy
-                # directly to the right offset in ``param.data``.
-                bound = getattr(loader, "__self__", None)
-                if bound is not None and hasattr(bound, "org_vocab_size"):
-                    param.data[edge.dst_local_slice()].copy_(tensor)
-                else:
-                    loader(param, tensor)
+                loader(param, tensor)
 
         def _on_bucket(weights):
             for encoded_name, tensor in weights:
