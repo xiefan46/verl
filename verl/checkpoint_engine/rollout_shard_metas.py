@@ -78,6 +78,19 @@ def _detect_moe(text_cfg: Any) -> tuple[int | None, int | None]:
     return num_experts, moe_interm
 
 
+def _has_qk_norm(text_cfg: Any) -> bool:
+    """Detect whether the attention block applies RMSNorm on Q/K before rope.
+
+    Qwen3 hardcodes True (its Megatron config exports ``qk_layernorm=True``).
+    """
+    for flag in ("use_qk_norm", "qk_norm", "qk_layernorm"):
+        v = getattr(text_cfg, flag, None)
+        if v is not None:
+            return bool(v)
+    arch_name = type(text_cfg).__name__
+    return "Qwen3" in arch_name
+
+
 def build_rollout_shard_metas(
     hf_config: Any,
     *,
@@ -110,6 +123,7 @@ def build_rollout_shard_metas(
     intermediate = int(text_cfg.intermediate_size)
     tie_embed = bool(getattr(text_cfg, "tie_word_embeddings", False))
     qkv_bias = _has_qkv_bias(text_cfg)
+    qk_norm = _has_qk_norm(text_cfg)
     num_experts, moe_interm = _detect_moe(text_cfg)
     is_moe = bool(num_experts) and num_experts > 1 and moe_interm is not None
     mlp_only_layers = set(getattr(text_cfg, "mlp_only_layers", None) or [])
@@ -207,6 +221,10 @@ def build_rollout_shard_metas(
             _bias_split(f"{base}.self_attn.q_proj.bias", q_rows_full, q_local)
             _bias_split(f"{base}.self_attn.k_proj.bias", kv_rows_full, kv_local)
             _bias_split(f"{base}.self_attn.v_proj.bias", kv_rows_full, kv_local)
+        if qk_norm:
+            # Per-head RMSNorm on Q/K (Qwen3). head_dim-shaped, replicated.
+            _add_full(f"{base}.self_attn.q_norm.weight", (head_dim,))
+            _add_full(f"{base}.self_attn.k_norm.weight", (head_dim,))
         _row_split(f"{base}.self_attn.o_proj.weight", (hidden, q_rows_full), q_rows_full, q_local)
 
         _add_full(f"{base}.post_attention_layernorm.weight", (hidden,))

@@ -386,12 +386,27 @@ def _dispatch_layer(
         yield _emit_1to1(f"{base}.input_layernorm.weight", param)
         return
     if rest == "self_attention.linear_proj.weight":
+        # ``linear_proj``'s input dim = num_heads * head_dim (the Q activation),
+        # NOT ``hidden_size``. Qwen3 has head_dim=128 with num_heads=32, so
+        # q_total = 4096 while hidden = 2048 — the two diverge whenever
+        # head_dim != hidden / num_heads (which is the case for Qwen3).
         hidden = ctx.hidden_size()
-        local_in = hidden // ctx.tp_size
+        q_total = ctx.num_heads() * ctx.head_dim()
+        local_in = q_total // ctx.tp_size
         if param.shape != (hidden, local_in):
-            raise ValueError(f"linear_proj shape {tuple(param.shape)} != expected ({hidden}, {local_in})")
-        full = (hidden, hidden)
+            raise ValueError(
+                f"linear_proj shape {tuple(param.shape)} != expected ({hidden}, {local_in}) "
+                f"(q_total={q_total} tp_size={ctx.tp_size})"
+            )
+        full = (hidden, q_total)
         yield f"{base}.self_attn.o_proj.weight", param, _tp_split_box(full, 1, ctx.tp_rank, ctx.tp_size), full
+        return
+    if rest == "self_attention.q_layernorm.weight":
+        # Qwen3 attention has per-head RMSNorm on Q/K — head_dim-shaped, replicated.
+        yield _emit_1to1(f"{base}.self_attn.q_norm.weight", param)
+        return
+    if rest == "self_attention.k_layernorm.weight":
+        yield _emit_1to1(f"{base}.self_attn.k_norm.weight", param)
         return
 
     if rest == "mlp.linear_fc1.weight":
