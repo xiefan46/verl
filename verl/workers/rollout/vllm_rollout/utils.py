@@ -379,14 +379,19 @@ class vLLMColocateWorkerExtension:
                 )
                 return
 
+            # The vLLM attributes we need to compute fused offsets are on the
+            # LINEAR MODULE, not on the param itself. Grab it via the bound
+            # method's ``__self__``. Same trick we use for VocabParallel.
+            bound = getattr(loader, "__self__", None)
+
             if edge.shard_id in ("q", "k", "v"):
                 # Fused qkv_proj layout per local rank: [q | k | v] stacked
-                # on dim 0. Offsets derived from the param's vLLM
-                # attributes: ``head_size`` × ``num_heads`` (per-rank Q),
-                # ``num_kv_heads`` (per-rank K/V each).
-                head_size = getattr(param, "head_size", None)
-                num_heads = getattr(param, "num_heads", None)
-                num_kv_heads = getattr(param, "num_kv_heads", None)
+                # on dim 0. Offsets derived from the linear module's
+                # ``head_size`` / ``num_heads`` / ``num_kv_heads``
+                # (which vLLM already stores per-rank).
+                head_size = getattr(bound, "head_size", None) if bound is not None else None
+                num_heads = getattr(bound, "num_heads", None) if bound is not None else None
+                num_kv_heads = getattr(bound, "num_kv_heads", None) if bound is not None else None
                 if head_size is None or num_heads is None or num_kv_heads is None:
                     loader(param, tensor, loaded_shard_id=edge.shard_id)
                     return
@@ -403,8 +408,13 @@ class vLLMColocateWorkerExtension:
 
             if isinstance(edge.shard_id, int):
                 # MergedColumn (gate_up_proj). Per-rank layout: shards
-                # stacked on dim 0 with sizes ``param.output_partition_sizes``.
-                sizes = getattr(param, "output_partition_sizes", None)
+                # stacked on dim 0 with sizes ``bound.output_sizes`` (also
+                # per-rank in vLLM, computed at __init__ time).
+                sizes = None
+                if bound is not None:
+                    sizes = getattr(bound, "output_sizes", None)
+                    if sizes is None:
+                        sizes = getattr(bound, "output_partition_sizes", None)
                 if sizes is None:
                     loader(param, tensor, loaded_shard_id=edge.shard_id)
                     return
@@ -414,7 +424,6 @@ class vLLMColocateWorkerExtension:
 
             # 1:1 default loader, with one carve-out:
             # VocabParallelEmbedding / ParallelLMHead — also narrow-by-tp_rank.
-            bound = getattr(loader, "__self__", None)
             if bound is not None and hasattr(bound, "org_vocab_size"):
                 param.data[edge.dst_local_slice()].copy_(tensor)
             else:
