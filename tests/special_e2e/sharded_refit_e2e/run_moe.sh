@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Sharded-aware NCCL refit MoE e2e gate — Qwen3-30B-A3B-Instruct on 8×H100.
+# Sharded-aware NCCL refit MoE e2e gate — Qwen3-30B-A3B-Instruct-2507 on 8×H200.
 #
 # Trainer Megatron: 4 GPU, PP=1 CP=1 TP=2 EP=2 ETP=1, offload ON.
-# Rollout vLLM:     4 GPU, TP=4 EP=4 DP=1, standalone, gpu_mem_util=0.7.
+# Rollout vLLM:     4 GPU, TP=4 EP=4 DP=1, standalone, gpu_mem_util=0.85.
 #
 # The asymmetric trainer-vs-rollout TP/EP is intentional — it forces the
 # routing plan to do cross-TP (2→4) and cross-EP (2→4) shard
