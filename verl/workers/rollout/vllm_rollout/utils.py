@@ -422,9 +422,25 @@ class vLLMColocateWorkerExtension:
                 param.data[offset : offset + tensor.shape[0]].copy_(tensor)
                 return
 
-            # 1:1 default loader, with one carve-out:
-            # VocabParallelEmbedding / ParallelLMHead — also narrow-by-tp_rank.
-            if bound is not None and hasattr(bound, "org_vocab_size"):
+            # 1:1 default loader, with carve-outs for ALL vLLM TP-parallel
+            # layers whose weight_loader narrows by tp_rank internally
+            # (incompatible with our pre-sliced shards):
+            #   - VocabParallelEmbedding / ParallelLMHead — org_vocab_size
+            #   - RowParallelLinear (o_proj, down_proj) — input_size_per_partition
+            #   - ColumnParallelLinear (bare; rare in MoE models, but safe to
+            #     cover here in case future arch grows a non-fused col-parallel
+            #     param) — output_size_per_partition
+            # If any of these markers is present, copy our pre-sliced shard
+            # to the destination box; otherwise fall through to the default
+            # loader (replicated params like layernorms, gate routers).
+            if bound is not None and any(
+                hasattr(bound, marker)
+                for marker in (
+                    "org_vocab_size",
+                    "input_size_per_partition",
+                    "output_size_per_partition",
+                )
+            ):
                 param.data[edge.dst_local_slice()].copy_(tensor)
             else:
                 loader(param, tensor)
