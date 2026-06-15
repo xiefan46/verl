@@ -699,6 +699,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         sanity-check the walk reached the whole module.
         """
         assert "actor" in self.role, "zero_init_module_for_testing only support actor role"
+
+        # With ``actor.megatron.param_offload=True`` (typical for the 30B+
+        # MoE configs), the Megatron param buffer is CPU-resident between
+        # forward passes — writing to ``p.data`` without re-loading the
+        # buffer to GPU hits a freed/unmapped CUDA address. Re-use the
+        # same loader ``get_local_shards_and_metas`` uses; cheap no-op if
+        # offload is not enabled.
+        try:
+            from verl.utils.megatron_utils import load_megatron_model_to_gpu
+
+            load_megatron_model_to_gpu(self.actor.engine.module, load_grad=False, load_frozen_params=True)
+        except ImportError:
+            # Non-Megatron engines (FSDP, etc.) don't need this guard.
+            pass
+
         module = self.actor.engine.module
         modules = module if isinstance(module, list) else [module]
         count = 0
